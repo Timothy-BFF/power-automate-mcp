@@ -1,5 +1,8 @@
 // ═══════════════════════════════════════════════════════════════
 // Power Automate MCP Server — Configuration
+//
+// Startup-resilient: Server starts even if Azure credentials
+// are missing. Health endpoint reports what's configured.
 // ═══════════════════════════════════════════════════════════════
 
 import dotenv from 'dotenv';
@@ -16,6 +19,7 @@ export interface AppConfig {
     flowScope: string;
     managementScope: string;
     tokenEndpoint: string;
+    isConfigured: boolean;
   };
   powerPlatform: {
     defaultEnvironmentId: string;
@@ -24,28 +28,28 @@ export interface AppConfig {
   };
 }
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
-
 export function loadConfig(): AppConfig {
-  const tenantId = requireEnv('AZURE_TENANT_ID');
+  const tenantId = process.env.AZURE_TENANT_ID || '';
+  const clientId = process.env.AZURE_CLIENT_ID || '';
+  const clientSecret = process.env.AZURE_CLIENT_SECRET || '';
+
+  // Determine if Azure AD is fully configured
+  const isAzureConfigured = !!(tenantId && clientId && clientSecret);
 
   return {
     port: parseInt(process.env.PORT || '8080', 10),
     logLevel: process.env.LOG_LEVEL || 'info',
-    simtheoryAuthToken: requireEnv('SIMTHEORY_AUTH_TOKEN'),
+    simtheoryAuthToken: process.env.SIMTHEORY_AUTH_TOKEN || '',
     azure: {
       tenantId,
-      clientId: requireEnv('AZURE_CLIENT_ID'),
-      clientSecret: requireEnv('AZURE_CLIENT_SECRET'),
+      clientId,
+      clientSecret,
       flowScope: process.env.AZURE_FLOW_SCOPE || 'https://service.flow.microsoft.com/.default',
       managementScope: process.env.AZURE_MANAGEMENT_SCOPE || 'https://management.azure.com/.default',
-      tokenEndpoint: `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+      tokenEndpoint: tenantId
+        ? `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`
+        : '',
+      isConfigured: isAzureConfigured,
     },
     powerPlatform: {
       defaultEnvironmentId: process.env.POWER_PLATFORM_ENVIRONMENT_ID || '',
