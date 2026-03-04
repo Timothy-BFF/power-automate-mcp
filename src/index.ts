@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 // Power Automate MCP Server — Main Entry Point
 //
 // Designed for Simtheory.ai integration via SSE transport.
@@ -6,7 +6,7 @@
 // Startup-resilient: boots even without Azure credentials.
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -36,6 +36,24 @@ import { listConnectionsSchema, executeListConnections } from './mcp/tools/list-
 
 const config: AppConfig = loadConfig();
 const logger = createLogger(config.logLevel);
+
+// ─────────────────────────────────────────────────────────────────
+// Global Crash Protection — server must NEVER die on errors
+// ─────────────────────────────────────────────────────────────────
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Promise Rejection — server staying alive', {
+    reason: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception — server staying alive', {
+    message: error.message,
+    stack: error.stack,
+  });
+});
 
 logger.info('╔══════════════════════════════════════════════════════════╗');
 logger.info('║   Power Automate MCP Server                             ║');
@@ -110,6 +128,33 @@ function requireConfigured(): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Helper: safe tool executor wrapper
+// ─────────────────────────────────────────────────────────────────
+
+function safeToolResult(text: string) {
+  return { content: [{ type: 'text' as const, text }] };
+}
+
+async function safeTool(
+  name: string,
+  fn: () => Promise<string>
+): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+  try {
+    const guard = requireConfigured();
+    if (guard) return safeToolResult(guard);
+    const result = await fn();
+    return safeToolResult(result);
+  } catch (error: unknown) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.error(`Tool ${name} failed`, { message: err.message, stack: err.stack });
+    return safeToolResult(JSON.stringify({
+      error: `Tool execution failed: ${err.message}`,
+      tool: name,
+    }));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // MCP Server Setup
 // ─────────────────────────────────────────────────────────────────
 
@@ -128,11 +173,10 @@ mcpServer.tool(
   'Lists all Power Automate flows in a Power Platform environment. Returns flow name, display name, state (Started/Stopped), created time, and last modified time. Use filter to narrow by personal or shared flows.',
   listFlowsSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = listFlowsSchema.parse(args);
-    const result = await executeListFlows(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-list-flows', async () => {
+      const parsed = listFlowsSchema.parse(args);
+      return executeListFlows(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -142,11 +186,10 @@ mcpServer.tool(
   'Gets complete details about a specific Power Automate flow, including its definition, state, and HTTP trigger URI. Use pa-list-flows first to discover flow IDs.',
   getFlowDetailsSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = getFlowDetailsSchema.parse(args);
-    const result = await executeGetFlowDetails(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-get-flow-details', async () => {
+      const parsed = getFlowDetailsSchema.parse(args);
+      return executeGetFlowDetails(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -156,11 +199,10 @@ mcpServer.tool(
   'Enables or disables a Power Automate flow. Use action "enable" to start a stopped flow, or "disable" to stop a running flow.',
   enableDisableFlowSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = enableDisableFlowSchema.parse(args);
-    const result = await executeEnableDisableFlow(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-enable-disable-flow', async () => {
+      const parsed = enableDisableFlowSchema.parse(args);
+      return executeEnableDisableFlow(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -170,11 +212,10 @@ mcpServer.tool(
   'Permanently deletes a Power Automate flow. DESTRUCTIVE AND IRREVERSIBLE. confirmDelete must be true. Verify with pa-get-flow-details first.',
   deleteFlowSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = deleteFlowSchema.parse(args);
-    const result = await executeDeleteFlow(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-delete-flow', async () => {
+      const parsed = deleteFlowSchema.parse(args);
+      return executeDeleteFlow(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -184,11 +225,10 @@ mcpServer.tool(
   'Triggers a Power Automate flow with an HTTP Request trigger. Provide triggerUri directly or environmentId + flowId to auto-discover. Optionally pass a JSON body as input.',
   triggerFlowSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = triggerFlowSchema.parse(args);
-    const result = await executeTriggerFlow(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-trigger-flow', async () => {
+      const parsed = triggerFlowSchema.parse(args);
+      return executeTriggerFlow(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -198,11 +238,10 @@ mcpServer.tool(
   'Gets execution run history for a flow. Returns status, timing, trigger name, and error details. Use top to limit and status to filter.',
   getRunHistorySchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = getRunHistorySchema.parse(args);
-    const result = await executeGetRunHistory(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-get-run-history', async () => {
+      const parsed = getRunHistorySchema.parse(args);
+      return executeGetRunHistory(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -212,11 +251,10 @@ mcpServer.tool(
   'Gets detailed information about a specific flow run including full status, timing, trigger info, and error details. Use pa-get-run-history to find run IDs.',
   getRunDetailsSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = getRunDetailsSchema.parse(args);
-    const result = await executeGetRunDetails(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-get-run-details', async () => {
+      const parsed = getRunDetailsSchema.parse(args);
+      return executeGetRunDetails(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -226,11 +264,10 @@ mcpServer.tool(
   'Cancels a currently running flow execution. Only works on runs in "Running" status. Use pa-get-run-history with status "Running" to find active runs.',
   cancelRunSchema.shape,
   async (args) => {
-    const guard = requireConfigured();
-    if (guard) return { content: [{ type: 'text' as const, text: guard }] };
-    const parsed = cancelRunSchema.parse(args);
-    const result = await executeCancelRun(parsed, flowClient!, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
+    return safeTool('pa-cancel-run', async () => {
+      const parsed = cancelRunSchema.parse(args);
+      return executeCancelRun(parsed, flowClient!, defaultEnvId);
+    });
   }
 );
 
@@ -240,19 +277,20 @@ mcpServer.tool(
   'Lists all Power Platform environments accessible to the service principal. Returns name, display name, location, type, state, and default flag. Use to discover environment IDs.',
   {},
   async () => {
-    if (!config.azure.isConfigured || !envClient) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify({
-            error: 'Azure AD credentials are not configured.',
-            action: 'Set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET in Railway environment variables.',
-          }),
-        }],
-      };
+    try {
+      if (!config.azure.isConfigured || !envClient) {
+        return safeToolResult(JSON.stringify({
+          error: 'Azure AD credentials are not configured.',
+          action: 'Set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET in Railway environment variables.',
+        }));
+      }
+      const result = await executeListEnvironments(envClient);
+      return safeToolResult(result);
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error('Tool pa-list-environments failed', { message: err.message, stack: err.stack });
+      return safeToolResult(JSON.stringify({ error: `Tool execution failed: ${err.message}` }));
     }
-    const result = await executeListEnvironments(envClient);
-    return { content: [{ type: 'text' as const, text: result }] };
   }
 );
 
@@ -262,20 +300,21 @@ mcpServer.tool(
   'Lists all API connections in a Power Platform environment. Returns connector type, status, and creation time. Useful for auditing flow dependencies.',
   listConnectionsSchema.shape,
   async (args) => {
-    if (!config.azure.isConfigured || !connClient) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify({
-            error: 'Azure AD credentials are not configured.',
-            action: 'Set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET in Railway environment variables.',
-          }),
-        }],
-      };
+    try {
+      if (!config.azure.isConfigured || !connClient) {
+        return safeToolResult(JSON.stringify({
+          error: 'Azure AD credentials are not configured.',
+          action: 'Set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET in Railway environment variables.',
+        }));
+      }
+      const parsed = listConnectionsSchema.parse(args);
+      const result = await executeListConnections(parsed, connClient, defaultEnvId);
+      return safeToolResult(result);
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error('Tool pa-list-connections failed', { message: err.message, stack: err.stack });
+      return safeToolResult(JSON.stringify({ error: `Tool execution failed: ${err.message}` }));
     }
-    const parsed = listConnectionsSchema.parse(args);
-    const result = await executeListConnections(parsed, connClient, defaultEnvId);
-    return { content: [{ type: 'text' as const, text: result }] };
   }
 );
 
@@ -329,68 +368,108 @@ app.use(validateSimtheoryToken);
 
 // ─────── Health Endpoint ───────
 app.get('/health', async (_req, res) => {
-  const missingVars: string[] = [];
-  if (!config.azure.tenantId) missingVars.push('AZURE_TENANT_ID');
-  if (!config.azure.clientId) missingVars.push('AZURE_CLIENT_ID');
-  if (!config.azure.clientSecret) missingVars.push('AZURE_CLIENT_SECRET');
-  if (!config.simtheoryAuthToken) missingVars.push('SIMTHEORY_AUTH_TOKEN');
+  try {
+    const missingVars: string[] = [];
+    if (!config.azure.tenantId) missingVars.push('AZURE_TENANT_ID');
+    if (!config.azure.clientId) missingVars.push('AZURE_CLIENT_ID');
+    if (!config.azure.clientSecret) missingVars.push('AZURE_CLIENT_SECRET');
+    if (!config.simtheoryAuthToken) missingVars.push('SIMTHEORY_AUTH_TOKEN');
 
-  let tokenStatus = { flow: 'not_configured', management: 'not_configured' };
+    let tokenStatus = { flow: 'not_configured', management: 'not_configured' };
 
-  if (tokenManager) {
-    try {
-      const health = await tokenManager.healthCheck();
-      tokenStatus = {
-        flow: health.flow ? 'ok' : 'error',
-        management: health.management ? 'ok' : 'error',
-      };
-    } catch {
-      tokenStatus = { flow: 'error', management: 'error' };
+    if (tokenManager) {
+      try {
+        const health = await tokenManager.healthCheck();
+        tokenStatus = {
+          flow: health.flow ? 'ok' : 'error',
+          management: health.management ? 'ok' : 'error',
+        };
+      } catch {
+        tokenStatus = { flow: 'error', management: 'error' };
+      }
     }
-  }
 
-  res.json({
-    status: config.azure.isConfigured ? 'healthy' : 'awaiting_configuration',
-    server: 'power-automate-mcp',
-    version: '1.0.0',
-    timestamp: new Date().toISOString(),
-    configuration: {
-      azureAD: config.azure.isConfigured ? 'configured' : 'MISSING',
-      simtheoryAuth: config.simtheoryAuthToken ? 'configured' : 'MISSING',
-      defaultEnvironment: config.powerPlatform.defaultEnvironmentId || 'not_set',
-      missingVariables: missingVars.length > 0 ? missingVars : undefined,
-    },
-    auth: tokenStatus,
-    tools: 10,
-  });
+    res.json({
+      status: config.azure.isConfigured ? 'healthy' : 'awaiting_configuration',
+      server: 'power-automate-mcp',
+      version: '1.0.0',
+      timestamp: new Date().toISOString(),
+      configuration: {
+        azureAD: config.azure.isConfigured ? 'configured' : 'MISSING',
+        simtheoryAuth: config.simtheoryAuthToken ? 'configured' : 'MISSING',
+        defaultEnvironment: config.powerPlatform.defaultEnvironmentId || 'not_set',
+        missingVariables: missingVars.length > 0 ? missingVars : undefined,
+      },
+      auth: tokenStatus,
+      tools: 10,
+    });
+  } catch (error: unknown) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.error('Health check failed', { message: err.message });
+    res.status(503).json({ status: 'unhealthy', error: err.message });
+  }
 });
 
 // ─────── SSE Transport for MCP ───────
 const transports: Map<string, SSEServerTransport> = new Map();
 
 app.get('/sse', async (req, res) => {
-  logger.info('New SSE connection established');
-  const transport = new SSEServerTransport('/messages', res);
-  transports.set(transport.sessionId, transport);
+  try {
+    logger.info('New SSE connection request received');
+    const transport = new SSEServerTransport('/messages', res);
+    transports.set(transport.sessionId, transport);
+    logger.info(`SSE session created: ${transport.sessionId}`);
 
-  res.on('close', () => {
-    logger.info(`SSE connection closed: ${transport.sessionId}`);
-    transports.delete(transport.sessionId);
-  });
+    res.on('close', () => {
+      logger.info(`SSE connection closed: ${transport.sessionId}`);
+      transports.delete(transport.sessionId);
+    });
 
-  await mcpServer.connect(transport);
+    res.on('error', (err) => {
+      logger.error(`SSE connection error: ${transport.sessionId}`, { message: err.message });
+      transports.delete(transport.sessionId);
+    });
+
+    await mcpServer.connect(transport);
+    logger.info(`MCP server connected to SSE session: ${transport.sessionId}`);
+  } catch (error: unknown) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.error('SSE connection setup failed', { message: err.message, stack: err.stack });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'SSE connection failed' });
+    }
+  }
 });
 
 app.post('/messages', async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  const transport = transports.get(sessionId);
+  try {
+    const sessionId = req.query.sessionId as string;
+    logger.info(`Message received for session: ${sessionId}`);
 
-  if (!transport) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
+    const transport = transports.get(sessionId);
+
+    if (!transport) {
+      logger.warn(`Session not found: ${sessionId}. Active sessions: ${transports.size}`);
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    await transport.handlePostMessage(req, res);
+  } catch (error: unknown) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.error('Message handling failed', { message: err.message, stack: err.stack });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Message handling failed' });
+    }
   }
+});
 
-  await transport.handlePostMessage(req, res);
+// ─────── Global Express Error Handler ───────
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error('Express unhandled error', { message: err.message, stack: err.stack });
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ─────── Start Server ───────
