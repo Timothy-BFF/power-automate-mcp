@@ -1,59 +1,30 @@
-// ═══════════════════════════════════════════════════════════════
-// Tool: pa-enable-disable-flow
-// Enables or disables a specific Power Automate flow.
-// ═══════════════════════════════════════════════════════════════
-
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { FlowClient } from '../../clients/flow-client.js';
+import type { Logger } from 'winston';
+import { PowerPlatformClient } from '../../api/power-platform-client.js';
+import { resolveEnvironmentId } from '../../config/environment-resolver.js';
 
-export const enableDisableFlowSchema = z.object({
-  environmentId: z.string().optional().describe(
-    'Power Platform environment ID. Uses default if omitted.'
-  ),
-  flowId: z.string().describe(
-    'The unique identifier (GUID) of the flow.'
-  ),
-  action: z.enum(['enable', 'disable']).describe(
-    'Whether to enable (start) or disable (stop) the flow.'
-  ),
-});
-
-export const enableDisableFlowDefinition = {
-  name: 'pa-enable-disable-flow',
-  description: [
-    'Enables or disables a Power Automate flow.',
-    'Use action "enable" to start a stopped flow,',
-    'or "disable" to stop a running flow.',
-    'Returns the new state after the operation.',
-  ].join(' '),
-  inputSchema: {
-    type: 'object' as const,
-    properties: {
-      environmentId: { type: 'string', description: 'Power Platform environment ID.' },
-      flowId: { type: 'string', description: 'The flow GUID.' },
-      action: { type: 'string', enum: ['enable', 'disable'], description: 'Enable or disable the flow.' },
+export function registerEnableDisableFlow(server: McpServer, client: PowerPlatformClient, defaultEnvId: string, logger: Logger): void {
+  (server as any).tool(
+    'pa-enable-disable-flow',
+    'Enables or disables a Power Automate flow. Use action "start" to enable or "stop" to disable the flow.',
+    {
+      flowId: z.string().describe('The unique identifier of the flow.'),
+      action: z.enum(['start', 'stop']).describe('Action to perform: start (enable) or stop (disable) the flow.'),
+      environmentId: z.string().optional().describe('Power Platform environment ID. Uses default if omitted.'),
     },
-    required: ['flowId', 'action'],
-  },
-};
-
-export async function executeEnableDisableFlow(
-  args: z.infer<typeof enableDisableFlowSchema>,
-  flowClient: FlowClient,
-  defaultEnvId: string
-): Promise<string> {
-  const envId = args.environmentId || defaultEnvId;
-  if (!envId) {
-    return JSON.stringify({ error: 'No environmentId provided and no default configured.' });
-  }
-
-  const state = args.action === 'enable' ? 'Started' : 'Stopped';
-  const result = await flowClient.setFlowState(envId, args.flowId, state);
-
-  return JSON.stringify({
-    flowId: args.flowId,
-    action: args.action,
-    success: result.success,
-    newState: result.newState,
-  }, null, 2);
+    async (args: any) => {
+      try {
+        const envId = resolveEnvironmentId(args.environmentId);
+        if (args.action === 'start') {
+          await client.enableFlow(envId, args.flowId);
+        } else {
+          await client.disableFlow(envId, args.flowId);
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, flowId: args.flowId, action: args.action, message: `Flow ${args.action === 'start' ? 'enabled' : 'disabled'} successfully.` }) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }] };
+      }
+    }
+  );
 }

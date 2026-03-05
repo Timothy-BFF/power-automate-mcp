@@ -1,53 +1,31 @@
-// ═══════════════════════════════════════════════════════════════
-// Tool: pa-list-connections
-// Lists all API connections in a Power Platform environment.
-// ═══════════════════════════════════════════════════════════════
-
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { ConnectionClient } from '../../clients/connection-client.js';
+import type { Logger } from 'winston';
+import { PowerPlatformClient } from '../../api/power-platform-client.js';
+import { resolveEnvironmentId } from '../../config/environment-resolver.js';
 
-export const listConnectionsSchema = z.object({
-  environmentId: z.string().optional().describe(
-    'Power Platform environment ID. Uses default if omitted.'
-  ),
-});
-
-export const listConnectionsDefinition = {
-  name: 'pa-list-connections',
-  description: [
-    'Lists all API connections configured in a Power Platform environment.',
-    'Returns connection name, connector type (e.g., Office 365, SharePoint, SQL),',
-    'status, and creation time. Useful for auditing or debugging flow dependencies.',
-  ].join(' '),
-  inputSchema: {
-    type: 'object' as const,
-    properties: {
-      environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+export function registerListConnections(server: McpServer, client: PowerPlatformClient, defaultEnvId: string, logger: Logger): void {
+  (server as any).tool(
+    'pa-list-connections',
+    'Lists all Power Platform connections in an environment. Returns connection ID, display name, status, connector information, and creation time.',
+    {
+      environmentId: z.string().optional().describe('Power Platform environment ID. Uses default if omitted.'),
     },
-  },
-};
-
-export async function executeListConnections(
-  args: z.infer<typeof listConnectionsSchema>,
-  connectionClient: ConnectionClient,
-  defaultEnvId: string
-): Promise<string> {
-  const envId = args.environmentId || defaultEnvId;
-  if (!envId) {
-    return JSON.stringify({ error: 'No environmentId provided and no default configured.' });
-  }
-
-  const connections = await connectionClient.listConnections(envId);
-
-  return JSON.stringify({
-    environmentId: envId,
-    totalConnections: connections.length,
-    connections: connections.map(c => ({
-      id: c.name,
-      displayName: c.displayName,
-      connectorName: c.connectorName,
-      status: c.status,
-      createdTime: c.createdTime,
-    })),
-  }, null, 2);
+    async (args: any) => {
+      try {
+        const envId = resolveEnvironmentId(args.environmentId);
+        const data = await client.listConnections(envId);
+        const connections = (data.value || []).map((c: any) => ({
+          id: c.name,
+          displayName: c.properties?.displayName,
+          status: c.properties?.statuses?.[0]?.status,
+          connectorName: c.properties?.apiId,
+          createdTime: c.properties?.createdTime,
+        }));
+        return { content: [{ type: 'text', text: JSON.stringify({ environmentId: envId, totalConnections: connections.length, connections }, null, 2) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }] };
+      }
+    }
+  );
 }

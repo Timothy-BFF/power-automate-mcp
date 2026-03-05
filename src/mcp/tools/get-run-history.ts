@@ -1,71 +1,33 @@
-// ═══════════════════════════════════════════════════════════════
-// Tool: pa-get-run-history
-// Gets the execution history for a specific flow.
-// ═══════════════════════════════════════════════════════════════
-
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { FlowClient } from '../../clients/flow-client.js';
+import type { Logger } from 'winston';
+import { PowerPlatformClient } from '../../api/power-platform-client.js';
+import { resolveEnvironmentId } from '../../config/environment-resolver.js';
 
-export const getRunHistorySchema = z.object({
-  environmentId: z.string().optional().describe(
-    'Power Platform environment ID. Uses default if omitted.'
-  ),
-  flowId: z.string().describe(
-    'The unique identifier (GUID) of the flow.'
-  ),
-  top: z.number().optional().default(10).describe(
-    'Maximum number of runs to return. Defaults to 10.'
-  ),
-  status: z.enum(['Succeeded', 'Failed', 'Running', 'Cancelled']).optional().describe(
-    'Filter runs by status.'
-  ),
-});
-
-export const getRunHistoryDefinition = {
-  name: 'pa-get-run-history',
-  description: [
-    'Gets the execution run history for a specific Power Automate flow.',
-    'Returns run status (Succeeded, Failed, Running, Cancelled),',
-    'start time, end time, trigger name, and error details for failed runs.',
-    'Use top to limit results and status to filter by outcome.',
-  ].join(' '),
-  inputSchema: {
-    type: 'object' as const,
-    properties: {
-      environmentId: { type: 'string', description: 'Power Platform environment ID.' },
-      flowId: { type: 'string', description: 'The flow GUID.' },
-      top: { type: 'number', description: 'Max runs to return (default 10).' },
-      status: { type: 'string', enum: ['Succeeded', 'Failed', 'Running', 'Cancelled'], description: 'Filter by run status.' },
+export function registerGetRunHistory(server: McpServer, client: PowerPlatformClient, defaultEnvId: string, logger: Logger): void {
+  (server as any).tool(
+    'pa-get-run-history',
+    'Gets the run history for a specific Power Automate flow. Returns run ID, status (Succeeded/Failed/Running/Cancelled), start time, end time, and trigger information.',
+    {
+      flowId: z.string().describe('The unique identifier of the flow.'),
+      environmentId: z.string().optional().describe('Power Platform environment ID. Uses default if omitted.'),
+      top: z.number().optional().describe('Maximum number of runs to return.'),
     },
-    required: ['flowId'],
-  },
-};
-
-export async function executeGetRunHistory(
-  args: z.infer<typeof getRunHistorySchema>,
-  flowClient: FlowClient,
-  defaultEnvId: string
-): Promise<string> {
-  const envId = args.environmentId || defaultEnvId;
-  if (!envId) {
-    return JSON.stringify({ error: 'No environmentId provided and no default configured.' });
-  }
-
-  const runs = await flowClient.getFlowRuns(envId, args.flowId, {
-    top: args.top,
-    status: args.status,
-  });
-
-  return JSON.stringify({
-    flowId: args.flowId,
-    totalRuns: runs.length,
-    runs: runs.map(r => ({
-      runId: r.name,
-      status: r.status,
-      startTime: r.startTime,
-      endTime: r.endTime || null,
-      triggerName: r.triggerName,
-      error: r.error || null,
-    })),
-  }, null, 2);
+    async (args: any) => {
+      try {
+        const envId = resolveEnvironmentId(args.environmentId);
+        const data = await client.getRunHistory(envId, args.flowId, args.top);
+        const runs = (data.value || []).map((r: any) => ({
+          id: r.name,
+          status: r.properties?.status,
+          startTime: r.properties?.startTime,
+          endTime: r.properties?.endTime,
+          trigger: r.properties?.trigger?.name,
+        }));
+        return { content: [{ type: 'text', text: JSON.stringify({ flowId: args.flowId, totalRuns: runs.length, runs }, null, 2) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }] };
+      }
+    }
+  );
 }

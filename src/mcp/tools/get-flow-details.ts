@@ -1,57 +1,35 @@
-// ═══════════════════════════════════════════════════════════════
-// Tool: pa-get-flow-details
-// Gets complete details about a specific flow, including its definition.
-// ═══════════════════════════════════════════════════════════════
-
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { FlowClient } from '../../clients/flow-client.js';
+import type { Logger } from 'winston';
+import { PowerPlatformClient } from '../../api/power-platform-client.js';
+import { resolveEnvironmentId } from '../../config/environment-resolver.js';
 
-export const getFlowDetailsSchema = z.object({
-  environmentId: z.string().optional().describe(
-    'Power Platform environment ID. Uses default if omitted.'
-  ),
-  flowId: z.string().describe(
-    'The unique identifier (GUID) of the flow to inspect.'
-  ),
-});
-
-export const getFlowDetailsDefinition = {
-  name: 'pa-get-flow-details',
-  description: [
-    'Gets complete details about a specific Power Automate flow,',
-    'including its definition (triggers, actions, conditions),',
-    'state, creation time, and HTTP trigger URI if applicable.',
-    'Use pa-list-flows first to discover flow IDs.',
-  ].join(' '),
-  inputSchema: {
-    type: 'object' as const,
-    properties: {
-      environmentId: { type: 'string', description: 'Power Platform environment ID.' },
-      flowId: { type: 'string', description: 'The flow GUID to inspect.' },
+export function registerGetFlowDetails(server: McpServer, client: PowerPlatformClient, defaultEnvId: string, logger: Logger): void {
+  (server as any).tool(
+    'pa-get-flow-details',
+    'Gets detailed information about a specific Power Automate flow including its definition, triggers, actions, connections, and current state.',
+    {
+      flowId: z.string().describe('The unique identifier of the flow.'),
+      environmentId: z.string().optional().describe('Power Platform environment ID. Uses default if omitted.'),
     },
-    required: ['flowId'],
-  },
-};
-
-export async function executeGetFlowDetails(
-  args: z.infer<typeof getFlowDetailsSchema>,
-  flowClient: FlowClient,
-  defaultEnvId: string
-): Promise<string> {
-  const envId = args.environmentId || defaultEnvId;
-  if (!envId) {
-    return JSON.stringify({ error: 'No environmentId provided and no default configured.' });
-  }
-
-  const flow = await flowClient.getFlowDetails(envId, args.flowId);
-  return JSON.stringify({
-    id: flow.name,
-    displayName: flow.displayName,
-    state: flow.state,
-    createdTime: flow.createdTime,
-    lastModifiedTime: flow.lastModifiedTime,
-    hasTriggerUri: !!flow.flowTriggerUri,
-    triggerUri: flow.flowTriggerUri || null,
-    definition: flow.definition,
-  }, null, 2);
+    async (args: any) => {
+      try {
+        const envId = resolveEnvironmentId(args.environmentId);
+        const flow = await client.getFlowDetails(envId, args.flowId);
+        const result = {
+          id: flow.name,
+          displayName: flow.properties?.displayName,
+          state: flow.properties?.state,
+          createdTime: flow.properties?.createdTime,
+          lastModifiedTime: flow.properties?.lastModifiedTime,
+          connectionReferences: flow.properties?.connectionReferences,
+          triggers: flow.properties?.definition?.triggers,
+          actions: flow.properties?.definition?.actions,
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }] };
+      }
+    }
+  );
 }
