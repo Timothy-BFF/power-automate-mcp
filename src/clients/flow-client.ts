@@ -4,13 +4,13 @@
 // All operations use admin-scoped endpoints:
 //   /scopes/admin/environments/{envId}/...
 //
-// IMPORTANT: Return types are RAW ARRAYS (FlowSummary[],
-// RunSummary[]) — NOT wrapper objects. The existing tool handler
-// files call .length and .map() directly on the returned values.
+// Returns RAW ARRAYS from list methods (handlers call .length/.map).
 //
-// Method name aliases:
-//   getFlowRunDetails() → getRunDetails()  (used by get-run-details handler)
-//   getRunHistory()     → getFlowRuns()    (alias for compatibility)
+// Method aliases (handler compatibility):
+//   getFlowRunDetails() → getRunDetails()    (get-run-details.ts)
+//   getRunHistory()     → getFlowRuns()       (alias)
+//   cancelFlowRun()     → cancelRun()         (cancel-run.ts)
+//   setFlowState()      → enableDisableFlow() (enable-disable-flow.ts)
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════
@@ -19,8 +19,6 @@ import { AxiosInstance } from 'axios';
 import winston from 'winston';
 
 const API_VERSION = '2016-11-01';
-
-// ── Return type interfaces ──────────────────────────────────────
 
 export interface FlowSummary {
   name: string;
@@ -50,19 +48,12 @@ export class FlowClient {
     this.logger = logger;
   }
 
-  /**
-   * Build an admin-scoped path for the Flow API.
-   */
   private adminPath(envId: string, subPath: string): string {
     return `/scopes/admin/environments/${envId}${subPath}`;
   }
 
   // ── listFlows ─────────────────────────────────────────────────
-  // Returns: FlowSummary[]  (raw array — handlers call .length / .map)
-  // Accepts:
-  //   listFlows(envId, filter?, top?)
-  //   listFlows(envId, { filter?, top? })
-  // ────────────────────────────────────────────────────────────────
+  // Returns: FlowSummary[] (raw array)
   async listFlows(
     environmentId: string,
     filterOrOptions?: any,
@@ -175,6 +166,15 @@ export class FlowClient {
     };
   }
 
+  // ── setFlowState (alias — used by enable-disable-flow.ts handler) ──
+  async setFlowState(
+    environmentId: string,
+    flowId: string,
+    actionOrOptions?: any
+  ): Promise<any> {
+    return this.enableDisableFlow(environmentId, flowId, actionOrOptions);
+  }
+
   // ── deleteFlow ────────────────────────────────────────────────
   async deleteFlow(environmentId: string, flowId: string): Promise<any> {
     this.logger.info(`Deleting flow: ${flowId} in ${environmentId}`);
@@ -245,12 +245,7 @@ export class FlowClient {
   }
 
   // ── getFlowRuns ───────────────────────────────────────────────
-  // Returns: RunSummary[]  (raw array — handlers call .length / .map)
-  // Accepts:
-  //   getFlowRuns(envId, flowId, top?)
-  //   getFlowRuns(envId, flowId, { top? })
-  //   getFlowRuns(envId, { flowId?, top? })
-  // ────────────────────────────────────────────────────────────────
+  // Returns: RunSummary[] (raw array)
   async getFlowRuns(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -295,7 +290,7 @@ export class FlowClient {
     return runs;
   }
 
-  // ── getRunHistory (alias for getFlowRuns) ─────────────────────
+  // ── getRunHistory (alias) ─────────────────────────────────────
   async getRunHistory(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -349,7 +344,7 @@ export class FlowClient {
     };
   }
 
-  // ── getFlowRunDetails (alias — used by get-run-details handler) ──
+  // ── getFlowRunDetails (alias — used by get-run-details.ts) ───────
   async getFlowRunDetails(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -361,9 +356,28 @@ export class FlowClient {
   // ── cancelRun ─────────────────────────────────────────────────
   async cancelRun(
     environmentId: string,
-    flowId: string,
-    runId: string
+    flowIdOrOptions?: any,
+    runIdOrOptions?: any
   ): Promise<any> {
+    let flowId: string | undefined;
+    let runId: string | undefined;
+
+    if (typeof flowIdOrOptions === 'object' && flowIdOrOptions !== null) {
+      flowId = flowIdOrOptions.flowId;
+      runId = flowIdOrOptions.runId;
+    } else {
+      flowId = flowIdOrOptions;
+      if (typeof runIdOrOptions === 'object' && runIdOrOptions !== null) {
+        runId = runIdOrOptions.runId;
+      } else {
+        runId = runIdOrOptions;
+      }
+    }
+
+    if (!flowId || !runId) {
+      throw new Error('flowId and runId are required for cancelRun');
+    }
+
     this.logger.info(`Cancelling run: ${runId} for flow ${flowId}`);
 
     const url = this.adminPath(environmentId, `/v2/flows/${flowId}/runs/${runId}/cancel`);
@@ -372,5 +386,14 @@ export class FlowClient {
     });
 
     return { success: true, runId, message: 'Run cancelled successfully.' };
+  }
+
+  // ── cancelFlowRun (alias — used by cancel-run.ts handler) ───────
+  async cancelFlowRun(
+    environmentId: string,
+    flowIdOrOptions?: any,
+    runIdOrOptions?: any
+  ): Promise<any> {
+    return this.cancelRun(environmentId, flowIdOrOptions, runIdOrOptions);
   }
 }
