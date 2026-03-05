@@ -4,13 +4,13 @@
 // All operations use admin-scoped endpoints:
 //   /scopes/admin/environments/{envId}/...
 //
-// IMPORTANT: Return types are Promise<any> and methods return
-// RAW arrays (not wrapped objects) because the existing tool
-// handlers call .length and .map() directly on the result.
+// IMPORTANT: Return types are RAW ARRAYS (FlowSummary[],
+// RunSummary[]) — NOT wrapper objects. The existing tool handler
+// files call .length and .map() directly on the returned values.
 //
-// Method aliases:
-//   getFlowRunDetails() → getRunDetails()  (handler compatibility)
-//   getRunHistory()     → getFlowRuns()    (handler compatibility)
+// Method name aliases:
+//   getFlowRunDetails() → getRunDetails()  (used by get-run-details handler)
+//   getRunHistory()     → getFlowRuns()    (alias for compatibility)
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════
@@ -19,6 +19,27 @@ import { AxiosInstance } from 'axios';
 import winston from 'winston';
 
 const API_VERSION = '2016-11-01';
+
+// ── Return type interfaces ──────────────────────────────────────
+
+export interface FlowSummary {
+  name: string;
+  displayName: string;
+  state: string;
+  createdTime?: string;
+  lastModifiedTime?: string;
+  creator?: string;
+  [key: string]: any;
+}
+
+export interface RunSummary {
+  id: string;
+  status: string;
+  startTime?: string;
+  endTime?: string;
+  trigger?: string;
+  [key: string]: any;
+}
 
 export class FlowClient {
   private client: AxiosInstance;
@@ -36,17 +57,17 @@ export class FlowClient {
     return `/scopes/admin/environments/${envId}${subPath}`;
   }
 
-  // ── listFlows ───────────────────────────────────────────────
-  // Returns: raw array of flow objects (handler calls .length/.map)
+  // ── listFlows ─────────────────────────────────────────────────
+  // Returns: FlowSummary[]  (raw array — handlers call .length / .map)
   // Accepts:
   //   listFlows(envId, filter?, top?)
   //   listFlows(envId, { filter?, top? })
-  // ────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────────────
   async listFlows(
     environmentId: string,
     filterOrOptions?: any,
     top?: any
-  ): Promise<any> {
+  ): Promise<FlowSummary[]> {
     let filter: string | undefined;
     let topVal: number | undefined;
 
@@ -69,8 +90,7 @@ export class FlowClient {
     const response = await this.client.get(url, { params });
     const data = response.data;
 
-    // Return RAW ARRAY — handlers call result.length and result.map()
-    const flows = (data.value || []).map((flow: any) => ({
+    const flows: FlowSummary[] = (data.value || []).map((flow: any) => ({
       name: flow.name,
       displayName: flow.properties?.displayName || flow.name,
       state: flow.properties?.state || 'Unknown',
@@ -82,7 +102,7 @@ export class FlowClient {
     return flows;
   }
 
-  // ── getFlowDetails ──────────────────────────────────────────
+  // ── getFlowDetails ────────────────────────────────────────────
   async getFlowDetails(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -122,7 +142,7 @@ export class FlowClient {
     };
   }
 
-  // ── enableDisableFlow ───────────────────────────────────────
+  // ── enableDisableFlow ─────────────────────────────────────────
   async enableDisableFlow(
     environmentId: string,
     flowId: string,
@@ -155,7 +175,7 @@ export class FlowClient {
     };
   }
 
-  // ── deleteFlow ──────────────────────────────────────────────
+  // ── deleteFlow ────────────────────────────────────────────────
   async deleteFlow(environmentId: string, flowId: string): Promise<any> {
     this.logger.info(`Deleting flow: ${flowId} in ${environmentId}`);
 
@@ -167,7 +187,7 @@ export class FlowClient {
     return { success: true, flowId, message: 'Flow deleted successfully.' };
   }
 
-  // ── triggerFlow ─────────────────────────────────────────────
+  // ── triggerFlow ───────────────────────────────────────────────
   async triggerFlow(
     environmentId: string,
     flowIdOrBody?: any,
@@ -224,18 +244,18 @@ export class FlowClient {
     }
   }
 
-  // ── getFlowRuns ─────────────────────────────────────────────
-  // Returns: raw array of run objects (handler calls .length/.map)
+  // ── getFlowRuns ───────────────────────────────────────────────
+  // Returns: RunSummary[]  (raw array — handlers call .length / .map)
   // Accepts:
   //   getFlowRuns(envId, flowId, top?)
   //   getFlowRuns(envId, flowId, { top? })
   //   getFlowRuns(envId, { flowId?, top? })
-  // ────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────────────
   async getFlowRuns(
     environmentId: string,
     flowIdOrOptions?: any,
     topOrOptions?: any
-  ): Promise<any> {
+  ): Promise<RunSummary[]> {
     let flowId: string | undefined;
     let top: number | undefined;
 
@@ -264,8 +284,7 @@ export class FlowClient {
     const response = await this.client.get(url, { params });
     const data = response.data;
 
-    // Return RAW ARRAY — handlers call result.length and result.map()
-    const runs = (data.value || []).map((run: any) => ({
+    const runs: RunSummary[] = (data.value || []).map((run: any) => ({
       id: run.name,
       status: run.properties?.status || 'Unknown',
       startTime: run.properties?.startTime,
@@ -276,16 +295,16 @@ export class FlowClient {
     return runs;
   }
 
-  // ── getRunHistory (alias for getFlowRuns) ───────────────────
+  // ── getRunHistory (alias for getFlowRuns) ─────────────────────
   async getRunHistory(
     environmentId: string,
     flowIdOrOptions?: any,
     topOrOptions?: any
-  ): Promise<any> {
+  ): Promise<RunSummary[]> {
     return this.getFlowRuns(environmentId, flowIdOrOptions, topOrOptions);
   }
 
-  // ── getRunDetails ───────────────────────────────────────────
+  // ── getRunDetails ─────────────────────────────────────────────
   async getRunDetails(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -330,7 +349,7 @@ export class FlowClient {
     };
   }
 
-  // ── getFlowRunDetails (alias — handler uses this name) ──────
+  // ── getFlowRunDetails (alias — used by get-run-details handler) ──
   async getFlowRunDetails(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -339,7 +358,7 @@ export class FlowClient {
     return this.getRunDetails(environmentId, flowIdOrOptions, runIdOrOptions);
   }
 
-  // ── cancelRun ───────────────────────────────────────────────
+  // ── cancelRun ─────────────────────────────────────────────────
   async cancelRun(
     environmentId: string,
     flowId: string,
