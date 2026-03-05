@@ -29,21 +29,24 @@ interface TokenEntry {
   refreshPromise: Promise<string> | null;
 }
 
-interface TokenManagerConfig {
+export interface TokenManagerConfig {
   clientId: string;
   clientSecret: string;
-  tokenEndpoint: string;
+  tenantId: string;
   scopes: Record<TokenScope, string>;
 }
 
 export class AzureTokenManager {
   private config: TokenManagerConfig;
+  private tokenEndpoint: string;
   private tokens: Map<TokenScope, TokenEntry> = new Map();
   private logger: winston.Logger;
 
   constructor(config: TokenManagerConfig, logger: winston.Logger) {
     this.config = config;
     this.logger = logger;
+    // Derive token endpoint from tenantId
+    this.tokenEndpoint = `https://login.microsoftonline.com/${config.tenantId.trim()}/oauth2/v2.0/token`;
   }
 
   /**
@@ -85,7 +88,7 @@ export class AzureTokenManager {
     const scopeUrl = this.config.scopes[scope];
     this.logger.info(`Acquiring Azure AD token for scope: ${scope} (${scopeUrl})`);
 
-    const refreshPromise = this.acquireToken(scopeUrl);
+    const refreshPromise = this.acquireToken(scope, scopeUrl);
 
     // Store the promise so concurrent requests can wait
     const currentEntry = this.tokens.get(scope);
@@ -109,16 +112,16 @@ export class AzureTokenManager {
     }
   }
 
-  private async acquireToken(scopeUrl: string): Promise<string> {
+  private async acquireToken(scope: TokenScope, scopeUrl: string): Promise<string> {
     try {
       const params = new URLSearchParams({
         grant_type: 'client_credentials',
-        client_id: this.config.clientId,
-        client_secret: this.config.clientSecret,
-        scope: scopeUrl,
+        client_id: this.config.clientId.trim(),
+        client_secret: this.config.clientSecret.trim(),
+        scope: scopeUrl.trim(),
       });
 
-      const response = await axios.post(this.config.tokenEndpoint, params.toString(), {
+      const response = await axios.post(this.tokenEndpoint, params.toString(), {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         timeout: 15000,
       });
@@ -126,21 +129,14 @@ export class AzureTokenManager {
       const { access_token, expires_in } = response.data;
       const expiresAt = Date.now() + (expires_in * 1000);
 
-      // Determine which scope this belongs to
-      const scope = Object.entries(this.config.scopes).find(
-        ([, url]) => url === scopeUrl
-      )?.[0] as TokenScope;
+      this.tokens.set(scope, {
+        accessToken: access_token,
+        expiresAt,
+        refreshPromise: null,
+      });
 
-      if (scope) {
-        this.tokens.set(scope, {
-          accessToken: access_token,
-          expiresAt,
-          refreshPromise: null,
-        });
-
-        const expiresInMin = Math.round(expires_in / 60);
-        this.logger.info(`Token acquired for scope '${scope}', expires in ${expiresInMin} min`);
-      }
+      const expiresInMin = Math.round(expires_in / 60);
+      this.logger.info(`Token acquired for scope '${scope}', expires in ${expiresInMin} min`);
 
       return access_token;
     } catch (error) {
@@ -163,7 +159,8 @@ export class AzureTokenManager {
    *
    * IMPORTANT: For the 'flow' scope, the Power Automate Flow API
    * requires the x-ms-client-scope header for service principal auth.
-   * This header is automatically injected here.
+   * Without it, the API returns 401 ClientScopeAuthorizationFailed:
+   * "The x-ms-client-scope header must not be null or empty."
    */
   createAuthenticatedClient(scope: TokenScope, baseURL: string): AxiosInstance {
     // Build default headers — Flow API requires x-ms-client-scope
