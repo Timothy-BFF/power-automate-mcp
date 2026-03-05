@@ -30,23 +30,26 @@ interface TokenEntry {
 }
 
 export interface TokenManagerConfig {
+  tenantId: string;
   clientId: string;
   clientSecret: string;
-  tenantId: string;
+  tokenEndpoint: string;
   scopes: Record<TokenScope, string>;
 }
 
 export class AzureTokenManager {
   private config: TokenManagerConfig;
-  private tokenEndpoint: string;
   private tokens: Map<TokenScope, TokenEntry> = new Map();
   private logger: winston.Logger;
 
-  constructor(config: TokenManagerConfig, logger: winston.Logger) {
+  // ── Static factory (called by index.ts) ──
+  static initialize(config: TokenManagerConfig, logger: winston.Logger): AzureTokenManager {
+    return new AzureTokenManager(config, logger);
+  }
+
+  private constructor(config: TokenManagerConfig, logger: winston.Logger) {
     this.config = config;
     this.logger = logger;
-    // Derive token endpoint from tenantId
-    this.tokenEndpoint = `https://login.microsoftonline.com/${config.tenantId.trim()}/oauth2/v2.0/token`;
   }
 
   /**
@@ -113,6 +116,11 @@ export class AzureTokenManager {
   }
 
   private async acquireToken(scope: TokenScope, scopeUrl: string): Promise<string> {
+    // Use the tokenEndpoint from config, fall back to constructing from tenantId
+    const endpoint = this.config.tokenEndpoint
+      ? this.config.tokenEndpoint.trim()
+      : `https://login.microsoftonline.com/${this.config.tenantId.trim()}/oauth2/v2.0/token`;
+
     try {
       const params = new URLSearchParams({
         grant_type: 'client_credentials',
@@ -121,7 +129,7 @@ export class AzureTokenManager {
         scope: scopeUrl.trim(),
       });
 
-      const response = await axios.post(this.tokenEndpoint, params.toString(), {
+      const response = await axios.post(endpoint, params.toString(), {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         timeout: 15000,
       });
@@ -170,8 +178,6 @@ export class AzureTokenManager {
 
     if (scope === 'flow') {
       // The Flow API requires this header for service principal (client_credentials) auth.
-      // Without it, the API returns 401 ClientScopeAuthorizationFailed:
-      // "The x-ms-client-scope header must not be null or empty."
       defaultHeaders['x-ms-client-scope'] = this.config.scopes[scope];
       this.logger.info(`Flow client will include x-ms-client-scope: ${this.config.scopes[scope]}`);
     }
