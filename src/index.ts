@@ -6,10 +6,17 @@
 // Deployed on Railway with health endpoint.
 // Startup-resilient: boots even without Azure credentials.
 //
-// Note: @ts-nocheck is used on this composition root because the MCP SDK
-// v1.12+ has strict overload resolution conflicts with our executor
-// function signatures. All actual type safety is enforced in the
-// individual tool, client, and auth modules.
+// SIMTHEORY.AI DISCOVERY PROTOCOL (learned from production logs):
+//   1. POST /       — JSON-RPC initialize (python-requests)
+//   2. GET /        — Server info probe (python-requests)
+//   3. POST /tools  — JSON-RPC tools/list (python-requests)
+//   4. GET /tools   — REST tool listing (python-requests)
+//   5. GET /events  — SSE event stream (Simtheory/mcp-operator)
+//   6. GET /sse     — MCP SSE transport (python-requests)
+//
+// Tool discovery happens via REST probes (#1-4), NOT through
+// the SSE JSON-RPC protocol. If these return 404, no tools
+// appear in chat sessions.
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -68,7 +75,6 @@ logger.info('╚═════════════════════�
 
 // ─────────────────────────────────────────────────────────────────
 // Initialize Azure Token Manager (No-Bother Protocol)
-// Only initializes if Azure AD credentials are fully configured.
 // ─────────────────────────────────────────────────────────────────
 
 let tokenManager: AzureTokenManager | null = null;
@@ -92,18 +98,9 @@ if (config.azure.isConfigured) {
     logger
   );
 
-  const flowHttpClient = tokenManager.createAuthenticatedClient(
-    'flow',
-    config.powerPlatform.flowApiBase
-  );
-  const envHttpClient = tokenManager.createAuthenticatedClient(
-    'management',
-    config.powerPlatform.environmentApiBase
-  );
-  const connHttpClient = tokenManager.createAuthenticatedClient(
-    'flow',
-    config.powerPlatform.flowApiBase
-  );
+  const flowHttpClient = tokenManager.createAuthenticatedClient('flow', config.powerPlatform.flowApiBase);
+  const envHttpClient = tokenManager.createAuthenticatedClient('management', config.powerPlatform.environmentApiBase);
+  const connHttpClient = tokenManager.createAuthenticatedClient('flow', config.powerPlatform.flowApiBase);
 
   flowClient = new FlowClient(flowHttpClient, logger);
   envClient = new EnvironmentClient(envHttpClient, logger);
@@ -134,10 +131,152 @@ function requireConfigured(): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// MCP Server + Tool Registration
+// Tool Definitions for REST Discovery
 //
-// Executor signatures: (args, client, defaultEnvId) => Promise<string>
-// MCP SDK expects: { content: [{ type: 'text', text: string }] }
+// Simtheory.ai discovers tools by probing GET/POST /tools BEFORE
+// connecting via SSE. These definitions are served as REST JSON
+// responses independently of the MCP SDK's JSON-RPC tool listing.
+// ─────────────────────────────────────────────────────────────────
+
+const TOOL_DEFINITIONS = [
+  {
+    name: 'pa-list-environments',
+    description: 'Lists all Power Platform environments accessible to the configured service principal. Returns environment ID, display name, location, SKU, and lifecycle state for each environment.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'pa-list-flows',
+    description: 'Lists all Power Automate flows in a Power Platform environment. Returns flow name, display name, state (Started/Stopped), created time, and last modified time. Use filter to narrow by personal or shared flows. Provide environmentId or uses the default configured environment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        filter: { type: 'string', enum: ['personal', 'shared', 'all'], description: 'Filter by ownership type: personal (my flows), shared (team flows), or all.' },
+        top: { type: 'number', description: 'Maximum number of flows to return.' },
+      },
+    },
+  },
+  {
+    name: 'pa-get-flow-details',
+    description: 'Gets detailed information about a specific Power Automate flow including its definition, triggers, actions, connections, and current state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId'],
+    },
+  },
+  {
+    name: 'pa-enable-disable-flow',
+    description: 'Enables or disables a Power Automate flow. Use action "start" to enable or "stop" to disable the flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
+        action: { type: 'string', enum: ['start', 'stop'], description: 'Action to perform: start (enable) or stop (disable) the flow.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId', 'action'],
+    },
+  },
+  {
+    name: 'pa-delete-flow',
+    description: 'Permanently deletes a Power Automate flow. This action cannot be undone. Use with caution.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow to delete.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId'],
+    },
+  },
+  {
+    name: 'pa-trigger-flow',
+    description: 'Manually triggers a Power Automate flow that has an HTTP request trigger. Optionally pass a JSON body to the trigger.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow to trigger.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        triggerBody: { type: 'object', description: 'Optional JSON body to pass to the flow trigger.' },
+      },
+      required: ['flowId'],
+    },
+  },
+  {
+    name: 'pa-get-run-history',
+    description: 'Gets the run history for a specific Power Automate flow. Returns run ID, status (Succeeded/Failed/Running/Cancelled), start time, end time, and trigger information.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        top: { type: 'number', description: 'Maximum number of runs to return.' },
+      },
+      required: ['flowId'],
+    },
+  },
+  {
+    name: 'pa-get-run-details',
+    description: 'Gets detailed information about a specific flow run including action-level results, inputs, outputs, and timing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
+        runId: { type: 'string', description: 'The unique identifier of the run.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId', 'runId'],
+    },
+  },
+  {
+    name: 'pa-cancel-run',
+    description: 'Cancels a currently running Power Automate flow run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
+        runId: { type: 'string', description: 'The unique identifier of the run to cancel.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId', 'runId'],
+    },
+  },
+  {
+    name: 'pa-list-connections',
+    description: 'Lists all Power Platform connections in an environment. Returns connection ID, display name, status, connector information, and creation time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+    },
+  },
+];
+
+const SERVER_INFO = {
+  name: 'power-automate-mcp',
+  version: '1.0.0',
+};
+
+const MCP_CAPABILITIES = {
+  protocolVersion: '2024-11-05',
+  capabilities: {
+    tools: { listChanged: true },
+  },
+  serverInfo: SERVER_INFO,
+};
+
+logger.info(`Tool definitions loaded: ${TOOL_DEFINITIONS.length} tools available for REST discovery.`);
+
+// ─────────────────────────────────────────────────────────────────
+// MCP Server + Tool Registration (for SSE JSON-RPC transport)
 // ─────────────────────────────────────────────────────────────────
 
 const mcpServer = new McpServer({
@@ -217,10 +356,10 @@ registerTool('pa-list-connections', listConnectionsSchema.shape, async (args) =>
   return { content: [{ type: 'text', text: result }] };
 });
 
-logger.info('All 10 MCP tools registered successfully.');
+logger.info('All 10 MCP tools registered (SDK + REST discovery).');
 
 // ─────────────────────────────────────────────────────────────────
-// Express Server + SSE Transport
+// Express Server
 // ─────────────────────────────────────────────────────────────────
 
 const app = express();
@@ -229,12 +368,122 @@ app.use(express.json());
 // ─────── Request Logging Middleware ───────
 app.use((req, res, next) => {
   if (req.path !== '/health') {
-    logger.info(`Incoming request: ${req.method} ${req.path}`, {
+    const logData: Record<string, any> = {
       hasAuth: !!req.headers['authorization'],
       userAgent: req.headers['user-agent'] || 'unknown',
-    });
+      contentType: req.headers['content-type'] || 'none',
+    };
+    // Log POST bodies for diagnostics (truncated)
+    if (req.method === 'POST' && req.body) {
+      logData.body = JSON.stringify(req.body).substring(0, 500);
+    }
+    logger.info(`Incoming: ${req.method} ${req.path}`, logData);
   }
   next();
+});
+
+// ═══════════════════════════════════════════════════════════════
+// REST Discovery Endpoints
+//
+// Simtheory.ai probes these BEFORE connecting via SSE.
+// Tool registration in the chat UI depends on these responses.
+// ═══════════════════════════════════════════════════════════════
+
+// ─────── Root Endpoint: Server Info + JSON-RPC Initialize ───────
+app.get('/', (_req, res) => {
+  logger.info('REST discovery: GET / — returning server info');
+  res.json({
+    jsonrpc: '2.0',
+    result: MCP_CAPABILITIES,
+  });
+});
+
+app.post('/', (req, res) => {
+  const body = req.body;
+
+  // Handle JSON-RPC requests
+  if (body?.jsonrpc === '2.0') {
+    logger.info(`JSON-RPC on POST /: method=${body.method}, id=${body.id}`);
+
+    if (body.method === 'initialize') {
+      return res.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: MCP_CAPABILITIES,
+      });
+    }
+
+    if (body.method === 'tools/list') {
+      logger.info('Serving tool list via JSON-RPC on POST /');
+      return res.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: { tools: TOOL_DEFINITIONS },
+      });
+    }
+
+    if (body.method === 'notifications/initialized') {
+      return res.json({
+        jsonrpc: '2.0',
+        id: body.id || null,
+        result: {},
+      });
+    }
+
+    // Unknown method — return method not found
+    logger.warn(`Unknown JSON-RPC method on POST /: ${body.method}`);
+    return res.json({
+      jsonrpc: '2.0',
+      id: body.id,
+      error: { code: -32601, message: `Method not found: ${body.method}` },
+    });
+  }
+
+  // Non-JSON-RPC POST — return server info
+  res.json({
+    ...SERVER_INFO,
+    tools: TOOL_DEFINITIONS.length,
+    endpoints: {
+      sse: '/sse',
+      events: '/events',
+      tools: '/tools',
+      health: '/health',
+      messages: '/messages',
+    },
+  });
+});
+
+// ─────── Tools Endpoint: REST + JSON-RPC Tool Discovery ───────
+app.get('/tools', (_req, res) => {
+  logger.info('REST discovery: GET /tools — returning tool definitions');
+  res.json({ tools: TOOL_DEFINITIONS });
+});
+
+app.post('/tools', (req, res) => {
+  const body = req.body;
+
+  // Handle JSON-RPC tools/list
+  if (body?.jsonrpc === '2.0') {
+    logger.info(`JSON-RPC on POST /tools: method=${body.method}, id=${body.id}`);
+
+    if (body.method === 'tools/list') {
+      return res.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: { tools: TOOL_DEFINITIONS },
+      });
+    }
+
+    return res.json({
+      jsonrpc: '2.0',
+      id: body.id,
+      error: { code: -32601, message: `Method not found: ${body.method}` },
+    });
+  }
+
+  // Non-JSON-RPC POST — return tool list
+  logger.info('REST discovery: POST /tools — returning tool definitions');
+  res.json({ tools: TOOL_DEFINITIONS });
 });
 
 // ─────── Health Endpoint ───────
@@ -272,7 +521,7 @@ app.get('/health', async (_req, res) => {
         missingVariables: missingVars.length > 0 ? missingVars : undefined,
       },
       auth: tokenStatus,
-      tools: 10,
+      tools: TOOL_DEFINITIONS.length,
     });
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
@@ -281,45 +530,37 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// SSE Transport for MCP
+// ═══════════════════════════════════════════════════════════════
+// SSE Transport Endpoints
 //
-// CRITICAL: The MCP SDK only allows ONE transport per McpServer
-// instance at a time. When Simtheory.ai reconnects (which it does
-// periodically), we must close() the existing connection before
-// connecting the new transport. Tool registrations are preserved
-// across close()/connect() cycles — only the transport is reset.
-// ─────────────────────────────────────────────────────────────────
+// Both /sse and /events serve as MCP SSE transport endpoints.
+// Simtheory.ai probes both — /events with Simtheory/mcp-operator
+// user agent, /sse with python-requests.
+// ═══════════════════════════════════════════════════════════════
+
 const transports: Map<string, SSEServerTransport> = new Map();
 
-app.get('/sse', async (req, res) => {
+async function handleSSEConnection(req: express.Request, res: express.Response, endpoint: string) {
   try {
-    logger.info('New SSE connection request received');
+    logger.info(`New SSE connection on ${endpoint}`);
 
-    // Close any existing MCP connection to allow reconnection.
-    // The MCP SDK only supports one transport at a time per server.
-    // Tool registrations persist across close/connect cycles.
+    // Close any existing MCP connection for reconnection
     try {
       await mcpServer.close();
       logger.info('Previous MCP transport closed for reconnection');
-    } catch (closeErr) {
-      // Expected on first connection — no previous transport exists
+    } catch {
       logger.debug('No previous transport to close (first connection)');
     }
 
-    // Clean up any stale transport references
+    // Clean up stale transports
     for (const [id, oldTransport] of transports.entries()) {
-      try {
-        await oldTransport.close();
-      } catch {
-        // Already closed
-      }
+      try { await oldTransport.close(); } catch { /* already closed */ }
       transports.delete(id);
     }
 
     const transport = new SSEServerTransport('/messages', res);
     transports.set(transport.sessionId, transport);
-    logger.info(`SSE session created: ${transport.sessionId}`);
+    logger.info(`SSE session created: ${transport.sessionId} (via ${endpoint})`);
 
     res.on('close', () => {
       logger.info(`SSE connection closed: ${transport.sessionId}`);
@@ -335,12 +576,15 @@ app.get('/sse', async (req, res) => {
     logger.info(`MCP server connected to SSE session: ${transport.sessionId}`);
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
-    logger.error('SSE connection setup failed', { message: err.message, stack: err.stack });
+    logger.error(`SSE connection setup failed on ${endpoint}`, { message: err.message, stack: err.stack });
     if (!res.headersSent) {
       res.status(500).json({ error: 'SSE connection failed' });
     }
   }
-});
+}
+
+app.get('/sse', (req, res) => handleSSEConnection(req, res, '/sse'));
+app.get('/events', (req, res) => handleSSEConnection(req, res, '/events'));
 
 app.post('/messages', async (req, res) => {
   try {
@@ -376,8 +620,11 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 // ─────── Start Server ───────
 app.listen(config.port, '0.0.0.0', () => {
   logger.info(`Server listening on port ${config.port}`);
-  logger.info(`Health: http://0.0.0.0:${config.port}/health`);
-  logger.info(`SSE:    http://0.0.0.0:${config.port}/sse`);
+  logger.info(`Health:  http://0.0.0.0:${config.port}/health`);
+  logger.info(`SSE:     http://0.0.0.0:${config.port}/sse`);
+  logger.info(`Events:  http://0.0.0.0:${config.port}/events`);
+  logger.info(`Tools:   http://0.0.0.0:${config.port}/tools`);
+  logger.info(`REST discovery endpoints active for Simtheory.ai`);
   if (!config.azure.isConfigured) {
     logger.warn('Awaiting Azure AD configuration — add credentials to Railway variables and redeploy.');
   }
