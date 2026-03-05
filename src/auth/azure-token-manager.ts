@@ -1,30 +1,35 @@
 // ═══════════════════════════════════════════════════════════════
 // Power Automate MCP Server — Azure AD Token Manager
-// "No-Bother" Protocol: Users never manually refresh tokens.
 //
-// Supports dual-scope tokens:
-//   - Flow API scope (service.flow.microsoft.com)
-//   - Management API scope (management.azure.com)
+// Manages OAuth2 client_credentials tokens for two scopes:
+//   - 'flow'       → Power Automate Flow API
+//   - 'management' → Power Platform BAP API
 //
-// Features:
-//   - Proactive refresh when token has < 5 min remaining
-//   - Automatic 401 retry with fresh token
-//   - Thread-safe singleton per scope
+// Implements the "No-Bother Protocol":
+//   - Auto-refresh when token < 5 min from expiry
+//   - 401 retry interceptor with fresh token
+//   - 429 rate-limit backoff
+//   - Concurrent request coalescing (one refresh per scope)
+//
+// IMPORTANT: The Flow API requires a custom x-ms-client-scope
+// header for service principal authentication. This is injected
+// automatically when creating the flow-scoped client.
+//
+// Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════
 
-import axios, { AxiosInstance, InternalAxiosRequestConfig, AxiosError } from 'axios';
+import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
 import winston from 'winston';
 
 export type TokenScope = 'flow' | 'management';
 
 interface TokenEntry {
   accessToken: string;
-  expiresAt: number; // Unix timestamp in ms
+  expiresAt: number;
   refreshPromise: Promise<string> | null;
 }
 
-interface AzureTokenConfig {
-  tenantId: string;
+interface TokenManagerConfig {
   clientId: string;
   clientSecret: string;
   tokenEndpoint: string;
@@ -32,46 +37,30 @@ interface AzureTokenConfig {
 }
 
 export class AzureTokenManager {
-  private static instance: AzureTokenManager | null = null;
+  private config: TokenManagerConfig;
   private tokens: Map<TokenScope, TokenEntry> = new Map();
-  private readonly REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
-  private config: AzureTokenConfig;
   private logger: winston.Logger;
 
-  private constructor(config: AzureTokenConfig, logger: winston.Logger) {
+  constructor(config: TokenManagerConfig, logger: winston.Logger) {
     this.config = config;
     this.logger = logger;
   }
 
-  static initialize(config: AzureTokenConfig, logger: winston.Logger): AzureTokenManager {
-    if (!AzureTokenManager.instance) {
-      AzureTokenManager.instance = new AzureTokenManager(config, logger);
-    }
-    return AzureTokenManager.instance;
-  }
-
-  static getInstance(): AzureTokenManager {
-    if (!AzureTokenManager.instance) {
-      throw new Error('AzureTokenManager not initialized. Call initialize() first.');
-    }
-    return AzureTokenManager.instance;
-  }
-
   /**
-   * Get a valid access token for the specified scope.
-   * Automatically refreshes if expired or nearing expiry.
+   * Get a valid token for the specified scope.
+   * Returns cached token if still valid (> 5 min remaining).
+   * Otherwise triggers a refresh.
    */
   async getToken(scope: TokenScope): Promise<string> {
     const entry = this.tokens.get(scope);
 
-    // If we have a valid token with buffer, return it
-    if (entry && entry.expiresAt - Date.now() > this.REFRESH_BUFFER_MS) {
+    // If we have a valid token with > 5 min remaining, return it
+    if (entry?.accessToken && entry.expiresAt > Date.now() + 5 * 60 * 1000) {
       return entry.accessToken;
     }
 
     // If a refresh is already in progress, wait for it
     if (entry?.refreshPromise) {
-      this.logger.debug(`Token refresh already in progress for scope: ${scope}`);
       return entry.refreshPromise;
     }
 
@@ -171,12 +160,29 @@ export class AzureTokenManager {
   /**
    * Create an axios instance with automatic token injection
    * and 401 retry logic for the specified scope.
+   *
+   * IMPORTANT: For the 'flow' scope, the Power Automate Flow API
+   * requires the x-ms-client-scope header for service principal auth.
+   * This header is automatically injected here.
    */
   createAuthenticatedClient(scope: TokenScope, baseURL: string): AxiosInstance {
+    // Build default headers — Flow API requires x-ms-client-scope
+    const defaultHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+
+    if (scope === 'flow') {
+      // The Flow API requires this header for service principal (client_credentials) auth.
+      // Without it, the API returns 401 ClientScopeAuthorizationFailed:
+      // "The x-ms-client-scope header must not be null or empty."
+      defaultHeaders['x-ms-client-scope'] = this.config.scopes[scope];
+      this.logger.info(`Flow client will include x-ms-client-scope: ${this.config.scopes[scope]}`);
+    }
+
     const client = axios.create({
       baseURL,
       timeout: 30000,
-      headers: { 'Content-Type': 'application/json' },
+      headers: defaultHeaders,
     });
 
     // Request interceptor: inject Bearer token
