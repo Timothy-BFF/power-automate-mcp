@@ -136,7 +136,7 @@ function requireConfigured(): string | null {
 // ─────────────────────────────────────────────────────────────────
 // MCP Server + Tool Registration
 //
-// Executor signatures: (args, client, defaultEnvId) => Promise<string>
+// Executor signatures follow: (args, client, defaultEnvId) => string
 // MCP SDK expects: { content: [{ type: 'text', text: string }] }
 // ─────────────────────────────────────────────────────────────────
 
@@ -226,74 +226,35 @@ logger.info('All 10 MCP tools registered successfully.');
 const app = express();
 app.use(express.json());
 
-// ─────── Simtheory.ai Auth Middleware ───────
-//
-// PERMISSIVE MODE: Simtheory.ai does NOT send an Authorization
-// header on SSE transport connections (/sse, /messages, /events,
-// /tools, /). The SIMTHEORY_AUTH_TOKEN is used for registration
-// identity, not per-request HTTP auth.
-//
-// Behavior:
-//   - No auth header → allow through (log for visibility)
-//   - Auth header present + matches → allow through
-//   - Auth header present + WRONG → reject (403)
-//
-// This prevents blocking legitimate Simtheory.ai connections
-// while still rejecting unauthorized callers who send bad tokens.
 // ─────────────────────────────────────────────────────────────────
-function validateSimtheoryToken(
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction
-): void {
-  // Skip auth for health check
-  if (req.path === '/health') {
-    next();
-    return;
-  }
+// Simtheory.ai Connection Logging
+//
+// IMPORTANT DISCOVERY: Simtheory.ai does NOT send an Authorization
+// header when connecting via SSE. The SIMTHEORY_AUTH_TOKEN is used
+// only during MCP registration in the Simtheory.ai admin UI, not
+// for runtime SSE connections.
+//
+// Simtheory.ai probes these paths on connection:
+//   /       — root discovery
+//   /tools  — tool listing
+//   /events — event stream
+//   /sse    — SSE transport (the actual MCP channel)
+//
+// All paths are open to allow the SSE handshake to complete.
+// Security is provided by the Railway private network + the
+// SIMTHEORY_AUTH_TOKEN used during initial registration.
+// ─────────────────────────────────────────────────────────────────
 
-  // If no Simtheory token is configured, skip validation entirely
-  if (!config.simtheoryAuthToken) {
-    next();
-    return;
-  }
-
-  const authHeader = req.headers['authorization'];
-
-  // No Authorization header present — allow through (Simtheory SSE behavior)
-  if (!authHeader) {
-    logger.debug('Request without Authorization header (normal for Simtheory SSE transport)', {
-      path: req.path,
-      method: req.method,
+app.use((req, res, next) => {
+  // Log all incoming requests for observability
+  if (req.path !== '/health') {
+    logger.info(`Incoming request: ${req.method} ${req.path}`, {
+      hasAuth: !!req.headers['authorization'],
+      userAgent: req.headers['user-agent'] || 'unknown',
     });
-    next();
-    return;
   }
-
-  // Authorization header IS present — validate it
-  const token = (authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7)
-    : authHeader).trim();
-
-  if (token !== config.simtheoryAuthToken) {
-    logger.warn('Invalid Simtheory.ai authorization token received', {
-      receivedLength: token.length,
-      expectedLength: config.simtheoryAuthToken.length,
-      receivedFirst4: token.substring(0, 4) + '...',
-      expectedFirst4: config.simtheoryAuthToken.substring(0, 4) + '...',
-      receivedLast4: '...' + token.substring(Math.max(0, token.length - 4)),
-      expectedLast4: '...' + config.simtheoryAuthToken.substring(Math.max(0, config.simtheoryAuthToken.length - 4)),
-      headerFormat: authHeader.startsWith('Bearer ') ? 'Bearer <token>' : 'raw',
-    });
-    res.status(403).json({ error: 'Invalid authorization token' });
-    return;
-  }
-
-  logger.info('Simtheory.ai token validated successfully');
   next();
-}
-
-app.use(validateSimtheoryToken);
+});
 
 // ─────── Health Endpoint ───────
 app.get('/health', async (_req, res) => {
