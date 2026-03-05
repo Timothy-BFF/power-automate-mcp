@@ -1,8 +1,12 @@
 // ═══════════════════════════════════════════════════════════════
 // Power Automate MCP Server — Configuration
 //
+// ALL values configurable via environment variables.
+// No hardcoded URLs, secrets, or infrastructure details.
 // Startup-resilient: Server starts even if Azure credentials
 // are missing. Health endpoint reports what's configured.
+//
+// Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════
 
 import dotenv from 'dotenv';
@@ -44,8 +48,16 @@ export function loadConfig(): AppConfig {
       tenantId,
       clientId,
       clientSecret,
+
+      // Flow API scope — for flow CRUD, run history, triggers
       flowScope: (process.env.AZURE_FLOW_SCOPE || 'https://service.flow.microsoft.com/.default').trim(),
-      managementScope: (process.env.AZURE_MANAGEMENT_SCOPE || 'https://management.azure.com/.default').trim(),
+
+      // PowerApps/BAP API scope — for environment listing
+      // CRITICAL: The BAP API (api.bap.microsoft.com) requires tokens
+      // scoped to service.powerapps.com, NOT management.azure.com.
+      // Using management.azure.com scope returns 403 Forbidden.
+      managementScope: (process.env.AZURE_MANAGEMENT_SCOPE || 'https://service.powerapps.com/.default').trim(),
+
       tokenEndpoint: tenantId
         ? `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`
         : '',
@@ -53,8 +65,10 @@ export function loadConfig(): AppConfig {
     },
     powerPlatform: {
       defaultEnvironmentId: (process.env.POWER_PLATFORM_ENVIRONMENT_ID || '').trim(),
-      flowApiBase: 'https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple',
-      environmentApiBase: 'https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform',
+
+      // All API base URLs configurable via env vars — no hardcoded infrastructure
+      flowApiBase: (process.env.FLOW_API_BASE || 'https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple').trim(),
+      environmentApiBase: (process.env.ENVIRONMENT_API_BASE || 'https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform').trim(),
     },
   };
 }
