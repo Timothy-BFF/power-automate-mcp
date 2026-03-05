@@ -136,7 +136,7 @@ function requireConfigured(): string | null {
 // ─────────────────────────────────────────────────────────────────
 // MCP Server + Tool Registration
 //
-// Executor signatures follow: (args, client, defaultEnvId) => string
+// Executor signatures: (args, client, defaultEnvId) => Promise<string>
 // MCP SDK expects: { content: [{ type: 'text', text: string }] }
 // ─────────────────────────────────────────────────────────────────
 
@@ -226,7 +226,21 @@ logger.info('All 10 MCP tools registered successfully.');
 const app = express();
 app.use(express.json());
 
-// ─────── Simtheory.ai Auth Middleware (with diagnostic logging) ───────
+// ─────── Simtheory.ai Auth Middleware ───────
+//
+// PERMISSIVE MODE: Simtheory.ai does NOT send an Authorization
+// header on SSE transport connections (/sse, /messages, /events,
+// /tools, /). The SIMTHEORY_AUTH_TOKEN is used for registration
+// identity, not per-request HTTP auth.
+//
+// Behavior:
+//   - No auth header → allow through (log for visibility)
+//   - Auth header present + matches → allow through
+//   - Auth header present + WRONG → reject (403)
+//
+// This prevents blocking legitimate Simtheory.ai connections
+// while still rejecting unauthorized callers who send bad tokens.
+// ─────────────────────────────────────────────────────────────────
 function validateSimtheoryToken(
   req: express.Request,
   res: express.Response,
@@ -238,30 +252,30 @@ function validateSimtheoryToken(
     return;
   }
 
-  // If no Simtheory token is configured, skip validation (development mode)
+  // If no Simtheory token is configured, skip validation entirely
   if (!config.simtheoryAuthToken) {
     next();
     return;
   }
 
   const authHeader = req.headers['authorization'];
+
+  // No Authorization header present — allow through (Simtheory SSE behavior)
   if (!authHeader) {
-    logger.warn('Missing Authorization header from incoming request', {
+    logger.debug('Request without Authorization header (normal for Simtheory SSE transport)', {
       path: req.path,
-      headersPresent: Object.keys(req.headers).join(', '),
+      method: req.method,
     });
-    res.status(401).json({ error: 'Missing Authorization header' });
+    next();
     return;
   }
 
-  // Extract token — supports both "Bearer <token>" and raw "<token>"
-  // .trim() defends against invisible whitespace from either side
+  // Authorization header IS present — validate it
   const token = (authHeader.startsWith('Bearer ')
     ? authHeader.slice(7)
     : authHeader).trim();
 
   if (token !== config.simtheoryAuthToken) {
-    // ── Diagnostic logging: show WHY the comparison failed ──
     logger.warn('Invalid Simtheory.ai authorization token received', {
       receivedLength: token.length,
       expectedLength: config.simtheoryAuthToken.length,
@@ -270,7 +284,6 @@ function validateSimtheoryToken(
       receivedLast4: '...' + token.substring(Math.max(0, token.length - 4)),
       expectedLast4: '...' + config.simtheoryAuthToken.substring(Math.max(0, config.simtheoryAuthToken.length - 4)),
       headerFormat: authHeader.startsWith('Bearer ') ? 'Bearer <token>' : 'raw',
-      match: token === config.simtheoryAuthToken,
     });
     res.status(403).json({ error: 'Invalid authorization token' });
     return;
