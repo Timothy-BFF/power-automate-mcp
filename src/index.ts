@@ -135,6 +135,9 @@ function requireConfigured(): string | null {
 
 // ─────────────────────────────────────────────────────────────────
 // MCP Server + Tool Registration
+//
+// Executor signatures follow: (args, client, defaultEnvId) => string
+// MCP SDK expects: { content: [{ type: 'text', text: string }] }
 // ─────────────────────────────────────────────────────────────────
 
 const mcpServer = new McpServer({
@@ -147,61 +150,71 @@ const registerTool = mcpServer.tool.bind(mcpServer);
 registerTool('pa-list-environments', {}, async () => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeListEnvironments(envClient!);
+  const result = await executeListEnvironments(envClient!);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-list-flows', listFlowsSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeListFlows(flowClient!, args, defaultEnvId);
+  const result = await executeListFlows(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-get-flow-details', getFlowDetailsSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeGetFlowDetails(flowClient!, args, defaultEnvId);
+  const result = await executeGetFlowDetails(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-enable-disable-flow', enableDisableFlowSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeEnableDisableFlow(flowClient!, args, defaultEnvId);
+  const result = await executeEnableDisableFlow(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-delete-flow', deleteFlowSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeDeleteFlow(flowClient!, args, defaultEnvId);
+  const result = await executeDeleteFlow(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-trigger-flow', triggerFlowSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeTriggerFlow(flowClient!, args, defaultEnvId);
+  const result = await executeTriggerFlow(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-get-run-history', getRunHistorySchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeGetRunHistory(flowClient!, args, defaultEnvId);
+  const result = await executeGetRunHistory(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-get-run-details', getRunDetailsSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeGetRunDetails(flowClient!, args, defaultEnvId);
+  const result = await executeGetRunDetails(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-cancel-run', cancelRunSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeCancelRun(flowClient!, args, defaultEnvId);
+  const result = await executeCancelRun(args, flowClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 registerTool('pa-list-connections', listConnectionsSchema.shape, async (args) => {
   const err = requireConfigured();
   if (err) return { content: [{ type: 'text', text: err }] };
-  return executeListConnections(connClient!, args, defaultEnvId);
+  const result = await executeListConnections(args, connClient!, defaultEnvId);
+  return { content: [{ type: 'text', text: result }] };
 });
 
 logger.info('All 10 MCP tools registered successfully.');
