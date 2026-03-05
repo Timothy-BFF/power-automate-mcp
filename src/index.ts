@@ -2,21 +2,30 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Power Automate MCP Server — Main Entry Point
 //
-// Designed for Simtheory.ai integration via SSE transport.
-// Deployed on Railway with health endpoint.
-// Startup-resilient: boots even without Azure credentials.
+// SIMTHEORY.AI PROTOCOL (fully mapped from production logs):
 //
-// SIMTHEORY.AI DISCOVERY PROTOCOL (learned from production logs):
-//   1. POST /       — JSON-RPC initialize (python-requests)
-//   2. GET /        — Server info probe (python-requests)
-//   3. POST /tools  — JSON-RPC tools/list (python-requests)
-//   4. GET /tools   — REST tool listing (python-requests)
-//   5. GET /events  — SSE event stream (Simtheory/mcp-operator)
-//   6. GET /sse     — MCP SSE transport (python-requests)
+// Phase 1 — Discovery (REST JSON-RPC):
+//   POST /        → initialize, tools/list
+//   GET /         → server info
+//   POST /tools   → tools/list
+//   GET /tools    → REST tool definitions
+//   POST /mcp     → tools/list
+//   GET /mcp      → server info
+//   POST /api     → tools/list
+//   GET /api      → server info
 //
-// Tool discovery happens via REST probes (#1-4), NOT through
-// the SSE JSON-RPC protocol. If these return 404, no tools
-// appear in chat sessions.
+// Phase 2 — SSE Transport:
+//   GET /events   → SSE (Simtheory/mcp-operator)
+//   GET /sse      → SSE (python-requests)
+//
+// Phase 3 — Tool Execution (REST JSON-RPC):
+//   POST /sse     → tools/call
+//   POST /mcp     → tools/call
+//   POST /api     → tools/call
+//   POST /        → tools/call
+//
+// Tool execution goes through direct REST JSON-RPC POST, NOT the
+// SSE transport. The SSE channel is used for streaming/events only.
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -51,7 +60,7 @@ const config: AppConfig = loadConfig();
 const logger = createLogger(config.logLevel);
 
 // ─────────────────────────────────────────────────────────────────
-// Global Crash Protection — server must NEVER die on errors
+// Global Crash Protection
 // ─────────────────────────────────────────────────────────────────
 
 process.on('unhandledRejection', (reason, promise) => {
@@ -130,22 +139,15 @@ function requireConfigured(): string | null {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Tool Definitions for REST Discovery
-//
-// Simtheory.ai discovers tools by probing GET/POST /tools BEFORE
-// connecting via SSE. These definitions are served as REST JSON
-// responses independently of the MCP SDK's JSON-RPC tool listing.
-// ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// Tool Definitions (served via REST discovery)
+// ═══════════════════════════════════════════════════════════════
 
 const TOOL_DEFINITIONS = [
   {
     name: 'pa-list-environments',
     description: 'Lists all Power Platform environments accessible to the configured service principal. Returns environment ID, display name, location, SKU, and lifecycle state for each environment.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'pa-list-flows',
@@ -260,30 +262,175 @@ const TOOL_DEFINITIONS = [
   },
 ];
 
-const SERVER_INFO = {
-  name: 'power-automate-mcp',
-  version: '1.0.0',
-};
+const SERVER_INFO = { name: 'power-automate-mcp', version: '1.0.0' };
 
 const MCP_CAPABILITIES = {
   protocolVersion: '2024-11-05',
-  capabilities: {
-    tools: { listChanged: true },
-  },
+  capabilities: { tools: { listChanged: true } },
   serverInfo: SERVER_INFO,
 };
 
-logger.info(`Tool definitions loaded: ${TOOL_DEFINITIONS.length} tools available for REST discovery.`);
+logger.info(`Tool definitions loaded: ${TOOL_DEFINITIONS.length} tools for REST discovery + execution.`);
+
+// ═══════════════════════════════════════════════════════════════
+// Tool Execution Router (REST JSON-RPC tools/call)
+//
+// Simtheory.ai calls tools via direct REST POST, not through the
+// SSE transport. This router maps tool names to their executors.
+// ═══════════════════════════════════════════════════════════════
+
+async function executeToolCall(
+  toolName: string,
+  args: Record<string, any>
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const configErr = requireConfigured();
+  if (configErr) {
+    return { content: [{ type: 'text', text: configErr }] };
+  }
+
+  let result: string;
+
+  switch (toolName) {
+    case 'pa-list-environments':
+      result = await executeListEnvironments(envClient!);
+      break;
+    case 'pa-list-flows':
+      result = await executeListFlows(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-get-flow-details':
+      result = await executeGetFlowDetails(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-enable-disable-flow':
+      result = await executeEnableDisableFlow(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-delete-flow':
+      result = await executeDeleteFlow(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-trigger-flow':
+      result = await executeTriggerFlow(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-get-run-history':
+      result = await executeGetRunHistory(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-get-run-details':
+      result = await executeGetRunDetails(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-cancel-run':
+      result = await executeCancelRun(args, flowClient!, defaultEnvId);
+      break;
+    case 'pa-list-connections':
+      result = await executeListConnections(args, connClient!, defaultEnvId);
+      break;
+    default:
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: `Unknown tool: ${toolName}` }) }],
+      };
+  }
+
+  return { content: [{ type: 'text', text: result }] };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Centralized JSON-RPC Handler
+//
+// Handles all MCP JSON-RPC methods:
+//   - initialize       → server capabilities
+//   - tools/list       → tool definitions
+//   - tools/call       → tool execution (the critical one!)
+//   - notifications/*  → acknowledgment
+//
+// Mounted on: /, /tools, /sse, /mcp, /api
+// ═══════════════════════════════════════════════════════════════
+
+async function handleJsonRpc(
+  req: express.Request,
+  res: express.Response
+): Promise<boolean> {
+  const body = req.body;
+
+  // Only handle JSON-RPC 2.0 requests
+  if (!body?.jsonrpc || body.jsonrpc !== '2.0' || !body.method) {
+    return false; // Not a JSON-RPC request — let caller handle
+  }
+
+  const { method, id, params } = body;
+  const endpoint = req.path;
+
+  logger.info(`JSON-RPC: ${method} on ${endpoint}`, { id, toolName: params?.name });
+
+  try {
+    switch (method) {
+      case 'initialize': {
+        res.json({ jsonrpc: '2.0', id, result: MCP_CAPABILITIES });
+        return true;
+      }
+
+      case 'tools/list': {
+        logger.info(`Serving ${TOOL_DEFINITIONS.length} tool definitions via JSON-RPC`);
+        res.json({ jsonrpc: '2.0', id, result: { tools: TOOL_DEFINITIONS } });
+        return true;
+      }
+
+      case 'tools/call': {
+        const toolName = params?.name;
+        const toolArgs = params?.arguments || {};
+
+        logger.info(`Tool call: ${toolName}`, { args: JSON.stringify(toolArgs).substring(0, 500) });
+
+        try {
+          const result = await executeToolCall(toolName, toolArgs);
+          logger.info(`Tool call succeeded: ${toolName}`, {
+            resultLength: result.content[0]?.text?.length || 0,
+          });
+          res.json({ jsonrpc: '2.0', id, result });
+        } catch (execError) {
+          const err = execError instanceof Error ? execError : new Error(String(execError));
+          logger.error(`Tool call failed: ${toolName}`, { message: err.message, stack: err.stack });
+          res.json({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }],
+              isError: true,
+            },
+          });
+        }
+        return true;
+      }
+
+      // Handle all notification methods
+      default: {
+        if (method.startsWith('notifications/')) {
+          res.json({ jsonrpc: '2.0', id: id || null, result: {} });
+          return true;
+        }
+
+        logger.warn(`Unknown JSON-RPC method: ${method} on ${endpoint}`);
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          error: { code: -32601, message: `Method not found: ${method}` },
+        });
+        return true;
+      }
+    }
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.error(`JSON-RPC handler error for ${method}`, { message: err.message, stack: err.stack });
+    res.json({
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32603, message: `Internal error: ${err.message}` },
+    });
+    return true;
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────
-// MCP Server + Tool Registration (for SSE JSON-RPC transport)
+// MCP SDK Tool Registration (kept for SSE transport compatibility)
 // ─────────────────────────────────────────────────────────────────
 
-const mcpServer = new McpServer({
-  name: 'power-automate-mcp',
-  version: '1.0.0',
-});
-
+const mcpServer = new McpServer({ name: 'power-automate-mcp', version: '1.0.0' });
 const registerTool = mcpServer.tool.bind(mcpServer);
 
 registerTool('pa-list-environments', {}, async () => {
@@ -356,16 +503,16 @@ registerTool('pa-list-connections', listConnectionsSchema.shape, async (args) =>
   return { content: [{ type: 'text', text: result }] };
 });
 
-logger.info('All 10 MCP tools registered (SDK + REST discovery).');
+logger.info('All 10 MCP tools registered (SDK + REST discovery + REST execution).');
 
-// ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
 // Express Server
-// ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
 
 const app = express();
 app.use(express.json());
 
-// ─────── Request Logging Middleware ───────
+// ─────── Request Logging ───────
 app.use((req, res, next) => {
   if (req.path !== '/health') {
     const logData: Record<string, any> = {
@@ -373,7 +520,6 @@ app.use((req, res, next) => {
       userAgent: req.headers['user-agent'] || 'unknown',
       contentType: req.headers['content-type'] || 'none',
     };
-    // Log POST bodies for diagnostics (truncated)
     if (req.method === 'POST' && req.body) {
       logData.body = JSON.stringify(req.body).substring(0, 500);
     }
@@ -383,110 +529,73 @@ app.use((req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// REST Discovery Endpoints
-//
-// Simtheory.ai probes these BEFORE connecting via SSE.
-// Tool registration in the chat UI depends on these responses.
+// Endpoint: / (root)
 // ═══════════════════════════════════════════════════════════════
 
-// ─────── Root Endpoint: Server Info + JSON-RPC Initialize ───────
 app.get('/', (_req, res) => {
-  logger.info('REST discovery: GET / — returning server info');
-  res.json({
-    jsonrpc: '2.0',
-    result: MCP_CAPABILITIES,
-  });
+  logger.info('REST discovery: GET /');
+  res.json({ jsonrpc: '2.0', result: MCP_CAPABILITIES });
 });
 
-app.post('/', (req, res) => {
-  const body = req.body;
-
-  // Handle JSON-RPC requests
-  if (body?.jsonrpc === '2.0') {
-    logger.info(`JSON-RPC on POST /: method=${body.method}, id=${body.id}`);
-
-    if (body.method === 'initialize') {
-      return res.json({
-        jsonrpc: '2.0',
-        id: body.id,
-        result: MCP_CAPABILITIES,
-      });
-    }
-
-    if (body.method === 'tools/list') {
-      logger.info('Serving tool list via JSON-RPC on POST /');
-      return res.json({
-        jsonrpc: '2.0',
-        id: body.id,
-        result: { tools: TOOL_DEFINITIONS },
-      });
-    }
-
-    if (body.method === 'notifications/initialized') {
-      return res.json({
-        jsonrpc: '2.0',
-        id: body.id || null,
-        result: {},
-      });
-    }
-
-    // Unknown method — return method not found
-    logger.warn(`Unknown JSON-RPC method on POST /: ${body.method}`);
-    return res.json({
-      jsonrpc: '2.0',
-      id: body.id,
-      error: { code: -32601, message: `Method not found: ${body.method}` },
-    });
+app.post('/', async (req, res) => {
+  const handled = await handleJsonRpc(req, res);
+  if (!handled) {
+    res.json({ ...SERVER_INFO, tools: TOOL_DEFINITIONS.length });
   }
-
-  // Non-JSON-RPC POST — return server info
-  res.json({
-    ...SERVER_INFO,
-    tools: TOOL_DEFINITIONS.length,
-    endpoints: {
-      sse: '/sse',
-      events: '/events',
-      tools: '/tools',
-      health: '/health',
-      messages: '/messages',
-    },
-  });
 });
 
-// ─────── Tools Endpoint: REST + JSON-RPC Tool Discovery ───────
+// ═══════════════════════════════════════════════════════════════
+// Endpoint: /tools
+// ═══════════════════════════════════════════════════════════════
+
 app.get('/tools', (_req, res) => {
-  logger.info('REST discovery: GET /tools — returning tool definitions');
+  logger.info('REST discovery: GET /tools');
   res.json({ tools: TOOL_DEFINITIONS });
 });
 
-app.post('/tools', (req, res) => {
-  const body = req.body;
-
-  // Handle JSON-RPC tools/list
-  if (body?.jsonrpc === '2.0') {
-    logger.info(`JSON-RPC on POST /tools: method=${body.method}, id=${body.id}`);
-
-    if (body.method === 'tools/list') {
-      return res.json({
-        jsonrpc: '2.0',
-        id: body.id,
-        result: { tools: TOOL_DEFINITIONS },
-      });
-    }
-
-    return res.json({
-      jsonrpc: '2.0',
-      id: body.id,
-      error: { code: -32601, message: `Method not found: ${body.method}` },
-    });
+app.post('/tools', async (req, res) => {
+  const handled = await handleJsonRpc(req, res);
+  if (!handled) {
+    res.json({ tools: TOOL_DEFINITIONS });
   }
-
-  // Non-JSON-RPC POST — return tool list
-  logger.info('REST discovery: POST /tools — returning tool definitions');
-  res.json({ tools: TOOL_DEFINITIONS });
 });
 
-// ─────── Health Endpoint ───────
+// ═══════════════════════════════════════════════════════════════
+// Endpoint: /mcp (Simtheory probes this)
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/mcp', (_req, res) => {
+  logger.info('REST discovery: GET /mcp');
+  res.json({ jsonrpc: '2.0', result: MCP_CAPABILITIES });
+});
+
+app.post('/mcp', async (req, res) => {
+  const handled = await handleJsonRpc(req, res);
+  if (!handled) {
+    res.json({ ...SERVER_INFO, tools: TOOL_DEFINITIONS.length });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Endpoint: /api (Simtheory probes this)
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api', (_req, res) => {
+  logger.info('REST discovery: GET /api');
+  res.json({ jsonrpc: '2.0', result: MCP_CAPABILITIES });
+});
+
+app.post('/api', async (req, res) => {
+  const handled = await handleJsonRpc(req, res);
+  if (!handled) {
+    res.json({ ...SERVER_INFO, tools: TOOL_DEFINITIONS.length });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Health Endpoint
+// ═══════════════════════════════════════════════════════════════
+
 app.get('/health', async (_req, res) => {
   try {
     const missingVars: string[] = [];
@@ -496,14 +605,10 @@ app.get('/health', async (_req, res) => {
     if (!config.simtheoryAuthToken) missingVars.push('SIMTHEORY_AUTH_TOKEN');
 
     let tokenStatus = { flow: 'not_configured', management: 'not_configured' };
-
     if (tokenManager) {
       try {
         const health = await tokenManager.healthCheck();
-        tokenStatus = {
-          flow: health.flow ? 'ok' : 'error',
-          management: health.management ? 'ok' : 'error',
-        };
+        tokenStatus = { flow: health.flow ? 'ok' : 'error', management: health.management ? 'ok' : 'error' };
       } catch {
         tokenStatus = { flow: 'error', management: 'error' };
       }
@@ -532,10 +637,6 @@ app.get('/health', async (_req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // SSE Transport Endpoints
-//
-// Both /sse and /events serve as MCP SSE transport endpoints.
-// Simtheory.ai probes both — /events with Simtheory/mcp-operator
-// user agent, /sse with python-requests.
 // ═══════════════════════════════════════════════════════════════
 
 const transports: Map<string, SSEServerTransport> = new Map();
@@ -544,15 +645,13 @@ async function handleSSEConnection(req: express.Request, res: express.Response, 
   try {
     logger.info(`New SSE connection on ${endpoint}`);
 
-    // Close any existing MCP connection for reconnection
     try {
       await mcpServer.close();
       logger.info('Previous MCP transport closed for reconnection');
     } catch {
-      logger.debug('No previous transport to close (first connection)');
+      logger.debug('No previous transport to close');
     }
 
-    // Clean up stale transports
     for (const [id, oldTransport] of transports.entries()) {
       try { await oldTransport.close(); } catch { /* already closed */ }
       transports.delete(id);
@@ -586,13 +685,29 @@ async function handleSSEConnection(req: express.Request, res: express.Response, 
 app.get('/sse', (req, res) => handleSSEConnection(req, res, '/sse'));
 app.get('/events', (req, res) => handleSSEConnection(req, res, '/events'));
 
+// POST /sse — Simtheory sends tools/call here via JSON-RPC
+app.post('/sse', async (req, res) => {
+  const handled = await handleJsonRpc(req, res);
+  if (!handled) {
+    res.status(400).json({ error: 'Expected JSON-RPC 2.0 request' });
+  }
+});
+
+// POST /events — Simtheory may also send tools/call here
+app.post('/events', async (req, res) => {
+  const handled = await handleJsonRpc(req, res);
+  if (!handled) {
+    res.status(400).json({ error: 'Expected JSON-RPC 2.0 request' });
+  }
+});
+
+// SSE message handler (for MCP SDK transport)
 app.post('/messages', async (req, res) => {
   try {
     const sessionId = req.query.sessionId as string;
     logger.info(`Message received for session: ${sessionId}`);
 
     const transport = transports.get(sessionId);
-
     if (!transport) {
       logger.warn(`Session not found: ${sessionId}. Active sessions: ${transports.size}`);
       res.status(404).json({ error: 'Session not found' });
@@ -609,7 +724,7 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// ─────── Global Express Error Handler ───────
+// ─────── Global Error Handler ───────
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error('Express unhandled error', { message: err.message, stack: err.stack });
   if (!res.headersSent) {
@@ -624,9 +739,11 @@ app.listen(config.port, '0.0.0.0', () => {
   logger.info(`SSE:     http://0.0.0.0:${config.port}/sse`);
   logger.info(`Events:  http://0.0.0.0:${config.port}/events`);
   logger.info(`Tools:   http://0.0.0.0:${config.port}/tools`);
-  logger.info(`REST discovery endpoints active for Simtheory.ai`);
+  logger.info(`MCP:     http://0.0.0.0:${config.port}/mcp`);
+  logger.info(`API:     http://0.0.0.0:${config.port}/api`);
+  logger.info('REST discovery + JSON-RPC execution endpoints active');
   if (!config.azure.isConfigured) {
-    logger.warn('Awaiting Azure AD configuration — add credentials to Railway variables and redeploy.');
+    logger.warn('Awaiting Azure AD configuration.');
   }
   logger.info('Waiting for Simtheory.ai connections...');
 });
