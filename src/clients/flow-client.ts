@@ -4,14 +4,13 @@
 // All operations use admin-scoped endpoints:
 //   /scopes/admin/environments/{envId}/...
 //
-// Service principals registered via New-PowerAppManagementApp
-// MUST use admin paths. User-scoped paths require 'maker
-// permissions' which a service principal does not have.
+// IMPORTANT: Return types are Promise<any> and methods return
+// RAW arrays (not wrapped objects) because the existing tool
+// handlers call .length and .map() directly on the result.
 //
-// Method signatures use flexible parameter types (any) to
-// maintain backward compatibility with existing tool handlers
-// that may pass options objects or positional arguments.
-// Runtime type detection resolves the actual values.
+// Method aliases:
+//   getFlowRunDetails() → getRunDetails()  (handler compatibility)
+//   getRunHistory()     → getFlowRuns()    (handler compatibility)
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════
@@ -20,40 +19,6 @@ import { AxiosInstance } from 'axios';
 import winston from 'winston';
 
 const API_VERSION = '2016-11-01';
-
-// ── Return type interfaces ──────────────────────────────────
-// Typed arrays ensure .map() callbacks get FlowSummary/RunSummary
-// instead of implicit 'any', satisfying noImplicitAny.
-// Index signatures allow flexible property access.
-
-export interface FlowSummary {
-  name: string;
-  displayName: string;
-  state: string;
-  createdTime?: string;
-  lastModifiedTime?: string;
-  creator?: string;
-  [key: string]: any;
-}
-
-export interface ListFlowsResult {
-  totalFlows: number;
-  flows: FlowSummary[];
-}
-
-export interface RunSummary {
-  id: string;
-  status: string;
-  startTime?: string;
-  endTime?: string;
-  trigger?: string;
-  [key: string]: any;
-}
-
-export interface RunHistoryResult {
-  totalRuns: number;
-  runs: RunSummary[];
-}
 
 export class FlowClient {
   private client: AxiosInstance;
@@ -66,13 +31,13 @@ export class FlowClient {
 
   /**
    * Build an admin-scoped path for the Flow API.
-   * Admin path: /scopes/admin/environments/{envId}/...
    */
   private adminPath(envId: string, subPath: string): string {
     return `/scopes/admin/environments/${envId}${subPath}`;
   }
 
   // ── listFlows ───────────────────────────────────────────────
+  // Returns: raw array of flow objects (handler calls .length/.map)
   // Accepts:
   //   listFlows(envId, filter?, top?)
   //   listFlows(envId, { filter?, top? })
@@ -81,7 +46,7 @@ export class FlowClient {
     environmentId: string,
     filterOrOptions?: any,
     top?: any
-  ): Promise<ListFlowsResult> {
+  ): Promise<any> {
     let filter: string | undefined;
     let topVal: number | undefined;
 
@@ -104,7 +69,8 @@ export class FlowClient {
     const response = await this.client.get(url, { params });
     const data = response.data;
 
-    const flows: FlowSummary[] = (data.value || []).map((flow: any) => ({
+    // Return RAW ARRAY — handlers call result.length and result.map()
+    const flows = (data.value || []).map((flow: any) => ({
       name: flow.name,
       displayName: flow.properties?.displayName || flow.name,
       state: flow.properties?.state || 'Unknown',
@@ -113,15 +79,10 @@ export class FlowClient {
       creator: flow.properties?.creator?.objectId,
     }));
 
-    return { totalFlows: flows.length, flows };
+    return flows;
   }
 
   // ── getFlowDetails ──────────────────────────────────────────
-  // Accepts:
-  //   getFlowDetails(envId, flowId)
-  //   getFlowDetails(envId, { flowId? })
-  //   getFlowDetails(envId, {})          ← empty options fallback
-  // ────────────────────────────────────────────────────────────
   async getFlowDetails(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -162,10 +123,6 @@ export class FlowClient {
   }
 
   // ── enableDisableFlow ───────────────────────────────────────
-  // Accepts:
-  //   enableDisableFlow(envId, flowId, 'start'|'stop')
-  //   enableDisableFlow(envId, flowId, { action: 'start'|'stop' })
-  // ────────────────────────────────────────────────────────────
   async enableDisableFlow(
     environmentId: string,
     flowId: string,
@@ -211,11 +168,6 @@ export class FlowClient {
   }
 
   // ── triggerFlow ─────────────────────────────────────────────
-  // Accepts:
-  //   triggerFlow(envId, flowId, body?)
-  //   triggerFlow(envId, body)              ← body at position 2
-  //   triggerFlow(envId, { flowId, triggerBody? })
-  // ────────────────────────────────────────────────────────────
   async triggerFlow(
     environmentId: string,
     flowIdOrBody?: any,
@@ -232,7 +184,6 @@ export class FlowClient {
         flowId = flowIdOrBody.flowId;
         triggerBody = flowIdOrBody.triggerBody || undefined;
       } else {
-        // Body passed at position 2 without flowId
         triggerBody = flowIdOrBody;
       }
     }
@@ -274,7 +225,7 @@ export class FlowClient {
   }
 
   // ── getFlowRuns ─────────────────────────────────────────────
-  // The original method name used by existing tool handlers.
+  // Returns: raw array of run objects (handler calls .length/.map)
   // Accepts:
   //   getFlowRuns(envId, flowId, top?)
   //   getFlowRuns(envId, flowId, { top? })
@@ -284,7 +235,7 @@ export class FlowClient {
     environmentId: string,
     flowIdOrOptions?: any,
     topOrOptions?: any
-  ): Promise<RunHistoryResult> {
+  ): Promise<any> {
     let flowId: string | undefined;
     let top: number | undefined;
 
@@ -313,7 +264,8 @@ export class FlowClient {
     const response = await this.client.get(url, { params });
     const data = response.data;
 
-    const runs: RunSummary[] = (data.value || []).map((run: any) => ({
+    // Return RAW ARRAY — handlers call result.length and result.map()
+    const runs = (data.value || []).map((run: any) => ({
       id: run.name,
       status: run.properties?.status || 'Unknown',
       startTime: run.properties?.startTime,
@@ -321,7 +273,7 @@ export class FlowClient {
       trigger: run.properties?.trigger?.name,
     }));
 
-    return { totalRuns: runs.length, runs };
+    return runs;
   }
 
   // ── getRunHistory (alias for getFlowRuns) ───────────────────
@@ -329,16 +281,11 @@ export class FlowClient {
     environmentId: string,
     flowIdOrOptions?: any,
     topOrOptions?: any
-  ): Promise<RunHistoryResult> {
+  ): Promise<any> {
     return this.getFlowRuns(environmentId, flowIdOrOptions, topOrOptions);
   }
 
   // ── getRunDetails ───────────────────────────────────────────
-  // Accepts:
-  //   getRunDetails(envId, flowId, runId)
-  //   getRunDetails(envId, flowId, { runId })
-  //   getRunDetails(envId, { flowId, runId })
-  // ────────────────────────────────────────────────────────────
   async getRunDetails(
     environmentId: string,
     flowIdOrOptions?: any,
@@ -381,6 +328,15 @@ export class FlowClient {
       outputs: run.properties?.outputs,
       error: run.properties?.error,
     };
+  }
+
+  // ── getFlowRunDetails (alias — handler uses this name) ──────
+  async getFlowRunDetails(
+    environmentId: string,
+    flowIdOrOptions?: any,
+    runIdOrOptions?: any
+  ): Promise<any> {
+    return this.getRunDetails(environmentId, flowIdOrOptions, runIdOrOptions);
   }
 
   // ── cancelRun ───────────────────────────────────────────────
