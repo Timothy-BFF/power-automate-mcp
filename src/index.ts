@@ -136,7 +136,7 @@ function requireConfigured(): string | null {
 // ─────────────────────────────────────────────────────────────────
 // MCP Server + Tool Registration
 //
-// Executor signatures follow: (args, client, defaultEnvId) => string
+// Executor signatures: (args, client, defaultEnvId) => Promise<string>
 // MCP SDK expects: { content: [{ type: 'text', text: string }] }
 // ─────────────────────────────────────────────────────────────────
 
@@ -226,27 +226,8 @@ logger.info('All 10 MCP tools registered successfully.');
 const app = express();
 app.use(express.json());
 
-// ─────────────────────────────────────────────────────────────────
-// Simtheory.ai Connection Logging
-//
-// IMPORTANT DISCOVERY: Simtheory.ai does NOT send an Authorization
-// header when connecting via SSE. The SIMTHEORY_AUTH_TOKEN is used
-// only during MCP registration in the Simtheory.ai admin UI, not
-// for runtime SSE connections.
-//
-// Simtheory.ai probes these paths on connection:
-//   /       — root discovery
-//   /tools  — tool listing
-//   /events — event stream
-//   /sse    — SSE transport (the actual MCP channel)
-//
-// All paths are open to allow the SSE handshake to complete.
-// Security is provided by the Railway private network + the
-// SIMTHEORY_AUTH_TOKEN used during initial registration.
-// ─────────────────────────────────────────────────────────────────
-
+// ─────── Request Logging Middleware ───────
 app.use((req, res, next) => {
-  // Log all incoming requests for observability
   if (req.path !== '/health') {
     logger.info(`Incoming request: ${req.method} ${req.path}`, {
       hasAuth: !!req.headers['authorization'],
@@ -300,12 +281,42 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-// ─────── SSE Transport for MCP ───────
+// ─────────────────────────────────────────────────────────────────
+// SSE Transport for MCP
+//
+// CRITICAL: The MCP SDK only allows ONE transport per McpServer
+// instance at a time. When Simtheory.ai reconnects (which it does
+// periodically), we must close() the existing connection before
+// connecting the new transport. Tool registrations are preserved
+// across close()/connect() cycles — only the transport is reset.
+// ─────────────────────────────────────────────────────────────────
 const transports: Map<string, SSEServerTransport> = new Map();
 
 app.get('/sse', async (req, res) => {
   try {
     logger.info('New SSE connection request received');
+
+    // Close any existing MCP connection to allow reconnection.
+    // The MCP SDK only supports one transport at a time per server.
+    // Tool registrations persist across close/connect cycles.
+    try {
+      await mcpServer.close();
+      logger.info('Previous MCP transport closed for reconnection');
+    } catch (closeErr) {
+      // Expected on first connection — no previous transport exists
+      logger.debug('No previous transport to close (first connection)');
+    }
+
+    // Clean up any stale transport references
+    for (const [id, oldTransport] of transports.entries()) {
+      try {
+        await oldTransport.close();
+      } catch {
+        // Already closed
+      }
+      transports.delete(id);
+    }
+
     const transport = new SSEServerTransport('/messages', res);
     transports.set(transport.sessionId, transport);
     logger.info(`SSE session created: ${transport.sessionId}`);
