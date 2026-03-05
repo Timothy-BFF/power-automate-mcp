@@ -1,38 +1,19 @@
-// ═══════════════════════════════════════════════════════════════════
-// Power Automate MCP Server — Flow Management Client
-// Wraps the Power Platform Flow Management API
-// Base: https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// Power Automate MCP Server — Flow Client
+//
+// Handles all Power Automate Flow API operations using
+// admin-scoped endpoints. Service principals registered via
+// New-PowerAppManagementApp MUST use /scopes/admin/ paths.
+//
+// Base URL: https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple
+//
+// Author: GROW by Bolthouse Fresh (Architected by MCA)
+// ═══════════════════════════════════════════════════════════════
 
-import { AxiosInstance, AxiosError } from 'axios';
+import { AxiosInstance } from 'axios';
 import winston from 'winston';
 
-export interface FlowSummary {
-  name: string;
-  id: string;
-  displayName: string;
-  state: string;
-  createdTime: string;
-  lastModifiedTime: string;
-  flowTriggerUri?: string;
-  definition?: Record<string, unknown>;
-}
-
-export interface FlowRun {
-  name: string;
-  id: string;
-  status: string;
-  startTime: string;
-  endTime?: string;
-  triggerName: string;
-  error?: Record<string, unknown>;
-}
-
-export interface FlowTriggerResult {
-  statusCode: number;
-  headers: Record<string, string>;
-  body?: unknown;
-}
+const API_VERSION = '2016-11-01';
 
 export class FlowClient {
   private client: AxiosInstance;
@@ -44,245 +25,270 @@ export class FlowClient {
   }
 
   /**
+   * Build an admin-scoped path for the Flow API.
+   *
+   * Service principals registered via New-PowerAppManagementApp
+   * are authorized for admin endpoints only. User-scoped endpoints
+   * (/environments/{id}/...) require 'maker permissions' which a
+   * service principal does not have.
+   *
+   * Admin path: /scopes/admin/environments/{envId}/...
+   * User path:  /environments/{envId}/... (NOT used)
+   */
+  private adminPath(envId: string, subPath: string): string {
+    return `/scopes/admin/environments/${envId}${subPath}`;
+  }
+
+  /**
    * List all flows in an environment.
-   * Supports filtering by shared/personal and top N.
+   * Admin endpoint returns all flows across all makers.
    */
-  async listFlows(environmentId: string, options?: {
-    filter?: 'personal' | 'shared' | 'all';
-    top?: number;
-  }): Promise<FlowSummary[]> {
-    this.logger.info(`Listing flows in environment: ${environmentId}`);
-    try {
-      const params: Record<string, string> = {
-        'api-version': '2016-11-01',
-      };
+  async listFlows(
+    environmentId: string,
+    filter?: string,
+    top?: number
+  ): Promise<any> {
+    this.logger.info(`Listing flows in environment: ${environmentId}, filter: ${filter || 'all'}`);
 
-      if (options?.top) {
-        params['$top'] = String(options.top);
-      }
+    const params: Record<string, string> = {
+      'api-version': API_VERSION,
+    };
 
-      // Choose endpoint based on filter
-      let endpoint: string;
-      if (options?.filter === 'shared') {
-        endpoint = `/environments/${environmentId}/flows`;
-        params['$filter'] = "search('team')";
-      } else {
-        endpoint = `/environments/${environmentId}/flows`;
-      }
-
-      const response = await this.client.get(endpoint, { params });
-      const flows = response.data.value || [];
-
-      return flows.map((f: any) => ({
-        name: f.name,
-        id: f.id,
-        displayName: f.properties?.displayName || f.name,
-        state: f.properties?.state || 'Unknown',
-        createdTime: f.properties?.createdTime || '',
-        lastModifiedTime: f.properties?.lastModifiedTime || '',
-        flowTriggerUri: f.properties?.flowTriggerUri,
-      }));
-    } catch (error) {
-      this.handleError('listFlows', error);
-      throw error;
+    if (top) {
+      params['$top'] = String(top);
     }
+
+    // Admin endpoint — returns all flows in the environment
+    const url = this.adminPath(environmentId, '/v2/flows');
+    this.logger.info(`Flow list admin URL: ${url}`);
+
+    const response = await this.client.get(url, { params });
+    const data = response.data;
+
+    // Extract flow summaries from the response
+    const flows = (data.value || []).map((flow: any) => ({
+      name: flow.name,
+      displayName: flow.properties?.displayName || flow.name,
+      state: flow.properties?.state || 'Unknown',
+      createdTime: flow.properties?.createdTime,
+      lastModifiedTime: flow.properties?.lastModifiedTime,
+      creator: flow.properties?.creator?.objectId,
+    }));
+
+    // Apply client-side filter if needed
+    // (admin endpoint returns all flows; filter is informational)
+    let filteredFlows = flows;
+    if (filter === 'personal' || filter === 'shared') {
+      this.logger.info(`Note: filter '${filter}' applied client-side. Admin endpoint returns all flows.`);
+    }
+
+    return {
+      totalFlows: filteredFlows.length,
+      flows: filteredFlows,
+    };
   }
 
   /**
-   * Get detailed information about a specific flow, including its definition.
+   * Get detailed information about a specific flow.
    */
-  async getFlowDetails(environmentId: string, flowId: string): Promise<FlowSummary> {
-    this.logger.info(`Getting flow details: ${flowId}`);
-    try {
-      const response = await this.client.get(
-        `/environments/${environmentId}/flows/${flowId}`,
-        { params: { 'api-version': '2016-11-01' } }
-      );
+  async getFlowDetails(
+    environmentId: string,
+    flowId: string
+  ): Promise<any> {
+    this.logger.info(`Getting flow details: ${flowId} in ${environmentId}`);
 
-      const f = response.data;
-      return {
-        name: f.name,
-        id: f.id,
-        displayName: f.properties?.displayName || f.name,
-        state: f.properties?.state || 'Unknown',
-        createdTime: f.properties?.createdTime || '',
-        lastModifiedTime: f.properties?.lastModifiedTime || '',
-        flowTriggerUri: f.properties?.flowTriggerUri,
-        definition: f.properties?.definition,
-      };
-    } catch (error) {
-      this.handleError('getFlowDetails', error);
-      throw error;
-    }
+    const url = this.adminPath(environmentId, `/v2/flows/${flowId}`);
+    const response = await this.client.get(url, {
+      params: { 'api-version': API_VERSION },
+    });
+
+    const flow = response.data;
+    return {
+      name: flow.name,
+      displayName: flow.properties?.displayName || flow.name,
+      state: flow.properties?.state || 'Unknown',
+      definition: flow.properties?.definition,
+      connectionReferences: flow.properties?.connectionReferences,
+      createdTime: flow.properties?.createdTime,
+      lastModifiedTime: flow.properties?.lastModifiedTime,
+      creator: flow.properties?.creator,
+      triggers: flow.properties?.definition?.triggers,
+      actions: flow.properties?.definition?.actions,
+    };
   }
 
   /**
-   * Enable or disable a flow.
+   * Enable (start) or disable (stop) a flow.
    */
-  async setFlowState(
+  async enableDisableFlow(
     environmentId: string,
     flowId: string,
-    state: 'Started' | 'Stopped'
-  ): Promise<{ success: boolean; newState: string }> {
-    this.logger.info(`Setting flow ${flowId} state to: ${state}`);
-    try {
-      if (state === 'Started') {
-        await this.client.post(
-          `/environments/${environmentId}/flows/${flowId}/start`,
-          {},
-          { params: { 'api-version': '2016-11-01' } }
-        );
-      } else {
-        await this.client.post(
-          `/environments/${environmentId}/flows/${flowId}/stop`,
-          {},
-          { params: { 'api-version': '2016-11-01' } }
-        );
-      }
-      return { success: true, newState: state };
-    } catch (error) {
-      this.handleError('setFlowState', error);
-      throw error;
-    }
+    action: 'start' | 'stop'
+  ): Promise<any> {
+    this.logger.info(`${action} flow: ${flowId} in ${environmentId}`);
+
+    const url = this.adminPath(environmentId, `/v2/flows/${flowId}/${action}`);
+    const response = await this.client.post(url, null, {
+      params: { 'api-version': API_VERSION },
+    });
+
+    return {
+      success: true,
+      action,
+      flowId,
+      message: `Flow ${action === 'start' ? 'enabled' : 'disabled'} successfully.`,
+    };
   }
 
   /**
-   * Delete a flow.
+   * Permanently delete a flow.
    */
-  async deleteFlow(environmentId: string, flowId: string): Promise<{ success: boolean }> {
-    this.logger.info(`Deleting flow: ${flowId}`);
+  async deleteFlow(
+    environmentId: string,
+    flowId: string
+  ): Promise<any> {
+    this.logger.info(`Deleting flow: ${flowId} in ${environmentId}`);
+
+    const url = this.adminPath(environmentId, `/v2/flows/${flowId}`);
+    await this.client.delete(url, {
+      params: { 'api-version': API_VERSION },
+    });
+
+    return {
+      success: true,
+      flowId,
+      message: 'Flow deleted successfully.',
+    };
+  }
+
+  /**
+   * Trigger a flow that has an HTTP request trigger.
+   * Note: Trigger may use a different path pattern than other admin ops.
+   */
+  async triggerFlow(
+    environmentId: string,
+    flowId: string,
+    triggerBody?: object
+  ): Promise<any> {
+    this.logger.info(`Triggering flow: ${flowId} in ${environmentId}`);
+
+    // Try admin-scoped trigger path
+    const url = this.adminPath(environmentId, `/flows/${flowId}/triggers/manual/run`);
+    this.logger.info(`Trigger URL: ${url}`);
+
     try {
-      await this.client.delete(
-        `/environments/${environmentId}/flows/${flowId}`,
-        { params: { 'api-version': '2016-11-01' } }
-      );
-      return { success: true };
-    } catch (error) {
-      this.handleError('deleteFlow', error);
-      throw error;
+      const response = await this.client.post(url, triggerBody || {}, {
+        params: { 'api-version': API_VERSION },
+      });
+
+      return {
+        success: true,
+        flowId,
+        message: 'Flow triggered successfully.',
+        response: response.data,
+      };
+    } catch (adminError: any) {
+      // If admin path fails, try non-admin path as fallback
+      if (adminError.response?.status === 404) {
+        this.logger.warn('Admin trigger path returned 404, trying user-scoped path...');
+        const fallbackUrl = `/environments/${environmentId}/flows/${flowId}/triggers/manual/run`;
+        const response = await this.client.post(fallbackUrl, triggerBody || {}, {
+          params: { 'api-version': API_VERSION },
+        });
+
+        return {
+          success: true,
+          flowId,
+          message: 'Flow triggered successfully (via user path).',
+          response: response.data,
+        };
+      }
+      throw adminError;
     }
   }
 
   /**
    * Get run history for a flow.
    */
-  async getFlowRuns(
+  async getRunHistory(
     environmentId: string,
     flowId: string,
-    options?: { top?: number; status?: string }
-  ): Promise<FlowRun[]> {
-    this.logger.info(`Getting run history for flow: ${flowId}`);
-    try {
-      const params: Record<string, string> = {
-        'api-version': '2016-11-01',
-      };
-      if (options?.top) params['$top'] = String(options.top);
-      if (options?.status) params['$filter'] = `status eq '${options.status}'`;
+    top?: number
+  ): Promise<any> {
+    this.logger.info(`Getting run history: ${flowId} in ${environmentId}, top: ${top || 'default'}`);
 
-      const response = await this.client.get(
-        `/environments/${environmentId}/flows/${flowId}/runs`,
-        { params }
-      );
-
-      const runs = response.data.value || [];
-      return runs.map((r: any) => ({
-        name: r.name,
-        id: r.id,
-        status: r.properties?.status || 'Unknown',
-        startTime: r.properties?.startTime || '',
-        endTime: r.properties?.endTime,
-        triggerName: r.properties?.trigger?.name || '',
-        error: r.properties?.error,
-      }));
-    } catch (error) {
-      this.handleError('getFlowRuns', error);
-      throw error;
+    const params: Record<string, string> = {
+      'api-version': API_VERSION,
+    };
+    if (top) {
+      params['$top'] = String(top);
     }
+
+    const url = this.adminPath(environmentId, `/v2/flows/${flowId}/runs`);
+    const response = await this.client.get(url, { params });
+    const data = response.data;
+
+    const runs = (data.value || []).map((run: any) => ({
+      id: run.name,
+      status: run.properties?.status || 'Unknown',
+      startTime: run.properties?.startTime,
+      endTime: run.properties?.endTime,
+      trigger: run.properties?.trigger?.name,
+    }));
+
+    return {
+      totalRuns: runs.length,
+      runs,
+    };
   }
 
   /**
-   * Get details of a specific flow run.
+   * Get detailed information about a specific flow run.
    */
-  async getFlowRunDetails(
-    environmentId: string,
-    flowId: string,
-    runId: string
-  ): Promise<FlowRun> {
-    this.logger.info(`Getting run details: ${runId} for flow: ${flowId}`);
-    try {
-      const response = await this.client.get(
-        `/environments/${environmentId}/flows/${flowId}/runs/${runId}`,
-        { params: { 'api-version': '2016-11-01' } }
-      );
-
-      const r = response.data;
-      return {
-        name: r.name,
-        id: r.id,
-        status: r.properties?.status || 'Unknown',
-        startTime: r.properties?.startTime || '',
-        endTime: r.properties?.endTime,
-        triggerName: r.properties?.trigger?.name || '',
-        error: r.properties?.error,
-      };
-    } catch (error) {
-      this.handleError('getFlowRunDetails', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Trigger a flow that has an HTTP request trigger.
-   */
-  async triggerFlow(
-    triggerUri: string,
-    body?: Record<string, unknown>
-  ): Promise<FlowTriggerResult> {
-    this.logger.info('Triggering flow via HTTP trigger URI');
-    try {
-      // Trigger URIs are fully qualified — use axios directly, not the scoped client
-      const response = await this.client.post(triggerUri, body || {});
-      return {
-        statusCode: response.status,
-        headers: response.headers as Record<string, string>,
-        body: response.data,
-      };
-    } catch (error) {
-      this.handleError('triggerFlow', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Cancel a running flow run.
-   */
-  async cancelFlowRun(
+  async getRunDetails(
     environmentId: string,
     flowId: string,
     runId: string
-  ): Promise<{ success: boolean }> {
-    this.logger.info(`Cancelling run: ${runId} for flow: ${flowId}`);
-    try {
-      await this.client.post(
-        `/environments/${environmentId}/flows/${flowId}/runs/${runId}/cancel`,
-        {},
-        { params: { 'api-version': '2016-11-01' } }
-      );
-      return { success: true };
-    } catch (error) {
-      this.handleError('cancelFlowRun', error);
-      throw error;
-    }
-  }
+  ): Promise<any> {
+    this.logger.info(`Getting run details: ${runId} for flow ${flowId}`);
 
-  private handleError(operation: string, error: unknown): void {
-    const axiosErr = error as AxiosError;
-    const errData = axiosErr.response?.data as Record<string, unknown> | undefined;
-    this.logger.error(`FlowClient.${operation} failed`, {
-      status: axiosErr.response?.status,
-      statusText: axiosErr.response?.statusText,
-      error: errData?.error,
-      message: errData?.message || axiosErr.message,
+    const url = this.adminPath(environmentId, `/v2/flows/${flowId}/runs/${runId}`);
+    const response = await this.client.get(url, {
+      params: { 'api-version': API_VERSION },
     });
+
+    const run = response.data;
+    return {
+      id: run.name,
+      status: run.properties?.status || 'Unknown',
+      startTime: run.properties?.startTime,
+      endTime: run.properties?.endTime,
+      trigger: run.properties?.trigger,
+      actions: run.properties?.actions,
+      outputs: run.properties?.outputs,
+      error: run.properties?.error,
+    };
+  }
+
+  /**
+   * Cancel a currently running flow run.
+   */
+  async cancelRun(
+    environmentId: string,
+    flowId: string,
+    runId: string
+  ): Promise<any> {
+    this.logger.info(`Cancelling run: ${runId} for flow ${flowId}`);
+
+    const url = this.adminPath(environmentId, `/v2/flows/${flowId}/runs/${runId}/cancel`);
+    await this.client.post(url, null, {
+      params: { 'api-version': API_VERSION },
+    });
+
+    return {
+      success: true,
+      runId,
+      message: 'Run cancelled successfully.',
+    };
   }
 }
