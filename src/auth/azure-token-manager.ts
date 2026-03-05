@@ -12,8 +12,9 @@
 //   - Concurrent request coalescing (one refresh per scope)
 //
 // IMPORTANT: The Flow API requires a custom x-ms-client-scope
-// header for service principal authentication. This is injected
-// automatically when creating the flow-scoped client.
+// header for service principal authentication. This header is
+// injected in the REQUEST INTERCEPTOR (not just axios defaults)
+// to guarantee it reaches the API on every request.
 //
 // Author: GROW by Bolthouse Fresh (Architected by MCA)
 // ═══════════════════════════════════════════════════════════════
@@ -41,6 +42,7 @@ export class AzureTokenManager {
   private config: TokenManagerConfig;
   private tokens: Map<TokenScope, TokenEntry> = new Map();
   private logger: winston.Logger;
+  private headerLoggedPerScope: Set<TokenScope> = new Set();
 
   // ── Static factory (called by index.ts) ──
   static initialize(config: TokenManagerConfig, logger: winston.Logger): AzureTokenManager {
@@ -165,37 +167,57 @@ export class AzureTokenManager {
    * Create an axios instance with automatic token injection
    * and 401 retry logic for the specified scope.
    *
-   * IMPORTANT: For the 'flow' scope, the Power Automate Flow API
-   * requires the x-ms-client-scope header for service principal auth.
-   * Without it, the API returns 401 ClientScopeAuthorizationFailed:
-   * "The x-ms-client-scope header must not be null or empty."
+   * CRITICAL: The x-ms-client-scope header is injected in the
+   * REQUEST INTERCEPTOR, not just in axios.create() defaults.
+   * Some axios versions do not properly merge custom headers
+   * from create() options into individual request configs.
+   * The interceptor guarantees the header is on every request.
    */
   createAuthenticatedClient(scope: TokenScope, baseURL: string): AxiosInstance {
-    // Build default headers — Flow API requires x-ms-client-scope
-    const defaultHeaders: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-
-    if (scope === 'flow') {
-      // The Flow API requires this header for service principal (client_credentials) auth.
-      defaultHeaders['x-ms-client-scope'] = this.config.scopes[scope];
-      this.logger.info(`Flow client will include x-ms-client-scope: ${this.config.scopes[scope]}`);
-    }
-
     const client = axios.create({
       baseURL,
       timeout: 30000,
-      headers: defaultHeaders,
+      headers: {
+        'Content-Type': 'application/json',
+      },
     });
 
-    // Request interceptor: inject Bearer token
+    // Store scope URL for use in interceptors
+    const scopeUrl = this.config.scopes[scope];
+
+    if (scope === 'flow') {
+      this.logger.info(`Flow client will include x-ms-client-scope: ${scopeUrl}`);
+    }
+
+    // ── Request interceptor: inject Bearer token + x-ms-client-scope ──
     client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
+      // Inject Bearer token
       const token = await this.getToken(scope);
       config.headers.Authorization = `Bearer ${token}`;
+
+      // CRITICAL: Inject x-ms-client-scope for Flow API
+      // This header MUST be present on every Flow API request when
+      // using service principal (client_credentials) authentication.
+      // Without it, the API returns 401 ClientScopeAuthorizationFailed:
+      // "The x-ms-client-scope header must not be null or empty."
+      if (scope === 'flow') {
+        config.headers['x-ms-client-scope'] = scopeUrl;
+      }
+
+      // Diagnostic: log outgoing headers once per scope
+      if (!this.headerLoggedPerScope.has(scope)) {
+        this.headerLoggedPerScope.add(scope);
+        const headerKeys = Object.keys(config.headers.toJSON ? config.headers.toJSON() : config.headers);
+        this.logger.info(`[${scope}] Outgoing request headers: ${headerKeys.join(', ')}`);
+        this.logger.info(`[${scope}] x-ms-client-scope value: ${config.headers['x-ms-client-scope'] || 'NOT SET'}`);
+        this.logger.info(`[${scope}] Authorization: Bearer ${token.substring(0, 20)}...`);
+        this.logger.info(`[${scope}] Target: ${config.baseURL}${config.url}`);
+      }
+
       return config;
     });
 
-    // Response interceptor: 401 retry with fresh token
+    // ── Response interceptor: 401 retry with fresh token ──
     client.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
@@ -205,9 +227,20 @@ export class AzureTokenManager {
           originalRequest._retry = true;
           this.logger.warn(`401 received for scope '${scope}', attempting token refresh...`);
 
+          // Log the 401 error body for diagnostics
+          const errBody = error.response?.data;
+          this.logger.warn(`401 error body: ${JSON.stringify(errBody)}`);
+
           try {
             const freshToken = await this.forceRefresh(scope);
             originalRequest.headers.Authorization = `Bearer ${freshToken}`;
+
+            // Re-inject x-ms-client-scope on retry
+            if (scope === 'flow') {
+              originalRequest.headers['x-ms-client-scope'] = scopeUrl;
+              this.logger.info(`[retry] x-ms-client-scope re-injected: ${scopeUrl}`);
+            }
+
             return client.request(originalRequest);
           } catch (refreshError) {
             this.logger.error('Token refresh failed during 401 retry', { refreshError });
