@@ -129,6 +129,7 @@ function requireConfigured(): string | null {
 
 // ─────────────────────────────────────────────────────────────────
 // MCP Server + Tool Registration
+// SDK v1.12+ requires raw Zod shapes (.shape), not z.object() wrappers
 // ─────────────────────────────────────────────────────────────────
 
 const mcpServer = new McpServer({
@@ -138,61 +139,61 @@ const mcpServer = new McpServer({
 
 mcpServer.tool('pa-list-environments', {}, async () => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeListEnvironments(envClient!);
 });
 
-mcpServer.tool('pa-list-flows', listFlowsSchema, async (args) => {
+mcpServer.tool('pa-list-flows', listFlowsSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeListFlows(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-get-flow-details', getFlowDetailsSchema, async (args) => {
+mcpServer.tool('pa-get-flow-details', getFlowDetailsSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeGetFlowDetails(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-enable-disable-flow', enableDisableFlowSchema, async (args) => {
+mcpServer.tool('pa-enable-disable-flow', enableDisableFlowSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeEnableDisableFlow(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-delete-flow', deleteFlowSchema, async (args) => {
+mcpServer.tool('pa-delete-flow', deleteFlowSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeDeleteFlow(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-trigger-flow', triggerFlowSchema, async (args) => {
+mcpServer.tool('pa-trigger-flow', triggerFlowSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeTriggerFlow(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-get-run-history', getRunHistorySchema, async (args) => {
+mcpServer.tool('pa-get-run-history', getRunHistorySchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeGetRunHistory(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-get-run-details', getRunDetailsSchema, async (args) => {
+mcpServer.tool('pa-get-run-details', getRunDetailsSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeGetRunDetails(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-cancel-run', cancelRunSchema, async (args) => {
+mcpServer.tool('pa-cancel-run', cancelRunSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeCancelRun(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-list-connections', listConnectionsSchema, async (args) => {
+mcpServer.tool('pa-list-connections', listConnectionsSchema.shape, async (args) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text', text: err }] };
+  if (err) return { content: [{ type: 'text' as const, text: err }] };
   return executeListConnections(connClient!, args, defaultEnvId);
 });
 
