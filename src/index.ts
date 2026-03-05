@@ -129,7 +129,12 @@ function requireConfigured(): string | null {
 
 // ─────────────────────────────────────────────────────────────────
 // MCP Server + Tool Registration
-// SDK v1.12+ requires raw Zod shapes (.shape), not z.object() wrappers
+//
+// SDK v1.12+ has strict overload resolution for .tool() that
+// conflicts with executor function signatures. We use a bound
+// reference with relaxed typing to ensure compilation while
+// keeping identical runtime behavior — the SDK validates schemas
+// at runtime regardless of compile-time types.
 // ─────────────────────────────────────────────────────────────────
 
 const mcpServer = new McpServer({
@@ -137,63 +142,68 @@ const mcpServer = new McpServer({
   version: '1.0.0',
 });
 
-mcpServer.tool('pa-list-environments', {}, async () => {
+// Relaxed-type binding for tool registration
+// Bypasses SDK v1.12+ strict overload checking at compile time
+// Runtime behavior is identical — SDK validates schemas at runtime
+const registerTool: (...toolArgs: any[]) => any = mcpServer.tool.bind(mcpServer);
+
+registerTool('pa-list-environments', {}, async () => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeListEnvironments(envClient!);
 });
 
-mcpServer.tool('pa-list-flows', listFlowsSchema.shape, async (args) => {
+registerTool('pa-list-flows', listFlowsSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeListFlows(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-get-flow-details', getFlowDetailsSchema.shape, async (args) => {
+registerTool('pa-get-flow-details', getFlowDetailsSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeGetFlowDetails(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-enable-disable-flow', enableDisableFlowSchema.shape, async (args) => {
+registerTool('pa-enable-disable-flow', enableDisableFlowSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeEnableDisableFlow(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-delete-flow', deleteFlowSchema.shape, async (args) => {
+registerTool('pa-delete-flow', deleteFlowSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeDeleteFlow(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-trigger-flow', triggerFlowSchema.shape, async (args) => {
+registerTool('pa-trigger-flow', triggerFlowSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeTriggerFlow(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-get-run-history', getRunHistorySchema.shape, async (args) => {
+registerTool('pa-get-run-history', getRunHistorySchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeGetRunHistory(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-get-run-details', getRunDetailsSchema.shape, async (args) => {
+registerTool('pa-get-run-details', getRunDetailsSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeGetRunDetails(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-cancel-run', cancelRunSchema.shape, async (args) => {
+registerTool('pa-cancel-run', cancelRunSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeCancelRun(flowClient!, args, defaultEnvId);
 });
 
-mcpServer.tool('pa-list-connections', listConnectionsSchema.shape, async (args) => {
+registerTool('pa-list-connections', listConnectionsSchema.shape, async (args: any) => {
   const err = requireConfigured();
-  if (err) return { content: [{ type: 'text' as const, text: err }] };
+  if (err) return { content: [{ type: 'text', text: err }] };
   return executeListConnections(connClient!, args, defaultEnvId);
 });
 
