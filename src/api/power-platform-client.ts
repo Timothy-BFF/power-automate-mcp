@@ -254,6 +254,16 @@ export class PowerPlatformClient {
   //   2. Service principal must be registered as a Dataverse Application User
   //   3. Application User must have a security role with workflow CRUD rights
   //      (e.g., System Administrator or a custom role)
+  //
+  // CLIENTDATA FORMAT (confirmed via multi-source research):
+  //   displayName must NOT appear inside clientdata.properties
+  //   It belongs ONLY in the entity-level 'name' field.
+  //   clientdata = JSON.stringify({
+  //     properties: {
+  //       definition: { <Logic Apps schema> },
+  //       connectionReferences: {}
+  //     }
+  //   })
   // =========================================================================
 
   /**
@@ -262,9 +272,11 @@ export class PowerPlatformClient {
    * Maps to the Dataverse 'workflow' entity with:
    *   - category   = 5  (Modern Flow / Cloud Flow)
    *   - type       = 1  (Definition)
-   *   - clientdata = JSON string of {properties: {displayName, definition, connectionReferences}}
+   *   - clientdata = JSON string of {properties: {definition, connectionReferences}}
    *   - statecode  = 0 (Draft/Stopped) or 1 (Activated/Started)
    *   - statuscode = 1 (Draft) or 2 (Activated)
+   *
+   * IMPORTANT: displayName goes in entity 'name' field ONLY, NOT in clientdata.
    */
   async createFlow(
     envId: string,
@@ -281,14 +293,14 @@ export class PowerPlatformClient {
           contentVersion: '1.0.0.0',
           triggers: definition.triggers || {},
           actions: definition.actions || {},
-          outputs: definition.outputs || {},
           ...(definition.parameters ? { parameters: definition.parameters } : {}),
         };
 
     // Build the clientdata JSON envelope — Power Automate interprets this as the flow definition
-    const clientData: any = {
+    // CRITICAL: displayName must NOT be inside properties — it causes "invalid format" errors
+    // The Dataverse parser only expects definition + connectionReferences inside properties
+    const clientData = {
       properties: {
-        displayName,
         definition: fullDefinition,
         connectionReferences: connectionReferences || {},
       },
@@ -299,6 +311,8 @@ export class PowerPlatformClient {
     // Started -> statecode: 1 (Activated), statuscode: 2
     const isStarted = state === 'Started';
 
+    const clientDataStr = JSON.stringify(clientData);
+
     const workflowEntity = {
       name: displayName,
       type: 1,
@@ -306,13 +320,15 @@ export class PowerPlatformClient {
       statecode: isStarted ? 1 : 0,
       statuscode: isStarted ? 2 : 1,
       primaryentity: 'none',
-      clientdata: JSON.stringify(clientData),
+      clientdata: clientDataStr,
     };
 
     console.log(`[Dataverse] Creating flow: "${displayName}" in env ${envId} (state: ${state})`);
     console.log(`[Dataverse] Workflow entity: category=5, type=1, statecode=${workflowEntity.statecode}`);
     console.log(`[Dataverse] Definition triggers: ${Object.keys(fullDefinition.triggers || {}).join(', ') || '(none)'}`);
     console.log(`[Dataverse] Definition actions: ${Object.keys(fullDefinition.actions || {}).join(', ') || '(none)'}`);
+    console.log(`[Dataverse] clientdata length: ${clientDataStr.length} chars`);
+    console.log(`[Dataverse] clientdata: ${clientDataStr}`);
 
     const result = await this.dataverseRequest(
       envId,
@@ -344,6 +360,8 @@ export class PowerPlatformClient {
    *
    * Note: For state changes only (start/stop), prefer enableDisableFlow() which
    * uses the Flow Admin API and doesn't require Dataverse.
+   *
+   * IMPORTANT: displayName goes in entity 'name' field ONLY, NOT in clientdata.
    */
   async updateFlow(
     envId: string,
@@ -358,7 +376,8 @@ export class PowerPlatformClient {
     const patch: any = {};
 
     // Build updated clientdata if any content properties changed
-    if (updates.definition || updates.displayName || updates.connectionReferences) {
+    // CRITICAL: displayName must NOT be in clientdata — only definition + connectionReferences
+    if (updates.definition || updates.connectionReferences) {
       const fullDefinition = updates.definition
         ? (updates.definition['$schema']
             ? updates.definition
@@ -367,18 +386,21 @@ export class PowerPlatformClient {
                 contentVersion: '1.0.0.0',
                 triggers: updates.definition.triggers || {},
                 actions: updates.definition.actions || {},
-                outputs: updates.definition.outputs || {},
                 ...(updates.definition.parameters ? { parameters: updates.definition.parameters } : {}),
               })
         : undefined;
 
       const clientDataObj: any = { properties: {} };
-      if (updates.displayName) clientDataObj.properties.displayName = updates.displayName;
       if (fullDefinition) clientDataObj.properties.definition = fullDefinition;
       if (updates.connectionReferences) {
         clientDataObj.properties.connectionReferences = updates.connectionReferences;
       }
-      patch.clientdata = JSON.stringify(clientDataObj);
+
+      // Only set clientdata if there's actual content to update
+      if (Object.keys(clientDataObj.properties).length > 0) {
+        patch.clientdata = JSON.stringify(clientDataObj);
+        console.log(`[Dataverse] clientdata for update: ${patch.clientdata}`);
+      }
     }
 
     if (updates.displayName) {
