@@ -3,7 +3,8 @@ import { AzureTokenManager } from '../auth/azure-token-manager.js';
 
 // Service principal (New-PowerAppManagementApp) requires:
 // - BAP admin scope for environment listing
-// - Flow scope with /scopes/admin/ for flow management
+// - Flow scope with /scopes/admin/ for flow management (read, enable/disable, delete)
+// - Flow scope with non-admin path for flow creation and update
 // - PowerApps scope for connections listing
 const BAP_SCOPE = 'https://api.bap.microsoft.com/.default';
 const FLOW_SCOPE = 'https://service.flow.microsoft.com/.default';
@@ -39,6 +40,12 @@ export class PowerPlatformClient {
     return this.request(url, method, FLOW_SCOPE, data);
   }
 
+  private async flowRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
+    const url = path.startsWith('http') ? path : `${FLOW_BASE}${path}`;
+    console.log(`[Flow-Write] ${method} ${url}`);
+    return this.request(url, method, FLOW_SCOPE, data);
+  }
+
   private async powerAppsAdminRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
     const sep = path.includes('?') ? '&' : '?';
     const url = `${POWERAPPS_BASE}${path}${sep}api-version=${POWERAPPS_API_VER}`;
@@ -65,6 +72,13 @@ export class PowerPlatformClient {
         });
         return retry.data;
       }
+      // Enhanced error logging for debugging
+      if (error.response) {
+        console.error(`[API] Error ${error.response.status} on ${method} ${url}`);
+        console.error(`[API] Response body:`, JSON.stringify(error.response.data, null, 2));
+      } else {
+        console.error(`[API] Network error on ${method} ${url}:`, error.message);
+      }
       throw this.fmtErr(error);
     }
   }
@@ -86,7 +100,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Management — READ (Flow Admin API)
+  // Flow Management — READ (Flow Admin API — /scopes/admin/ path)
   // =========================================================================
   async listFlows(envId: string, filter?: string, top?: number): Promise<any> {
     let p = `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/v2/flows?api-version=${FLOW_API_VER}`;
@@ -105,13 +119,16 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Management — WRITE (Flow Admin API)
+  // Flow Management — WRITE (Flow API — NON-admin path for create/update)
+  // NOTE: The /scopes/admin/ path does NOT support POST (create) or PATCH.
+  //       Creation and updates use the non-admin path:
+  //       /providers/Microsoft.ProcessSimple/environments/{envId}/flows
   // =========================================================================
 
   /**
    * Creates a new Power Automate cloud flow.
+   * Uses the NON-admin endpoint (admin path does not support POST).
    * The definition follows the Azure Logic Apps workflow definition schema.
-   * If the definition does not include $schema, it will be wrapped automatically.
    */
   async createFlow(
     envId: string,
@@ -144,9 +161,14 @@ export class PowerPlatformClient {
       body.properties.connectionReferences = connectionReferences;
     }
 
-    console.log(`[Flow] Creating flow: "${displayName}" in env ${envId} (state: ${state})`);
-    return this.flowAdminRequest(
-      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
+    console.log(`[Flow-Write] Creating flow: "${displayName}" in env ${envId} (state: ${state})`);
+    console.log(`[Flow-Write] Request body keys: ${Object.keys(body.properties).join(', ')}`);
+    console.log(`[Flow-Write] Definition triggers: ${Object.keys(fullDefinition.triggers || {}).join(', ') || '(none)'}`);
+    console.log(`[Flow-Write] Definition actions: ${Object.keys(fullDefinition.actions || {}).join(', ') || '(none)'}`);
+
+    // NON-admin path — /environments/{envId}/flows (no /scopes/admin/)
+    return this.flowRequest(
+      `/providers/Microsoft.ProcessSimple/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
       'POST',
       body
     );
@@ -154,8 +176,8 @@ export class PowerPlatformClient {
 
   /**
    * Updates an existing Power Automate cloud flow.
+   * Uses the NON-admin endpoint for PATCH operations.
    * Can update displayName, definition, state, and/or connectionReferences.
-   * Only include the properties you want to change.
    */
   async updateFlow(
     envId: string,
@@ -174,7 +196,6 @@ export class PowerPlatformClient {
     }
 
     if (updates.definition) {
-      // Ensure schema envelope
       properties.definition = updates.definition['$schema']
         ? updates.definition
         : {
@@ -195,16 +216,19 @@ export class PowerPlatformClient {
       properties.connectionReferences = updates.connectionReferences;
     }
 
-    console.log(`[Flow] Updating flow ${flowId} in env ${envId}`);
-    return this.flowAdminRequest(
-      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
+    console.log(`[Flow-Write] Updating flow ${flowId} in env ${envId}`);
+    console.log(`[Flow-Write] Update properties: ${Object.keys(properties).join(', ')}`);
+
+    // NON-admin path — /environments/{envId}/flows/{flowId} (no /scopes/admin/)
+    return this.flowRequest(
+      `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
       'PATCH',
       { properties }
     );
   }
 
   // =========================================================================
-  // Flow Management — LIFECYCLE (Flow Admin API)
+  // Flow Management — LIFECYCLE (Flow Admin API — /scopes/admin/ path)
   // =========================================================================
   async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop'): Promise<any> {
     return this.flowAdminRequest(
@@ -229,7 +253,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Runs (Flow Admin API)
+  // Flow Runs (Flow Admin API — /scopes/admin/ path)
   // =========================================================================
   async getRunHistory(envId: string, flowId: string, top?: number): Promise<any> {
     let p = `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}/runs?api-version=${FLOW_API_VER}`;
