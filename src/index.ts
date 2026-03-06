@@ -486,13 +486,6 @@ app.post('/tools', jsonParser, handleJsonRpc);
 // =============================================================================
 // Start
 // =============================================================================
-
-// Diagnostic: Log environment variable resolution
-console.log('[Init] Environment variable check:');
-console.log(`[Init]   POWER_PLATFORM_ENVIRONMENT_ID = ${process.env.POWER_PLATFORM_ENVIRONMENT_ID ? '"' + process.env.POWER_PLATFORM_ENVIRONMENT_ID + '"' : '(not set)'}`);
-console.log(`[Init]   DEFAULT_ENVIRONMENT_ID = ${process.env.DEFAULT_ENVIRONMENT_ID ? '"' + process.env.DEFAULT_ENVIRONMENT_ID + '"' : '(not set)'}`);
-console.log(`[Init]   AZURE_TENANT_ID = ${process.env.AZURE_TENANT_ID ? '(set)' : '(not set)'}`);
-
 try {
   const defaultEnv = resolveEnvironmentId();
   console.log(`[Init] Default environment: ${defaultEnv}`);
@@ -506,6 +499,6 @@ app.listen(PORT, () => {
   console.log(`[Init] SSE:    http://localhost:${PORT}/sse`);
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
-  console.log(`[Init] API:    BAP admin + Flow admin (/scopes/admin/) + PowerApps admin`);
+  console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
   console.log('');
 });
