@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.3.2';
+const VERSION = '2.3.3';
 
 // =============================================================================
 // Core Services
@@ -145,6 +145,7 @@ const toolDefs: ToolDefinition[] = [
           displayName: r.properties?.displayName || p.displayName,
           state: r.properties?.state || p.state || 'Stopped',
           _source: r._source,
+          _idMapping: r._idMapping,
         });
       } catch (e: any) { return fail(e.message); }
     },
@@ -557,6 +558,7 @@ app.listen(PORT, () => {
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
   console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin + Dataverse dynamic (4 scopes)`);
   console.log(`[Init] Write:  Dataverse Web API (create + update flows)`);
+  console.log(`[Init] ID:     workflowidunique bridge (Dataverse -> Flow API)`);
   console.log(`[Init] Tools:  ${toolDefs.length} (including Dataverse-backed create + update)`);
   console.log('');
 });
