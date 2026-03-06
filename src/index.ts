@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 
 // =============================================================================
 // Core Services
@@ -20,7 +20,7 @@ const VERSION = '2.2.0';
 const tokenManager = new AzureTokenManager();
 const client = new PowerPlatformClient(tokenManager);
 
-// Pre-warm tokens (BAP + Flow scopes)
+// Pre-warm tokens (BAP + Flow + PowerApps scopes)
 (async () => {
   try {
     await tokenManager.getToken('https://api.bap.microsoft.com/.default');
@@ -30,6 +30,10 @@ const client = new PowerPlatformClient(tokenManager);
     await tokenManager.getToken('https://service.flow.microsoft.com/.default');
     console.log('[Init] Flow token acquired (service.flow.microsoft.com)');
   } catch (e: any) { console.warn('[Init] Flow token pre-warm failed:', e.message); }
+  try {
+    await tokenManager.getToken('https://service.powerapps.com/.default');
+    console.log('[Init] PowerApps token acquired (service.powerapps.com)');
+  } catch (e: any) { console.warn('[Init] PowerApps token pre-warm failed:', e.message); }
 })();
 
 // =============================================================================
@@ -482,6 +486,13 @@ app.post('/tools', jsonParser, handleJsonRpc);
 // =============================================================================
 // Start
 // =============================================================================
+
+// Diagnostic: Log environment variable resolution
+console.log('[Init] Environment variable check:');
+console.log(`[Init]   POWER_PLATFORM_ENVIRONMENT_ID = ${process.env.POWER_PLATFORM_ENVIRONMENT_ID ? '"' + process.env.POWER_PLATFORM_ENVIRONMENT_ID + '"' : '(not set)'}`);
+console.log(`[Init]   DEFAULT_ENVIRONMENT_ID = ${process.env.DEFAULT_ENVIRONMENT_ID ? '"' + process.env.DEFAULT_ENVIRONMENT_ID + '"' : '(not set)'}`);
+console.log(`[Init]   AZURE_TENANT_ID = ${process.env.AZURE_TENANT_ID ? '(set)' : '(not set)'}`);
+
 try {
   const defaultEnv = resolveEnvironmentId();
   console.log(`[Init] Default environment: ${defaultEnv}`);
@@ -495,6 +506,6 @@ app.listen(PORT, () => {
   console.log(`[Init] SSE:    http://localhost:${PORT}/sse`);
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
-  console.log(`[Init] API:    BAP admin (api.bap.microsoft.com) + Flow admin (/scopes/admin/)`);
+  console.log(`[Init] API:    BAP admin + Flow admin (/scopes/admin/) + PowerApps admin`);
   console.log('');
 });

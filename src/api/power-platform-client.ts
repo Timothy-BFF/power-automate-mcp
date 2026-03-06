@@ -4,10 +4,13 @@ import { AzureTokenManager } from '../auth/azure-token-manager.js';
 // Service principal (New-PowerAppManagementApp) requires BAP admin scope + admin-prefixed paths
 const BAP_SCOPE = 'https://api.bap.microsoft.com/.default';
 const FLOW_SCOPE = 'https://service.flow.microsoft.com/.default';
+const POWERAPPS_SCOPE = 'https://service.powerapps.com/.default';
 const BAP_BASE = 'https://api.bap.microsoft.com';
 const FLOW_BASE = 'https://api.flow.microsoft.com';
+const POWERAPPS_BASE = 'https://api.powerapps.com';
 const BAP_API_VER = '2023-06-01';
 const FLOW_API_VER = '2016-11-01';
+const POWERAPPS_API_VER = '2016-11-01';
 
 export class PowerPlatformClient {
   private tm: AzureTokenManager;
@@ -27,6 +30,13 @@ export class PowerPlatformClient {
     const url = path.startsWith('http') ? path : `${FLOW_BASE}${path}`;
     console.log(`[Flow] ${method} ${url}`);
     return this.request(url, method, FLOW_SCOPE, data);
+  }
+
+  private async powerAppsAdminRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
+    const sep = path.includes('?') ? '&' : '?';
+    const url = `${POWERAPPS_BASE}${path}${sep}api-version=${POWERAPPS_API_VER}`;
+    console.log(`[PowerApps] ${method} ${url}`);
+    return this.request(url, method, POWERAPPS_SCOPE, data);
   }
 
   private async request(url: string, method: string, scope: string, data?: any): Promise<any> {
@@ -129,10 +139,10 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Connections (BAP Admin API)
+  // Connections (PowerApps Admin API — different host + scope from BAP)
   // =========================================================================
   async listConnections(envId: string): Promise<any> {
-    return this.bapRequest(
+    return this.powerAppsAdminRequest(
       `/providers/Microsoft.PowerApps/scopes/admin/environments/${envId}/connections`
     );
   }
