@@ -205,6 +205,66 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
+  // Dataverse ID Resolution
+  // =========================================================================
+
+  /**
+   * Resolves the Flow Management API ID from a Dataverse workflowid.
+   *
+   * ARCHITECTURE BOUNDARY (confirmed by IT team):
+   * Power Automate flows exist in two identity planes simultaneously:
+   *   - Dataverse: workflowid (primary key of workflow entity)
+   *   - Flow Management API: name/flowId (a separate GUID)
+   *
+   * The bridge field is 'workflowidunique' in the Dataverse workflow entity.
+   * After creating a flow via Dataverse POST, we must query this field
+   * to get the ID that the Flow Management API recognizes.
+   *
+   * Fallback chain:
+   *   1. workflowidunique (primary bridge field)
+   *   2. resourceid (some environments expose this)
+   *   3. Original workflowid (last resort — may cause 404 on Flow API)
+   */
+  private async resolveFlowApiId(envId: string, dataverseWorkflowId: string): Promise<{ flowApiId: string; dataverseId: string }> {
+    try {
+      console.log(`[IdResolver] Resolving Flow API ID for Dataverse workflowid: ${dataverseWorkflowId}`);
+
+      const result = await this.dataverseRequest(
+        envId,
+        `/api/data/v9.2/workflows(${dataverseWorkflowId})?$select=workflowidunique,resourceid,name`,
+        'GET'
+      );
+
+      const workflowidunique = result?.workflowidunique;
+      const resourceid = result?.resourceid;
+      const name = result?.name;
+
+      console.log(`[IdResolver] Dataverse response:`);
+      console.log(`[IdResolver]   workflowid:       ${dataverseWorkflowId}`);
+      console.log(`[IdResolver]   workflowidunique:  ${workflowidunique || '(not found)'}`);
+      console.log(`[IdResolver]   resourceid:        ${resourceid || '(not found)'}`);
+      console.log(`[IdResolver]   name:              ${name || '(not found)'}`);
+
+      // Use workflowidunique as the Flow API ID (primary bridge)
+      // Fall back to resourceid, then to the original workflowid
+      const flowApiId = workflowidunique || resourceid || dataverseWorkflowId;
+
+      if (workflowidunique) {
+        console.log(`[IdResolver] Resolved via workflowidunique: ${flowApiId}`);
+      } else if (resourceid) {
+        console.log(`[IdResolver] Resolved via resourceid: ${flowApiId}`);
+      } else {
+        console.warn(`[IdResolver] No bridge field found — using Dataverse workflowid as fallback: ${flowApiId}`);
+      }
+
+      return { flowApiId, dataverseId: dataverseWorkflowId };
+    } catch (error: any) {
+      console.warn(`[IdResolver] Resolution failed: ${error.message}. Using Dataverse workflowid as fallback.`);
+      return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId };
+    }
+  }
+
+  // =========================================================================
   // Environments (BAP Admin API)
   // =========================================================================
 
@@ -249,11 +309,11 @@ export class PowerPlatformClient {
   // supports application-only auth and is the Microsoft-recommended path
   // for programmatic flow management with service principals.
   //
-  // Prerequisites:
-  //   1. Environment must have a linked Dataverse instance
-  //   2. Service principal must be registered as a Dataverse Application User
-  //   3. Application User must have a security role with workflow CRUD rights
-  //      (e.g., System Administrator or a custom role)
+  // IDENTITY MAPPING (confirmed by IT team investigation):
+  //   Dataverse workflowid ≠ Flow Management API flowId
+  //   Bridge field: workflowidunique (in Dataverse workflow entity)
+  //   After POST creation, a follow-up GET retrieves workflowidunique
+  //   which is the ID recognized by the Flow Management API.
   //
   // CLIENTDATA FORMAT (confirmed via Dataverse error diagnostics):
   //   {
@@ -278,8 +338,8 @@ export class PowerPlatformClient {
    *   - statecode  = 0 (Draft/Stopped) or 1 (Activated/Started)
    *   - statuscode = 1 (Draft) or 2 (Activated)
    *
-   * IMPORTANT: displayName goes in entity 'name' field ONLY, NOT in clientdata.
-   * IMPORTANT: schemaVersion is REQUIRED at the root of clientdata.
+   * After creation, resolves the Flow Management API ID via workflowidunique
+   * so downstream tools (get-flow-details, enable/disable, etc.) work seamlessly.
    */
   async createFlow(
     envId: string,
@@ -334,7 +394,6 @@ export class PowerPlatformClient {
     console.log(`[Dataverse] Definition triggers: ${Object.keys(fullDefinition.triggers || {}).join(', ') || '(none)'}`);
     console.log(`[Dataverse] Definition actions: ${Object.keys(fullDefinition.actions || {}).join(', ') || '(none)'}`);
     console.log(`[Dataverse] clientdata length: ${clientDataStr.length} chars`);
-    console.log(`[Dataverse] clientdata preview: ${clientDataStr.substring(0, 200)}...`);
 
     const result = await this.dataverseRequest(
       envId,
@@ -343,12 +402,29 @@ export class PowerPlatformClient {
       workflowEntity
     );
 
-    // Normalize response to match Flow API shape for downstream MCP tool handlers
-    const workflowId = result?.workflowid || 'unknown';
+    // Extract the Dataverse workflowid from the creation response
+    const dataverseWorkflowId = result?.workflowid || 'unknown';
+    console.log(`[Dataverse] Flow created. Dataverse workflowid: ${dataverseWorkflowId}`);
+
+    // Resolve the Flow Management API ID via workflowidunique
+    // This bridges the Dataverse ↔ Flow API identity boundary
+    let flowApiId = dataverseWorkflowId;
+    let idSource = 'dataverse-workflowid';
+
+    if (dataverseWorkflowId !== 'unknown') {
+      try {
+        const resolved = await this.resolveFlowApiId(envId, dataverseWorkflowId);
+        flowApiId = resolved.flowApiId;
+        idSource = flowApiId !== dataverseWorkflowId ? 'workflowidunique' : 'dataverse-workflowid';
+        console.log(`[Dataverse] Flow API ID resolved: ${flowApiId} (via ${idSource})`);
+      } catch (resolveErr: any) {
+        console.warn(`[Dataverse] ID resolution failed: ${resolveErr.message}. Using Dataverse workflowid.`);
+      }
+    }
 
     return {
-      name: workflowId,
-      id: `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${workflowId}`,
+      name: flowApiId,
+      id: `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowApiId}`,
       type: 'Microsoft.ProcessSimple/environments/flows',
       properties: {
         displayName,
@@ -357,6 +433,11 @@ export class PowerPlatformClient {
         connectionReferences: connectionReferences || {},
       },
       _source: 'dataverse',
+      _idMapping: {
+        flowApiId,
+        dataverseWorkflowId,
+        resolvedVia: idSource,
+      },
     };
   }
 
