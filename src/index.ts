@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.1.0';
+const VERSION = '2.1.1';
 
 // =============================================================================
 // Core Services
@@ -36,10 +36,10 @@ const client = new PowerPlatformClient(tokenManager);
 // Tool Result Helpers
 // =============================================================================
 function ok(data: any): ToolResult {
-  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
 function fail(msg: string): ToolResult {
-  return { content: [{ type: 'text', text: JSON.stringify({ error: msg }) }], isError: true };
+  return { content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }], isError: true };
 }
 
 // =============================================================================
@@ -68,7 +68,7 @@ const toolDefs: ToolDefinition[] = [
       type: 'object',
       properties: {
         environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
-        filter: { type: 'string', enum: ['personal', 'shared', 'all'], description: 'Filter by ownership type: personal (my flows), shared (team flows), or all.' },
+        filter: { type: 'string', enum: ['personal', 'shared', 'all'], description: 'Filter by ownership type.' },
         top: { type: 'number', description: 'Maximum number of flows to return.' },
       },
     },
@@ -116,7 +116,7 @@ const toolDefs: ToolDefinition[] = [
       type: 'object',
       properties: {
         flowId: { type: 'string', description: 'The unique identifier of the flow.' },
-        action: { type: 'string', enum: ['start', 'stop'], description: 'Action to perform: start (enable) or stop (disable) the flow.' },
+        action: { type: 'string', enum: ['start', 'stop'], description: 'Action to perform.' },
         environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
       },
       required: ['flowId', 'action'],
@@ -267,7 +267,7 @@ const toolDefs: ToolDefinition[] = [
   },
 ];
 
-// Build handler lookup map
+// Build handler lookup map for REST JSON-RPC
 const toolHandlers = new Map<string, (params: any) => Promise<ToolResult>>();
 for (const t of toolDefs) {
   toolHandlers.set(t.name, t.handler);
@@ -278,56 +278,60 @@ for (const t of toolDefs) {
 // =============================================================================
 const mcpServer = new McpServer({ name: 'power-automate-mcp', version: VERSION });
 
-// Register tools with Zod shapes for MCP SDK
-mcpServer.tool('pa-list-environments', toolDefs[0].description, {}, async () => toolDefs[0].handler({}));
+// Relaxed-type binding: bypasses strict TS overload resolution for MCP SDK v1.12+
+// Runtime behavior is identical; this only affects compile-time type checking.
+const registerTool: any = mcpServer.tool.bind(mcpServer);
 
-mcpServer.tool('pa-list-flows', toolDefs[1].description, {
+registerTool('pa-list-environments', toolDefs[0].description, {},
+  async () => toolDefs[0].handler({}));
+
+registerTool('pa-list-flows', toolDefs[1].description, {
   environmentId: z.string().optional().describe('Power Platform environment ID'),
   filter: z.enum(['personal', 'shared', 'all']).optional().describe('Filter by ownership'),
   top: z.number().optional().describe('Max flows to return'),
 }, async (p: any) => toolDefs[1].handler(p));
 
-mcpServer.tool('pa-get-flow-details', toolDefs[2].description, {
+registerTool('pa-get-flow-details', toolDefs[2].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[2].handler(p));
 
-mcpServer.tool('pa-enable-disable-flow', toolDefs[3].description, {
+registerTool('pa-enable-disable-flow', toolDefs[3].description, {
   flowId: z.string().describe('Flow ID'),
   action: z.enum(['start', 'stop']).describe('Enable or disable'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[3].handler(p));
 
-mcpServer.tool('pa-delete-flow', toolDefs[4].description, {
+registerTool('pa-delete-flow', toolDefs[4].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[4].handler(p));
 
-mcpServer.tool('pa-trigger-flow', toolDefs[5].description, {
+registerTool('pa-trigger-flow', toolDefs[5].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
   triggerBody: z.record(z.any()).optional().describe('Trigger body'),
 }, async (p: any) => toolDefs[5].handler(p));
 
-mcpServer.tool('pa-get-run-history', toolDefs[6].description, {
+registerTool('pa-get-run-history', toolDefs[6].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
   top: z.number().optional().describe('Max runs'),
 }, async (p: any) => toolDefs[6].handler(p));
 
-mcpServer.tool('pa-get-run-details', toolDefs[7].description, {
+registerTool('pa-get-run-details', toolDefs[7].description, {
   flowId: z.string().describe('Flow ID'),
   runId: z.string().describe('Run ID'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[7].handler(p));
 
-mcpServer.tool('pa-cancel-run', toolDefs[8].description, {
+registerTool('pa-cancel-run', toolDefs[8].description, {
   flowId: z.string().describe('Flow ID'),
   runId: z.string().describe('Run ID'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[8].handler(p));
 
-mcpServer.tool('pa-list-connections', toolDefs[9].description, {
+registerTool('pa-list-connections', toolDefs[9].description, {
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[9].handler(p));
 
@@ -347,7 +351,7 @@ app.use((req: Request, res: Response, next) => {
   next();
 });
 
-// JSON body parser — applied ONLY to REST routes (not /messages, SSE reads raw stream)
+// JSON body parser — applied ONLY to REST routes (not SSE)
 const jsonParser = express.json();
 
 // --- Health ---
@@ -413,7 +417,7 @@ app.post('/messages', async (req: Request, res: Response) => {
 async function processJsonRpcRequest(request: any): Promise<any> {
   const { jsonrpc, id, method, params } = request || {};
 
-  // If method is a direct tool name (e.g. "pa-list-environments")
+  // Direct tool name as method (e.g. "pa-list-environments")
   if (method && toolHandlers.has(method)) {
     try {
       const result = await toolHandlers.get(method)!(params || {});

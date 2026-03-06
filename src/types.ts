@@ -1,10 +1,5 @@
-export interface TokenInfo {
-  accessToken: string;
-  expiresAt: number;
-  scope: string;
-}
-
 export interface ToolResult {
+  [key: string]: unknown;
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
 }
