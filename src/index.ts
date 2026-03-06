@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.1.1';
+const VERSION = '2.2.0';
 
 // =============================================================================
 // Core Services
@@ -20,12 +20,12 @@ const VERSION = '2.1.1';
 const tokenManager = new AzureTokenManager();
 const client = new PowerPlatformClient(tokenManager);
 
-// Pre-warm tokens
+// Pre-warm tokens (BAP + Flow scopes)
 (async () => {
   try {
-    await tokenManager.getToken('https://service.powerapps.com/.default');
-    console.log('[Init] Management token acquired (service.powerapps.com)');
-  } catch (e: any) { console.warn('[Init] Management token pre-warm failed:', e.message); }
+    await tokenManager.getToken('https://api.bap.microsoft.com/.default');
+    console.log('[Init] BAP admin token acquired (api.bap.microsoft.com)');
+  } catch (e: any) { console.warn('[Init] BAP token pre-warm failed:', e.message); }
   try {
     await tokenManager.getToken('https://service.flow.microsoft.com/.default');
     console.log('[Init] Flow token acquired (service.flow.microsoft.com)');
@@ -279,7 +279,6 @@ for (const t of toolDefs) {
 const mcpServer = new McpServer({ name: 'power-automate-mcp', version: VERSION });
 
 // Relaxed-type binding: bypasses strict TS overload resolution for MCP SDK v1.12+
-// Runtime behavior is identical; this only affects compile-time type checking.
 const registerTool: any = mcpServer.tool.bind(mcpServer);
 
 registerTool('pa-list-environments', toolDefs[0].description, {},
@@ -351,7 +350,6 @@ app.use((req: Request, res: Response, next) => {
   next();
 });
 
-// JSON body parser — applied ONLY to REST routes (not SSE)
 const jsonParser = express.json();
 
 // --- Health ---
@@ -366,7 +364,7 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// --- GET Discovery Endpoints (Simtheory probes these) ---
+// --- GET Discovery ---
 app.get('/', (_req: Request, res: Response) => {
   res.json({
     name: 'power-automate-mcp', version: VERSION, protocol: 'MCP',
@@ -376,9 +374,7 @@ app.get('/', (_req: Request, res: Response) => {
 });
 
 app.get('/tools', (_req: Request, res: Response) => {
-  res.json({
-    tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
-  });
+  res.json({ tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
 });
 
 app.get('/mcp', (_req: Request, res: Response) => {
@@ -389,7 +385,7 @@ app.get('/api', (_req: Request, res: Response) => {
   res.json({ name: 'power-automate-mcp', version: VERSION, status: 'ready' });
 });
 
-// --- SSE Transport (MCP SDK standard) ---
+// --- SSE Transport ---
 const sseTransports = new Map<string, SSEServerTransport>();
 
 app.get('/sse', async (req: Request, res: Response) => {
@@ -406,18 +402,14 @@ app.get('/sse', async (req: Request, res: Response) => {
 app.post('/messages', async (req: Request, res: Response) => {
   const sessionId = req.query.sessionId as string;
   const transport = sseTransports.get(sessionId);
-  if (!transport) {
-    res.status(404).json({ error: 'Session not found', sessionId });
-    return;
-  }
+  if (!transport) { res.status(404).json({ error: 'Session not found', sessionId }); return; }
   await transport.handlePostMessage(req, res);
 });
 
-// --- REST JSON-RPC Handler (Simtheory Direct JSON execution) ---
+// --- REST JSON-RPC Handler ---
 async function processJsonRpcRequest(request: any): Promise<any> {
   const { jsonrpc, id, method, params } = request || {};
 
-  // Direct tool name as method (e.g. "pa-list-environments")
   if (method && toolHandlers.has(method)) {
     try {
       const result = await toolHandlers.get(method)!(params || {});
@@ -427,7 +419,6 @@ async function processJsonRpcRequest(request: any): Promise<any> {
     }
   }
 
-  // Standard MCP JSON-RPC methods
   try {
     switch (method) {
       case 'initialize':
@@ -439,19 +430,14 @@ async function processJsonRpcRequest(request: any): Promise<any> {
             serverInfo: { name: 'power-automate-mcp', version: VERSION },
           },
         };
-
       case 'notifications/initialized':
       case 'initialized':
         return { jsonrpc: '2.0', id, result: {} };
-
       case 'tools/list':
         return {
           jsonrpc: '2.0', id,
-          result: {
-            tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
-          },
+          result: { tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) },
         };
-
       case 'tools/call': {
         const toolName = params?.name;
         const toolArgs = params?.arguments || {};
@@ -462,10 +448,8 @@ async function processJsonRpcRequest(request: any): Promise<any> {
         const result = await handler(toolArgs);
         return { jsonrpc: '2.0', id, result };
       }
-
       case 'ping':
         return { jsonrpc: '2.0', id, result: {} };
-
       default:
         return { jsonrpc: '2.0', id: id || null, error: { code: -32601, message: `Method not found: ${method}` } };
     }
@@ -490,23 +474,27 @@ const handleJsonRpc = async (req: Request, res: Response): Promise<void> => {
   res.json(result);
 };
 
-// Mount REST JSON-RPC on all paths Simtheory probes
 app.post('/', jsonParser, handleJsonRpc);
 app.post('/mcp', jsonParser, handleJsonRpc);
 app.post('/api', jsonParser, handleJsonRpc);
 app.post('/tools', jsonParser, handleJsonRpc);
 
 // =============================================================================
-// Start Server
+// Start
 // =============================================================================
-const defaultEnv = resolveEnvironmentId();
-console.log(`[Init] Default environment: ${defaultEnv}`);
+try {
+  const defaultEnv = resolveEnvironmentId();
+  console.log(`[Init] Default environment: ${defaultEnv}`);
+} catch (e: any) {
+  console.warn(`[Init] No default environment configured: ${e.message}`);
+}
 
 app.listen(PORT, () => {
   console.log('');
-  console.log(`[Init] Power Automate MCP server running on port ${PORT}`);
+  console.log(`[Init] Power Automate MCP v${VERSION} running on port ${PORT}`);
   console.log(`[Init] SSE:    http://localhost:${PORT}/sse`);
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
+  console.log(`[Init] API:    BAP admin (api.bap.microsoft.com) + Flow admin (/scopes/admin/)`);
   console.log('');
 });
