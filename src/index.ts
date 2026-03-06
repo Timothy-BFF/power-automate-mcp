@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.2.1';
+const VERSION = '2.3.0';
 
 // =============================================================================
 // Core Services
@@ -50,6 +50,7 @@ function fail(msg: string): ToolResult {
 // Tool Definitions (shared between SSE + REST transports)
 // =============================================================================
 const toolDefs: ToolDefinition[] = [
+  // ---- Tool 0: List Environments ----
   {
     name: 'pa-list-environments',
     description: 'Lists all Power Platform environments accessible to the configured service principal. Returns environment ID, display name, location, SKU, and lifecycle state for each environment.',
@@ -65,6 +66,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 1: List Flows ----
   {
     name: 'pa-list-flows',
     description: 'Lists all Power Automate flows in a Power Platform environment. Returns flow name, display name, state (Started/Stopped), created time, and last modified time. Use filter to narrow by personal or shared flows. Provide environmentId or uses the default configured environment.',
@@ -88,6 +90,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 2: Get Flow Details ----
   {
     name: 'pa-get-flow-details',
     description: 'Gets detailed information about a specific Power Automate flow including its definition, triggers, actions, connections, and current state.',
@@ -113,6 +116,140 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 3: Create Flow ----
+  {
+    name: 'pa-create-flow',
+    description: `Creates a new Power Automate cloud flow. Provide a display name and a workflow definition following the Azure Logic Apps schema. The definition must include "triggers" and "actions" objects. The schema envelope ($schema, contentVersion) is added automatically if not provided.
+
+Example definition for a daily scheduled flow that sends an email:
+{
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": { "frequency": "Day", "interval": 1, "schedule": { "hours": ["8"], "minutes": ["0"] } }
+    }
+  },
+  "actions": {
+    "Send_an_email": {
+      "type": "OpenApiConnection",
+      "inputs": {
+        "host": { "connectionName": "shared_office365", "operationId": "SendEmailV2" },
+        "parameters": { "emailMessage/To": "user@company.com", "emailMessage/Subject": "Daily Report", "emailMessage/Body": "<p>Your daily report is ready.</p>" }
+      },
+      "runAfter": {}
+    }
+  }
+}
+
+Common trigger types: Recurrence (scheduled), Request (HTTP webhook), OpenApiConnection (when item created/modified).
+Common action types: OpenApiConnection (connectors), Compose, Condition, ForEach, HTTP, Scope.
+
+Flows are created in Stopped state by default. Use pa-enable-disable-flow to start them after creation.
+Connection references are needed when using connectors (Office 365, SharePoint, Teams, etc.).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        displayName: { type: 'string', description: 'Display name for the new flow.' },
+        definition: {
+          type: 'object',
+          description: 'Workflow definition with triggers and actions. Follows Azure Logic Apps schema. The $schema and contentVersion are added automatically.',
+        },
+        state: {
+          type: 'string',
+          enum: ['Started', 'Stopped'],
+          description: 'Initial state. Defaults to Stopped for safety.',
+        },
+        connectionReferences: {
+          type: 'object',
+          description: 'Connection references for connectors used in the flow. Keys are connection names, values contain connector id and connection id.',
+        },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['displayName', 'definition'],
+    },
+    handler: async (p: any) => {
+      try {
+        if (!p.displayName) return fail('displayName is required');
+        if (!p.definition) return fail('definition is required');
+        if (!p.definition.triggers && !p.definition['$schema']) {
+          return fail('definition must include a "triggers" object (and usually "actions")');
+        }
+        const envId = resolveEnvironmentId(p.environmentId);
+        const r = await client.createFlow(
+          envId,
+          p.displayName,
+          p.definition,
+          p.state || 'Stopped',
+          p.connectionReferences
+        );
+        return ok({
+          status: 'created',
+          flowId: r.name,
+          displayName: r.properties?.displayName,
+          state: r.properties?.state,
+          environmentId: envId,
+          createdTime: r.properties?.createdTime,
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Tool 4: Update Flow ----
+  {
+    name: 'pa-update-flow',
+    description: `Updates an existing Power Automate flow. Can modify the display name, workflow definition, state, and/or connection references. Only include the properties you want to change.
+
+To update the definition, provide the full triggers and actions objects (partial updates to definition are not supported — provide the complete new definition).
+
+To rename a flow: { "displayName": "New Name" }
+To update the logic: { "definition": { "triggers": {...}, "actions": {...} } }
+To change state: { "state": "Started" } or { "state": "Stopped" }`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'The unique identifier of the flow to update.' },
+        displayName: { type: 'string', description: 'New display name for the flow.' },
+        definition: {
+          type: 'object',
+          description: 'New workflow definition with triggers and actions. Must be complete — partial definition updates are not supported.',
+        },
+        state: {
+          type: 'string',
+          enum: ['Started', 'Stopped'],
+          description: 'New state for the flow.',
+        },
+        connectionReferences: {
+          type: 'object',
+          description: 'Updated connection references.',
+        },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId'],
+    },
+    handler: async (p: any) => {
+      try {
+        if (!p.flowId) return fail('flowId is required');
+        const envId = resolveEnvironmentId(p.environmentId);
+        const updates: any = {};
+        if (p.displayName) updates.displayName = p.displayName;
+        if (p.definition) updates.definition = p.definition;
+        if (p.state) updates.state = p.state;
+        if (p.connectionReferences) updates.connectionReferences = p.connectionReferences;
+        if (Object.keys(updates).length === 0) {
+          return fail('At least one property to update must be provided (displayName, definition, state, or connectionReferences)');
+        }
+        const r = await client.updateFlow(envId, p.flowId, updates);
+        return ok({
+          status: 'updated',
+          flowId: r.name || p.flowId,
+          displayName: r.properties?.displayName,
+          state: r.properties?.state,
+          lastModifiedTime: r.properties?.lastModifiedTime,
+          environmentId: envId,
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Tool 5: Enable/Disable Flow ----
   {
     name: 'pa-enable-disable-flow',
     description: 'Enables or disables a Power Automate flow. Use action "start" to enable or "stop" to disable the flow.',
@@ -134,6 +271,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 6: Delete Flow ----
   {
     name: 'pa-delete-flow',
     description: 'Permanently deletes a Power Automate flow. This action cannot be undone. Use with caution.',
@@ -154,6 +292,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 7: Trigger Flow ----
   {
     name: 'pa-trigger-flow',
     description: 'Manually triggers a Power Automate flow that has an HTTP request trigger. Optionally pass a JSON body to the trigger.',
@@ -175,6 +314,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 8: Get Run History ----
   {
     name: 'pa-get-run-history',
     description: 'Gets the run history for a specific Power Automate flow. Returns run ID, status (Succeeded/Failed/Running/Cancelled), start time, end time, and trigger information.',
@@ -201,6 +341,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 9: Get Run Details ----
   {
     name: 'pa-get-run-details',
     description: 'Gets detailed information about a specific flow run including action-level results, inputs, outputs, and timing.',
@@ -226,6 +367,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 10: Cancel Run ----
   {
     name: 'pa-cancel-run',
     description: 'Cancels a currently running Power Automate flow run.',
@@ -247,6 +389,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Tool 11: List Connections ----
   {
     name: 'pa-list-connections',
     description: 'Lists all Power Platform connections in an environment. Returns connection ID, display name, status, connector information, and creation time.',
@@ -299,44 +442,61 @@ registerTool('pa-get-flow-details', toolDefs[2].description, {
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[2].handler(p));
 
-registerTool('pa-enable-disable-flow', toolDefs[3].description, {
-  flowId: z.string().describe('Flow ID'),
-  action: z.enum(['start', 'stop']).describe('Enable or disable'),
+registerTool('pa-create-flow', toolDefs[3].description, {
+  displayName: z.string().describe('Display name for the new flow'),
+  definition: z.record(z.any()).describe('Workflow definition with triggers and actions'),
+  state: z.enum(['Started', 'Stopped']).optional().describe('Initial state (default: Stopped)'),
+  connectionReferences: z.record(z.any()).optional().describe('Connection references for connectors'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[3].handler(p));
 
-registerTool('pa-delete-flow', toolDefs[4].description, {
-  flowId: z.string().describe('Flow ID'),
+registerTool('pa-update-flow', toolDefs[4].description, {
+  flowId: z.string().describe('Flow ID to update'),
+  displayName: z.string().optional().describe('New display name'),
+  definition: z.record(z.any()).optional().describe('New workflow definition'),
+  state: z.enum(['Started', 'Stopped']).optional().describe('New state'),
+  connectionReferences: z.record(z.any()).optional().describe('Updated connection references'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[4].handler(p));
 
-registerTool('pa-trigger-flow', toolDefs[5].description, {
+registerTool('pa-enable-disable-flow', toolDefs[5].description, {
+  flowId: z.string().describe('Flow ID'),
+  action: z.enum(['start', 'stop']).describe('Enable or disable'),
+  environmentId: z.string().optional().describe('Environment ID'),
+}, async (p: any) => toolDefs[5].handler(p));
+
+registerTool('pa-delete-flow', toolDefs[6].description, {
+  flowId: z.string().describe('Flow ID'),
+  environmentId: z.string().optional().describe('Environment ID'),
+}, async (p: any) => toolDefs[6].handler(p));
+
+registerTool('pa-trigger-flow', toolDefs[7].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
   triggerBody: z.record(z.any()).optional().describe('Trigger body'),
-}, async (p: any) => toolDefs[5].handler(p));
+}, async (p: any) => toolDefs[7].handler(p));
 
-registerTool('pa-get-run-history', toolDefs[6].description, {
+registerTool('pa-get-run-history', toolDefs[8].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
   top: z.number().optional().describe('Max runs'),
-}, async (p: any) => toolDefs[6].handler(p));
-
-registerTool('pa-get-run-details', toolDefs[7].description, {
-  flowId: z.string().describe('Flow ID'),
-  runId: z.string().describe('Run ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[7].handler(p));
-
-registerTool('pa-cancel-run', toolDefs[8].description, {
-  flowId: z.string().describe('Flow ID'),
-  runId: z.string().describe('Run ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[8].handler(p));
 
-registerTool('pa-list-connections', toolDefs[9].description, {
+registerTool('pa-get-run-details', toolDefs[9].description, {
+  flowId: z.string().describe('Flow ID'),
+  runId: z.string().describe('Run ID'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[9].handler(p));
+
+registerTool('pa-cancel-run', toolDefs[10].description, {
+  flowId: z.string().describe('Flow ID'),
+  runId: z.string().describe('Run ID'),
+  environmentId: z.string().optional().describe('Environment ID'),
+}, async (p: any) => toolDefs[10].handler(p));
+
+registerTool('pa-list-connections', toolDefs[11].description, {
+  environmentId: z.string().optional().describe('Environment ID'),
+}, async (p: any) => toolDefs[11].handler(p));
 
 console.log(`[Init] MCP tools registered: ${toolDefs.length}`);
 
@@ -348,13 +508,13 @@ const app = express();
 // CORS middleware
 app.use((req: Request, res: Response, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, PATCH');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id, Accept');
   if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
   next();
 });
 
-const jsonParser = express.json();
+const jsonParser = express.json({ limit: '5mb' });
 
 // --- Health ---
 app.get('/health', (_req: Request, res: Response) => {
@@ -486,6 +646,12 @@ app.post('/tools', jsonParser, handleJsonRpc);
 // =============================================================================
 // Start
 // =============================================================================
+
+// Diagnostic logging
+console.log('[Init] Environment variable check:');
+console.log(`[Init]   POWER_PLATFORM_ENVIRONMENT_ID = ${process.env.POWER_PLATFORM_ENVIRONMENT_ID ? '"' + process.env.POWER_PLATFORM_ENVIRONMENT_ID + '"' : '(not set)'}`);
+console.log(`[Init]   AZURE_TENANT_ID = ${process.env.AZURE_TENANT_ID ? '(set)' : '(not set)'}`);
+
 try {
   const defaultEnv = resolveEnvironmentId();
   console.log(`[Init] Default environment: ${defaultEnv}`);
@@ -500,5 +666,6 @@ app.listen(PORT, () => {
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
   console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
+  console.log(`[Init] Tools:  ${toolDefs.length} (including create + update flows)`);
   console.log('');
 });

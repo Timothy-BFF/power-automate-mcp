@@ -1,6 +1,6 @@
 {
   "name": "power-automate-mcp",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "description": "MCP server for Microsoft Power Automate management via Simtheory.ai",
   "author": "GROW by Bolthouse Fresh (Architected by MCA)",
   "type": "module",
