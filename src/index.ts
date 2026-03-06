@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.3.0';
+const VERSION = '2.3.1';
 
 // =============================================================================
 // Core Services
@@ -119,40 +119,14 @@ const toolDefs: ToolDefinition[] = [
   // ---- Tool 3: Create Flow ----
   {
     name: 'pa-create-flow',
-    description: `Creates a new Power Automate cloud flow. Provide a display name and a workflow definition following the Azure Logic Apps schema. The definition must include "triggers" and "actions" objects. The schema envelope ($schema, contentVersion) is added automatically if not provided.
-
-Example definition for a daily scheduled flow that sends an email:
-{
-  "triggers": {
-    "Recurrence": {
-      "type": "Recurrence",
-      "recurrence": { "frequency": "Day", "interval": 1, "schedule": { "hours": ["8"], "minutes": ["0"] } }
-    }
-  },
-  "actions": {
-    "Send_an_email": {
-      "type": "OpenApiConnection",
-      "inputs": {
-        "host": { "connectionName": "shared_office365", "operationId": "SendEmailV2" },
-        "parameters": { "emailMessage/To": "user@company.com", "emailMessage/Subject": "Daily Report", "emailMessage/Body": "<p>Your daily report is ready.</p>" }
-      },
-      "runAfter": {}
-    }
-  }
-}
-
-Common trigger types: Recurrence (scheduled), Request (HTTP webhook), OpenApiConnection (when item created/modified).
-Common action types: OpenApiConnection (connectors), Compose, Condition, ForEach, HTTP, Scope.
-
-Flows are created in Stopped state by default. Use pa-enable-disable-flow to start them after creation.
-Connection references are needed when using connectors (Office 365, SharePoint, Teams, etc.).`,
+    description: 'Creates a new Power Automate cloud flow. Provide a display name and a workflow definition object containing triggers and actions. The definition follows the Azure Logic Apps workflow definition schema. Common trigger types: Recurrence, Request, OpenApiConnection. Common action types: Compose, HTTP, OpenApiConnection, Condition, ForEach, Scope. Flows are created in Stopped state by default for safety. Use pa-enable-disable-flow to start them after creation.',
     inputSchema: {
       type: 'object',
       properties: {
         displayName: { type: 'string', description: 'Display name for the new flow.' },
         definition: {
           type: 'object',
-          description: 'Workflow definition with triggers and actions. Follows Azure Logic Apps schema. The $schema and contentVersion are added automatically.',
+          description: 'Workflow definition with triggers and actions objects.',
         },
         state: {
           type: 'string',
@@ -161,7 +135,7 @@ Connection references are needed when using connectors (Office 365, SharePoint, 
         },
         connectionReferences: {
           type: 'object',
-          description: 'Connection references for connectors used in the flow. Keys are connection names, values contain connector id and connection id.',
+          description: 'Connection references for connectors used in the flow.',
         },
         environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
       },
@@ -172,7 +146,7 @@ Connection references are needed when using connectors (Office 365, SharePoint, 
         if (!p.displayName) return fail('displayName is required');
         if (!p.definition) return fail('definition is required');
         if (!p.definition.triggers && !p.definition['$schema']) {
-          return fail('definition must include a "triggers" object (and usually "actions")');
+          return fail('definition must include a triggers object');
         }
         const envId = resolveEnvironmentId(p.environmentId);
         const r = await client.createFlow(
@@ -196,13 +170,7 @@ Connection references are needed when using connectors (Office 365, SharePoint, 
   // ---- Tool 4: Update Flow ----
   {
     name: 'pa-update-flow',
-    description: `Updates an existing Power Automate flow. Can modify the display name, workflow definition, state, and/or connection references. Only include the properties you want to change.
-
-To update the definition, provide the full triggers and actions objects (partial updates to definition are not supported — provide the complete new definition).
-
-To rename a flow: { "displayName": "New Name" }
-To update the logic: { "definition": { "triggers": {...}, "actions": {...} } }
-To change state: { "state": "Started" } or { "state": "Stopped" }`,
+    description: 'Updates an existing Power Automate flow. Can modify the display name, workflow definition, state, and connection references. Provide only the properties you want to change. Definition updates must include the complete triggers and actions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -210,7 +178,7 @@ To change state: { "state": "Started" } or { "state": "Stopped" }`,
         displayName: { type: 'string', description: 'New display name for the flow.' },
         definition: {
           type: 'object',
-          description: 'New workflow definition with triggers and actions. Must be complete — partial definition updates are not supported.',
+          description: 'New workflow definition with triggers and actions.',
         },
         state: {
           type: 'string',
@@ -444,18 +412,18 @@ registerTool('pa-get-flow-details', toolDefs[2].description, {
 
 registerTool('pa-create-flow', toolDefs[3].description, {
   displayName: z.string().describe('Display name for the new flow'),
-  definition: z.record(z.any()).describe('Workflow definition with triggers and actions'),
-  state: z.enum(['Started', 'Stopped']).optional().describe('Initial state (default: Stopped)'),
-  connectionReferences: z.record(z.any()).optional().describe('Connection references for connectors'),
+  definition: z.record(z.string(), z.any()).describe('Workflow definition with triggers and actions'),
+  state: z.enum(['Started', 'Stopped']).optional().describe('Initial state, defaults to Stopped'),
+  connectionReferences: z.record(z.string(), z.any()).optional().describe('Connection references for connectors'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[3].handler(p));
 
 registerTool('pa-update-flow', toolDefs[4].description, {
   flowId: z.string().describe('Flow ID to update'),
   displayName: z.string().optional().describe('New display name'),
-  definition: z.record(z.any()).optional().describe('New workflow definition'),
+  definition: z.record(z.string(), z.any()).optional().describe('New workflow definition'),
   state: z.enum(['Started', 'Stopped']).optional().describe('New state'),
-  connectionReferences: z.record(z.any()).optional().describe('Updated connection references'),
+  connectionReferences: z.record(z.string(), z.any()).optional().describe('Updated connection references'),
   environmentId: z.string().optional().describe('Environment ID'),
 }, async (p: any) => toolDefs[4].handler(p));
 
@@ -473,7 +441,7 @@ registerTool('pa-delete-flow', toolDefs[6].description, {
 registerTool('pa-trigger-flow', toolDefs[7].description, {
   flowId: z.string().describe('Flow ID'),
   environmentId: z.string().optional().describe('Environment ID'),
-  triggerBody: z.record(z.any()).optional().describe('Trigger body'),
+  triggerBody: z.record(z.string(), z.any()).optional().describe('Trigger body'),
 }, async (p: any) => toolDefs[7].handler(p));
 
 registerTool('pa-get-run-history', toolDefs[8].description, {
