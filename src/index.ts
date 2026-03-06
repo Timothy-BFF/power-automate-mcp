@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.3.1';
+const VERSION = '2.3.2';
 
 // =============================================================================
 // Core Services
@@ -111,7 +111,8 @@ const toolDefs: ToolDefinition[] = [
           id: r.name, displayName: r.properties?.displayName, state: r.properties?.state,
           createdTime: r.properties?.createdTime, lastModifiedTime: r.properties?.lastModifiedTime,
           definition: r.properties?.definition, connectionReferences: r.properties?.connectionReferences,
-          triggers: r.properties?.definition?.triggers, actions: r.properties?.definition?.actions,
+          triggers: r.properties?.definition?.triggers ? Object.keys(r.properties.definition.triggers) : [],
+          actions: r.properties?.definition?.actions ? Object.keys(r.properties.definition.actions) : [],
         });
       } catch (e: any) { return fail(e.message); }
     },
@@ -124,20 +125,10 @@ const toolDefs: ToolDefinition[] = [
       type: 'object',
       properties: {
         displayName: { type: 'string', description: 'Display name for the new flow.' },
-        definition: {
-          type: 'object',
-          description: 'Workflow definition with triggers and actions objects.',
-        },
-        state: {
-          type: 'string',
-          enum: ['Started', 'Stopped'],
-          description: 'Initial state. Defaults to Stopped for safety.',
-        },
-        connectionReferences: {
-          type: 'object',
-          description: 'Connection references for connectors used in the flow.',
-        },
+        definition: { type: 'object', description: 'Workflow definition with triggers and actions objects.' },
         environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        state: { type: 'string', enum: ['Started', 'Stopped'], description: 'Initial state. Defaults to Stopped for safety.' },
+        connectionReferences: { type: 'object', description: 'Connection references for connectors used in the flow.' },
       },
       required: ['displayName', 'definition'],
     },
@@ -145,24 +136,11 @@ const toolDefs: ToolDefinition[] = [
       try {
         if (!p.displayName) return fail('displayName is required');
         if (!p.definition) return fail('definition is required');
-        if (!p.definition.triggers && !p.definition['$schema']) {
-          return fail('definition must include a triggers object');
-        }
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.createFlow(
-          envId,
-          p.displayName,
-          p.definition,
-          p.state || 'Stopped',
-          p.connectionReferences
-        );
+        const r = await client.createFlow(envId, p.displayName, p.definition, p.state || 'Stopped', p.connectionReferences);
         return ok({
-          status: 'created',
-          flowId: r.name,
-          displayName: r.properties?.displayName,
-          state: r.properties?.state,
-          environmentId: envId,
-          createdTime: r.properties?.createdTime,
+          status: 'created', flowId: r.name, displayName: r.properties?.displayName || p.displayName,
+          state: r.properties?.state || p.state || 'Stopped', _source: r._source || 'flow-api',
         });
       } catch (e: any) { return fail(e.message); }
     },
@@ -176,20 +154,10 @@ const toolDefs: ToolDefinition[] = [
       properties: {
         flowId: { type: 'string', description: 'The unique identifier of the flow to update.' },
         displayName: { type: 'string', description: 'New display name for the flow.' },
-        definition: {
-          type: 'object',
-          description: 'New workflow definition with triggers and actions.',
-        },
-        state: {
-          type: 'string',
-          enum: ['Started', 'Stopped'],
-          description: 'New state for the flow.',
-        },
-        connectionReferences: {
-          type: 'object',
-          description: 'Updated connection references.',
-        },
+        definition: { type: 'object', description: 'New workflow definition with triggers and actions.' },
         environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        state: { type: 'string', enum: ['Started', 'Stopped'], description: 'New state for the flow.' },
+        connectionReferences: { type: 'object', description: 'Updated connection references.' },
       },
       required: ['flowId'],
     },
@@ -202,18 +170,8 @@ const toolDefs: ToolDefinition[] = [
         if (p.definition) updates.definition = p.definition;
         if (p.state) updates.state = p.state;
         if (p.connectionReferences) updates.connectionReferences = p.connectionReferences;
-        if (Object.keys(updates).length === 0) {
-          return fail('At least one property to update must be provided (displayName, definition, state, or connectionReferences)');
-        }
         const r = await client.updateFlow(envId, p.flowId, updates);
-        return ok({
-          status: 'updated',
-          flowId: r.name || p.flowId,
-          displayName: r.properties?.displayName,
-          state: r.properties?.state,
-          lastModifiedTime: r.properties?.lastModifiedTime,
-          environmentId: envId,
-        });
+        return ok({ status: 'updated', flowId: p.flowId, updatedProperties: Object.keys(updates), _source: r._source || 'flow-api' });
       } catch (e: any) { return fail(e.message); }
     },
   },
@@ -232,10 +190,11 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId || !p.action) return fail('flowId and action are required');
+        if (!p.flowId) return fail('flowId is required');
+        if (!p.action || !['start', 'stop'].includes(p.action)) return fail('action must be "start" or "stop"');
         const envId = resolveEnvironmentId(p.environmentId);
         await client.enableDisableFlow(envId, p.flowId, p.action);
-        return ok({ status: 'success', flowId: p.flowId, action: p.action });
+        return ok({ status: p.action === 'start' ? 'enabled' : 'disabled', flowId: p.flowId, action: p.action });
       } catch (e: any) { return fail(e.message); }
     },
   },
@@ -324,13 +283,14 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId || !p.runId) return fail('flowId and runId are required');
+        if (!p.flowId) return fail('flowId is required');
+        if (!p.runId) return fail('runId is required');
         const envId = resolveEnvironmentId(p.environmentId);
         const r = await client.getRunDetails(envId, p.flowId, p.runId);
         return ok({
-          id: r.name, status: r.properties?.status,
+          id: r.name, flowId: p.flowId, status: r.properties?.status,
           startTime: r.properties?.startTime, endTime: r.properties?.endTime,
-          trigger: r.properties?.trigger, outputs: r.properties?.outputs, error: r.properties?.error,
+          trigger: r.properties?.trigger, actions: r.properties?.actions,
         });
       } catch (e: any) { return fail(e.message); }
     },
@@ -350,7 +310,8 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId || !p.runId) return fail('flowId and runId are required');
+        if (!p.flowId) return fail('flowId is required');
+        if (!p.runId) return fail('runId is required');
         const envId = resolveEnvironmentId(p.environmentId);
         await client.cancelRun(envId, p.flowId, p.runId);
         return ok({ status: 'cancelled', flowId: p.flowId, runId: p.runId });
@@ -373,7 +334,8 @@ const toolDefs: ToolDefinition[] = [
         const r = await client.listConnections(envId);
         const conns = (r.value || []).map((c: any) => ({
           id: c.name, displayName: c.properties?.displayName,
-          status: c.properties?.statuses, apiId: c.properties?.apiId,
+          status: c.properties?.statuses?.[0]?.status,
+          connectorName: c.properties?.apiId?.split('/').pop(),
           createdTime: c.properties?.createdTime,
         }));
         return ok({ count: conns.length, environmentId: envId, connections: conns });
@@ -382,109 +344,37 @@ const toolDefs: ToolDefinition[] = [
   },
 ];
 
-// Build handler lookup map for REST JSON-RPC
-const toolHandlers = new Map<string, (params: any) => Promise<ToolResult>>();
-for (const t of toolDefs) {
-  toolHandlers.set(t.name, t.handler);
-}
+// =============================================================================
+// MCP Server (SSE transport)
+// =============================================================================
+const toolHandlers = new Map<string, (args: any) => Promise<ToolResult>>();
+toolDefs.forEach(t => toolHandlers.set(t.name, t.handler));
 
-// =============================================================================
-// MCP Server (SSE transport for discovery + streaming)
-// =============================================================================
 const mcpServer = new McpServer({ name: 'power-automate-mcp', version: VERSION });
-
-// Relaxed-type binding: bypasses strict TS overload resolution for MCP SDK v1.12+
-const registerTool: any = mcpServer.tool.bind(mcpServer);
-
-registerTool('pa-list-environments', toolDefs[0].description, {},
-  async () => toolDefs[0].handler({}));
-
-registerTool('pa-list-flows', toolDefs[1].description, {
-  environmentId: z.string().optional().describe('Power Platform environment ID'),
-  filter: z.enum(['personal', 'shared', 'all']).optional().describe('Filter by ownership'),
-  top: z.number().optional().describe('Max flows to return'),
-}, async (p: any) => toolDefs[1].handler(p));
-
-registerTool('pa-get-flow-details', toolDefs[2].description, {
-  flowId: z.string().describe('Flow ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[2].handler(p));
-
-registerTool('pa-create-flow', toolDefs[3].description, {
-  displayName: z.string().describe('Display name for the new flow'),
-  definition: z.record(z.string(), z.any()).describe('Workflow definition with triggers and actions'),
-  state: z.enum(['Started', 'Stopped']).optional().describe('Initial state, defaults to Stopped'),
-  connectionReferences: z.record(z.string(), z.any()).optional().describe('Connection references for connectors'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[3].handler(p));
-
-registerTool('pa-update-flow', toolDefs[4].description, {
-  flowId: z.string().describe('Flow ID to update'),
-  displayName: z.string().optional().describe('New display name'),
-  definition: z.record(z.string(), z.any()).optional().describe('New workflow definition'),
-  state: z.enum(['Started', 'Stopped']).optional().describe('New state'),
-  connectionReferences: z.record(z.string(), z.any()).optional().describe('Updated connection references'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[4].handler(p));
-
-registerTool('pa-enable-disable-flow', toolDefs[5].description, {
-  flowId: z.string().describe('Flow ID'),
-  action: z.enum(['start', 'stop']).describe('Enable or disable'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[5].handler(p));
-
-registerTool('pa-delete-flow', toolDefs[6].description, {
-  flowId: z.string().describe('Flow ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[6].handler(p));
-
-registerTool('pa-trigger-flow', toolDefs[7].description, {
-  flowId: z.string().describe('Flow ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-  triggerBody: z.record(z.string(), z.any()).optional().describe('Trigger body'),
-}, async (p: any) => toolDefs[7].handler(p));
-
-registerTool('pa-get-run-history', toolDefs[8].description, {
-  flowId: z.string().describe('Flow ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-  top: z.number().optional().describe('Max runs'),
-}, async (p: any) => toolDefs[8].handler(p));
-
-registerTool('pa-get-run-details', toolDefs[9].description, {
-  flowId: z.string().describe('Flow ID'),
-  runId: z.string().describe('Run ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[9].handler(p));
-
-registerTool('pa-cancel-run', toolDefs[10].description, {
-  flowId: z.string().describe('Flow ID'),
-  runId: z.string().describe('Run ID'),
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[10].handler(p));
-
-registerTool('pa-list-connections', toolDefs[11].description, {
-  environmentId: z.string().optional().describe('Environment ID'),
-}, async (p: any) => toolDefs[11].handler(p));
-
-console.log(`[Init] MCP tools registered: ${toolDefs.length}`);
+toolDefs.forEach(t => {
+  mcpServer.tool(t.name, t.description, t.inputSchema as any, async (p: any) => t.handler(p.arguments || p));
+});
 
 // =============================================================================
-// Express Server
+// Express App + Middleware
 // =============================================================================
 const app = express();
+const jsonParser = express.json();
 
-// CORS middleware
+// Auth middleware — permissive mode for Simtheory.ai compatibility
 app.use((req: Request, res: Response, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, PATCH');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id, Accept');
-  if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
+  const authToken = process.env.SIMTHEORY_AUTH_TOKEN;
+  if (!authToken) { next(); return; }
+  const incoming = req.headers['authorization']?.replace('Bearer ', '');
+  if (incoming && incoming !== authToken) {
+    // Only reject if a token is provided AND it's wrong
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
   next();
 });
 
-const jsonParser = express.json({ limit: '5mb' });
-
-// --- Health ---
+// --- Health + Discovery Endpoints ---
 app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'healthy', server: 'power-automate-mcp', version: VERSION,
@@ -633,7 +523,7 @@ app.listen(PORT, () => {
   console.log(`[Init] SSE:    http://localhost:${PORT}/sse`);
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
-  console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
-  console.log(`[Init] Tools:  ${toolDefs.length} (including create + update flows)`);
+  console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin + Dataverse (4 scopes)`);
+  console.log(`[Init] Tools:  ${toolDefs.length} (including create + update flows via Dataverse)`);
   console.log('');
 });
