@@ -4,17 +4,6 @@ import { AzureTokenManager } from '../auth/azure-token-manager.js';
 // =========================================================================
 // API Configuration Constants
 // =========================================================================
-// Service principal (New-PowerAppManagementApp) authentication paths:
-// - BAP admin scope for environment listing
-// - Flow scope with /scopes/admin/ for flow management (read, enable/disable, delete)
-// - Dataverse scope (dynamic per environment) for flow CREATION and UPDATE
-// - PowerApps scope for connections listing
-//
-// CRITICAL: The Flow API (api.flow.microsoft.com) does NOT support creating
-// or updating flows with service principal (client_credentials) auth.
-// The /scopes/admin/ path only supports GET + lifecycle ops.
-// The non-admin path requires delegated (interactive user) auth.
-// Solution: Use the Dataverse Web API for flow write operations.
 const BAP_SCOPE = 'https://api.bap.microsoft.com/.default';
 const FLOW_SCOPE = 'https://service.flow.microsoft.com/.default';
 const POWERAPPS_SCOPE = 'https://service.powerapps.com/.default';
@@ -29,13 +18,25 @@ const POWERAPPS_API_VER = '2016-11-01';
 
 const WORKFLOW_SCHEMA = 'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#';
 
-// OData headers required for Dataverse Web API requests
+// Propagation delay settings (Dataverse write → Flow Management API visibility)
+// IT team confirmed: 5-30 seconds is typical. We use conservative defaults.
+const PROPAGATION_DELAY_MS = 5000;        // Initial wait after creation
+const PROPAGATION_RETRY_DELAY_MS = 5000;  // Delay between retries
+const PROPAGATION_MAX_RETRIES = 3;        // Max retries on 404 in getFlowDetails
+
 const DATAVERSE_HEADERS: Record<string, string> = {
   'Content-Type': 'application/json; charset=utf-8',
   'OData-MaxVersion': '4.0',
   'OData-Version': '4.0',
   'Prefer': 'return=representation',
 };
+
+// =========================================================================
+// Utility
+// =========================================================================
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export class PowerPlatformClient {
   private tm: AzureTokenManager;
@@ -69,35 +70,20 @@ export class PowerPlatformClient {
     return this.request(url, method, POWERAPPS_SCOPE, data);
   }
 
-  /**
-   * Dataverse Web API request for a specific environment.
-   * Discovers the Dataverse instance URL from BAP environment metadata,
-   * acquires a dynamically-scoped token ({instanceUrl}/.default),
-   * and makes the request with OData headers.
-   *
-   * This is the ONLY supported path for flow creation/update with service principals.
-   */
   private async dataverseRequest(envId: string, path: string, method: string = 'GET', data?: any): Promise<any> {
     const instanceUrl = await this.discoverDataverseUrl(envId);
     if (!instanceUrl) {
       throw new Error(
         `Environment '${envId}' does not have a linked Dataverse instance. ` +
-        `Flow creation and update via service principal (application-only auth) requires Dataverse. ` +
-        `Please use an environment with Dataverse enabled, or create the flow manually in Power Automate.`
+        `Flow creation/update via service principal requires Dataverse.`
       );
     }
-
     const scope = `${instanceUrl}/.default`;
     const url = `${instanceUrl}${path}`;
     console.log(`[Dataverse] ${method} ${url}`);
-
     return this.request(url, method, scope, data, DATAVERSE_HEADERS);
   }
 
-  /**
-   * Core HTTP request handler with automatic 401 retry (token refresh).
-   * All API transport methods (BAP, Flow, Dataverse, PowerApps) route through here.
-   */
   private async request(
     url: string,
     method: string,
@@ -114,7 +100,6 @@ export class PowerPlatformClient {
 
     try {
       const resp = await axios({ method, url, data, headers });
-      // Handle 204 No Content (common for Dataverse PATCH responses)
       if (resp.status === 204) {
         const entityId = resp.headers?.['odata-entityid'] || '';
         const guidMatch = entityId.match(/\(([0-9a-f-]+)\)/i);
@@ -139,7 +124,6 @@ export class PowerPlatformClient {
         }
         return retry.data;
       }
-      // Enhanced error logging for debugging
       if (error.response) {
         console.error(`[API] Error ${error.response.status} on ${method} ${url}`);
         console.error(`[API] Response body:`, JSON.stringify(error.response.data, null, 2));
@@ -164,17 +148,10 @@ export class PowerPlatformClient {
   // Dataverse URL Discovery (cached per environment)
   // =========================================================================
 
-  /**
-   * Discovers the Dataverse instance URL for a Power Platform environment.
-   * Retrieves linkedEnvironmentMetadata.instanceUrl from the BAP Admin API.
-   * Results are cached per environment ID to avoid repeated API calls.
-   */
   private async discoverDataverseUrl(envId: string): Promise<string | null> {
     if (this.dataverseUrlCache.has(envId)) {
       const cached = this.dataverseUrlCache.get(envId)!;
-      console.log(
-        `[Dataverse] URL cache ${cached ? 'hit' : 'miss (no Dataverse)'}: ${envId} -> ${cached || 'N/A'}`
-      );
+      console.log(`[Dataverse] URL cache ${cached ? 'hit' : 'miss (no Dataverse)'}: ${envId} -> ${cached || 'N/A'}`);
       return cached;
     }
 
@@ -183,11 +160,8 @@ export class PowerPlatformClient {
       const envData = await this.bapRequest(
         `/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/${envId}`
       );
-
       const instanceUrl = envData?.properties?.linkedEnvironmentMetadata?.instanceUrl;
-
       if (instanceUrl) {
-        // Normalize: remove trailing slash
         const normalized = instanceUrl.replace(/\/+$/, '');
         console.log(`[Dataverse] Discovered instance URL: ${normalized}`);
         this.dataverseUrlCache.set(envId, normalized);
@@ -212,20 +186,18 @@ export class PowerPlatformClient {
    * Resolves the Flow Management API ID from a Dataverse workflowid.
    *
    * ARCHITECTURE BOUNDARY (confirmed by IT team):
-   * Power Automate flows exist in two identity planes simultaneously:
-   *   - Dataverse: workflowid (primary key of workflow entity)
-   *   - Flow Management API: name/flowId (a separate GUID)
-   *
-   * The bridge field is 'workflowidunique' in the Dataverse workflow entity.
-   * After creating a flow via Dataverse POST, we must query this field
-   * to get the ID that the Flow Management API recognizes.
+   *   Dataverse workflowid ≠ Flow Management API flowId
+   *   Bridge field: workflowidunique (in Dataverse workflow entity)
    *
    * Fallback chain:
-   *   1. workflowidunique (primary bridge field)
-   *   2. resourceid (some environments expose this)
-   *   3. Original workflowid (last resort — may cause 404 on Flow API)
+   *   1. workflowidunique (primary bridge)
+   *   2. resourceid (some environments)
+   *   3. Original workflowid (last resort — may cause 404)
    */
-  private async resolveFlowApiId(envId: string, dataverseWorkflowId: string): Promise<{ flowApiId: string; dataverseId: string }> {
+  private async resolveFlowApiId(
+    envId: string,
+    dataverseWorkflowId: string
+  ): Promise<{ flowApiId: string; dataverseId: string; resolvedVia: string }> {
     try {
       console.log(`[IdResolver] Resolving Flow API ID for Dataverse workflowid: ${dataverseWorkflowId}`);
 
@@ -237,30 +209,24 @@ export class PowerPlatformClient {
 
       const workflowidunique = result?.workflowidunique;
       const resourceid = result?.resourceid;
-      const name = result?.name;
 
-      console.log(`[IdResolver] Dataverse response:`);
-      console.log(`[IdResolver]   workflowid:       ${dataverseWorkflowId}`);
-      console.log(`[IdResolver]   workflowidunique:  ${workflowidunique || '(not found)'}`);
-      console.log(`[IdResolver]   resourceid:        ${resourceid || '(not found)'}`);
-      console.log(`[IdResolver]   name:              ${name || '(not found)'}`);
-
-      // Use workflowidunique as the Flow API ID (primary bridge)
-      // Fall back to resourceid, then to the original workflowid
-      const flowApiId = workflowidunique || resourceid || dataverseWorkflowId;
+      console.log(`[IdResolver] workflowidunique: ${workflowidunique || '(not found)'}`);
+      console.log(`[IdResolver] resourceid:       ${resourceid || '(not found)'}`);
 
       if (workflowidunique) {
-        console.log(`[IdResolver] Resolved via workflowidunique: ${flowApiId}`);
-      } else if (resourceid) {
-        console.log(`[IdResolver] Resolved via resourceid: ${flowApiId}`);
-      } else {
-        console.warn(`[IdResolver] No bridge field found — using Dataverse workflowid as fallback: ${flowApiId}`);
+        console.log(`[IdResolver] Resolved via workflowidunique: ${workflowidunique}`);
+        return { flowApiId: workflowidunique, dataverseId: dataverseWorkflowId, resolvedVia: 'workflowidunique' };
+      }
+      if (resourceid) {
+        console.log(`[IdResolver] Resolved via resourceid: ${resourceid}`);
+        return { flowApiId: resourceid, dataverseId: dataverseWorkflowId, resolvedVia: 'resourceid' };
       }
 
-      return { flowApiId, dataverseId: dataverseWorkflowId };
+      console.warn(`[IdResolver] No bridge field found — using Dataverse workflowid as fallback`);
+      return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId, resolvedVia: 'dataverse-workflowid' };
     } catch (error: any) {
-      console.warn(`[IdResolver] Resolution failed: ${error.message}. Using Dataverse workflowid as fallback.`);
-      return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId };
+      console.warn(`[IdResolver] Resolution failed: ${error.message}. Using fallback.`);
+      return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId, resolvedVia: 'dataverse-workflowid' };
     }
   }
 
@@ -288,58 +254,72 @@ export class PowerPlatformClient {
     return this.flowAdminRequest(path);
   }
 
+  /**
+   * Gets detailed information about a specific flow.
+   *
+   * PROPAGATION AWARENESS (per IT team guidance):
+   * After Dataverse creation, the Flow Management API may not see the flow
+   * for 5-30 seconds. This method retries on 404 with linear backoff
+   * to handle the propagation window transparently.
+   */
   async getFlowDetails(envId: string, flowId: string): Promise<any> {
-    return this.flowAdminRequest(
-      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`
-    );
+    const url = `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`;
+
+    for (let attempt = 0; attempt <= PROPAGATION_MAX_RETRIES; attempt++) {
+      try {
+        const result = await this.flowAdminRequest(url);
+        if (attempt > 0) {
+          console.log(`[Flow] Flow ${flowId} found after ${attempt} retries (propagation delay)`);
+        }
+        return result;
+      } catch (error: any) {
+        const is404 = error.message?.includes('404') || error.message?.includes('Could not find flow');
+
+        if (is404 && attempt < PROPAGATION_MAX_RETRIES) {
+          const delayMs = PROPAGATION_RETRY_DELAY_MS * (attempt + 1);
+          console.log(`[Flow] 404 on attempt ${attempt + 1}/${PROPAGATION_MAX_RETRIES + 1} for flow ${flowId}. ` +
+            `Waiting ${delayMs}ms for propagation...`);
+          await sleep(delayMs);
+          continue;
+        }
+
+        // Not a 404, or exhausted retries — throw
+        throw error;
+      }
+    }
+
+    // Should never reach here, but just in case
+    throw new Error(`Flow ${flowId} not found after ${PROPAGATION_MAX_RETRIES} retries (propagation timeout)`);
   }
 
   // =========================================================================
   // Flows — WRITE Operations (Dataverse Web API)
   // =========================================================================
   //
-  // CRITICAL ARCHITECTURE NOTE:
-  // The Power Automate Flow API (api.flow.microsoft.com) does NOT support
-  // creating or updating flows with service principal (client_credentials)
-  // authentication. This is a confirmed API design limitation:
-  //   - /scopes/admin/ paths: Only support GET and lifecycle ops (start/stop/delete)
-  //   - Non-admin paths: Require delegated (interactive user) auth
+  // ARCHITECTURE NOTES:
+  // - Flow API does NOT support create/update with service principal auth
+  // - Dataverse Web API is the supported path for application-only auth
+  // - Identity mapping: workflowidunique bridges Dataverse ↔ Flow API
+  // - Propagation delay: 5-30s between Dataverse write and Flow API visibility
   //
-  // The Dataverse Web API (POST/PATCH to /api/data/v9.2/workflows) fully
-  // supports application-only auth and is the Microsoft-recommended path
-  // for programmatic flow management with service principals.
-  //
-  // IDENTITY MAPPING (confirmed by IT team investigation):
-  //   Dataverse workflowid ≠ Flow Management API flowId
-  //   Bridge field: workflowidunique (in Dataverse workflow entity)
-  //   After POST creation, a follow-up GET retrieves workflowidunique
-  //   which is the ID recognized by the Flow Management API.
-  //
-  // CLIENTDATA FORMAT (confirmed via Dataverse error diagnostics):
+  // CLIENTDATA FORMAT:
   //   {
-  //     "properties": {
-  //       "definition": { <Logic Apps schema definition> },
-  //       "connectionReferences": {}
-  //     },
-  //     "schemaVersion": "1.0.0.0"    <-- REQUIRED at root level
+  //     "properties": { "definition": {...}, "connectionReferences": {} },
+  //     "schemaVersion": "1.0.0.0"
   //   }
-  //
-  //   - displayName must NOT appear inside clientdata — only in entity 'name' field
-  //   - schemaVersion is REQUIRED at the clientdata root (not inside properties)
+  //   - displayName in entity 'name' field ONLY
+  //   - schemaVersion REQUIRED at clientdata root
   // =========================================================================
 
   /**
    * Creates a new Power Automate cloud flow via the Dataverse Web API.
    *
-   * Maps to the Dataverse 'workflow' entity with:
-   *   - category   = 5  (Modern Flow / Cloud Flow)
-   *   - type       = 1  (Definition)
-   *   - clientdata = JSON string with {properties: {definition, connectionReferences}, schemaVersion}
-   *   - statecode  = 0 (Draft/Stopped) or 1 (Activated/Started)
-   *   - statuscode = 1 (Draft) or 2 (Activated)
-   *
-   * After creation, resolves the Flow Management API ID via workflowidunique
-   * so downstream tools (get-flow-details, enable/disable, etc.) work seamlessly.
+   * Post-creation workflow (per IT team recommendation):
+   *   1. POST workflow entity → get Dataverse workflowid
+   *   2. GET workflowidunique → resolve Flow API ID
+   *   3. Wait for propagation delay (5s)
+   *   4. Verify flow visible via Flow Management API
+   *   5. Return with full ID mapping + propagation status
    */
   async createFlow(
     envId: string,
@@ -348,7 +328,7 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
-    // Ensure the definition has the proper Logic Apps schema envelope
+    // Ensure proper Logic Apps schema envelope
     const fullDefinition = definition['$schema']
       ? definition
       : {
@@ -359,11 +339,7 @@ export class PowerPlatformClient {
           ...(definition.parameters ? { parameters: definition.parameters } : {}),
         };
 
-    // Build the clientdata JSON envelope
-    // CRITICAL FORMAT REQUIREMENTS (confirmed via Dataverse error diagnostics):
-    //   1. displayName must NOT be inside properties (causes parse failure)
-    //   2. schemaVersion MUST be at the root level ("Required property 'schemaVersion' not found")
-    //   3. Only definition + connectionReferences go inside properties
+    // Build clientdata (schemaVersion at root, displayName NOT inside)
     const clientData = {
       properties: {
         definition: fullDefinition,
@@ -372,11 +348,7 @@ export class PowerPlatformClient {
       schemaVersion: '1.0.0.0',
     };
 
-    // Map Power Automate state to Dataverse statecode/statuscode
-    // Stopped -> statecode: 0 (Draft), statuscode: 1
-    // Started -> statecode: 1 (Activated), statuscode: 2
     const isStarted = state === 'Started';
-
     const clientDataStr = JSON.stringify(clientData);
 
     const workflowEntity = {
@@ -395,6 +367,7 @@ export class PowerPlatformClient {
     console.log(`[Dataverse] Definition actions: ${Object.keys(fullDefinition.actions || {}).join(', ') || '(none)'}`);
     console.log(`[Dataverse] clientdata length: ${clientDataStr.length} chars`);
 
+    // ---- Step 1: Create the workflow in Dataverse ----
     const result = await this.dataverseRequest(
       envId,
       '/api/data/v9.2/workflows',
@@ -402,25 +375,50 @@ export class PowerPlatformClient {
       workflowEntity
     );
 
-    // Extract the Dataverse workflowid from the creation response
     const dataverseWorkflowId = result?.workflowid || 'unknown';
     console.log(`[Dataverse] Flow created. Dataverse workflowid: ${dataverseWorkflowId}`);
 
-    // Resolve the Flow Management API ID via workflowidunique
-    // This bridges the Dataverse ↔ Flow API identity boundary
+    // ---- Step 2: Resolve Flow Management API ID ----
     let flowApiId = dataverseWorkflowId;
-    let idSource = 'dataverse-workflowid';
+    let resolvedVia = 'dataverse-workflowid';
 
     if (dataverseWorkflowId !== 'unknown') {
       try {
         const resolved = await this.resolveFlowApiId(envId, dataverseWorkflowId);
         flowApiId = resolved.flowApiId;
-        idSource = flowApiId !== dataverseWorkflowId ? 'workflowidunique' : 'dataverse-workflowid';
-        console.log(`[Dataverse] Flow API ID resolved: ${flowApiId} (via ${idSource})`);
+        resolvedVia = resolved.resolvedVia;
+        console.log(`[Dataverse] Flow API ID resolved: ${flowApiId} (via ${resolvedVia})`);
       } catch (resolveErr: any) {
         console.warn(`[Dataverse] ID resolution failed: ${resolveErr.message}. Using Dataverse workflowid.`);
       }
     }
+
+    // ---- Step 3: Propagation delay + verification ----
+    let propagationVerified = false;
+    let propagationAttempts = 0;
+    const propagationStart = Date.now();
+
+    console.log(`[Propagation] Waiting ${PROPAGATION_DELAY_MS}ms for Flow Management API visibility...`);
+    await sleep(PROPAGATION_DELAY_MS);
+
+    // One verification attempt via Flow Management API
+    try {
+      propagationAttempts = 1;
+      const verifyUrl = `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowApiId}?api-version=${FLOW_API_VER}`;
+      await this.flowAdminRequest(verifyUrl);
+      propagationVerified = true;
+      console.log(`[Propagation] Flow ${flowApiId} verified in Flow Management API after ${Date.now() - propagationStart}ms`);
+    } catch (verifyErr: any) {
+      const is404 = verifyErr.message?.includes('404') || verifyErr.message?.includes('Could not find flow');
+      if (is404) {
+        console.log(`[Propagation] Flow ${flowApiId} not yet visible (404). Propagation still in progress. ` +
+          `Downstream get-flow-details will retry with backoff.`);
+      } else {
+        console.warn(`[Propagation] Verification failed (non-404): ${verifyErr.message}`);
+      }
+    }
+
+    const propagationMs = Date.now() - propagationStart;
 
     return {
       name: flowApiId,
@@ -436,20 +434,19 @@ export class PowerPlatformClient {
       _idMapping: {
         flowApiId,
         dataverseWorkflowId,
-        resolvedVia: idSource,
+        resolvedVia,
+      },
+      _propagation: {
+        verified: propagationVerified,
+        delayMs: propagationMs,
+        attempts: propagationAttempts,
+        ...(propagationVerified ? { verifiedAt: new Date().toISOString() } : {}),
       },
     };
   }
 
   /**
    * Updates an existing Power Automate cloud flow via the Dataverse Web API.
-   * Supports partial updates to displayName, definition, state, and connectionReferences.
-   *
-   * Note: For state changes only (start/stop), prefer enableDisableFlow() which
-   * uses the Flow Admin API and doesn't require Dataverse.
-   *
-   * IMPORTANT: displayName goes in entity 'name' field ONLY, NOT in clientdata.
-   * IMPORTANT: schemaVersion is REQUIRED at the root of clientdata.
    */
   async updateFlow(
     envId: string,
@@ -463,9 +460,6 @@ export class PowerPlatformClient {
   ): Promise<any> {
     const patch: any = {};
 
-    // Build updated clientdata if any content properties changed
-    // CRITICAL: displayName must NOT be in clientdata — only definition + connectionReferences
-    // CRITICAL: schemaVersion MUST be at the root of clientdata
     if (updates.definition || updates.connectionReferences) {
       const fullDefinition = updates.definition
         ? (updates.definition['$schema']
@@ -485,16 +479,13 @@ export class PowerPlatformClient {
         clientDataObj.properties.connectionReferences = updates.connectionReferences;
       }
 
-      // Only set clientdata if there's actual content to update
       if (Object.keys(clientDataObj.properties).length > 0) {
         patch.clientdata = JSON.stringify(clientDataObj);
         console.log(`[Dataverse] clientdata for update (${patch.clientdata.length} chars)`);
       }
     }
 
-    if (updates.displayName) {
-      patch.name = updates.displayName;
-    }
+    if (updates.displayName) patch.name = updates.displayName;
 
     if (updates.state) {
       const isStarted = updates.state === 'Started';
@@ -505,7 +496,6 @@ export class PowerPlatformClient {
     console.log(`[Dataverse] Updating flow ${flowId} in env ${envId}`);
     console.log(`[Dataverse] Update fields: ${Object.keys(patch).join(', ')}`);
 
-    // Extract bare GUID from flow ID (defensive — handle any format)
     const workflowGuid = flowId.includes('/') ? (flowId.split('/').pop() || flowId) : flowId;
 
     const result = await this.dataverseRequest(
@@ -528,7 +518,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Management — LIFECYCLE (Flow Admin API — /scopes/admin/ path)
+  // Flow Management — LIFECYCLE (Flow Admin API)
   // =========================================================================
 
   async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop'): Promise<any> {
@@ -554,7 +544,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Runs (Flow Admin API — /scopes/admin/ path)
+  // Flow Runs (Flow Admin API)
   // =========================================================================
 
   async getRunHistory(envId: string, flowId: string, top?: number): Promise<any> {
