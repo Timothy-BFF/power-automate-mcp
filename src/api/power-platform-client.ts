@@ -321,6 +321,11 @@ export class PowerPlatformClient {
    *   4. Verify flow visible via Flow Management API
    *   5. Return with full ID mapping + propagation status
    */
+    /**
+   * Creates a new Power Automate cloud flow via the Flow Management API.
+   * This creates the flow directly in the Flow engine (not just Dataverse),
+   * eliminating the propagation gap that caused FlowNotFound 404 errors.
+   */
   async createFlow(
     envId: string,
     displayName: string,
@@ -339,114 +344,51 @@ export class PowerPlatformClient {
           ...(definition.parameters ? { parameters: definition.parameters } : {}),
         };
 
-    // Build clientdata (schemaVersion at root, displayName NOT inside)
-    const clientData = {
-      properties: {
-        definition: fullDefinition,
-        connectionReferences: connectionReferences || {},
-      },
-      schemaVersion: '1.0.0.0',
-    };
-
-    const isStarted = state === 'Started';
-    const clientDataStr = JSON.stringify(clientData);
-
-    const workflowEntity = {
-      name: displayName,
-      type: 1,
-      category: 5,
-      statecode: isStarted ? 1 : 0,
-      statuscode: isStarted ? 2 : 1,
-      primaryentity: 'none',
-      clientdata: clientDataStr,
-    };
-
-    console.log(`[Dataverse] Creating flow: "${displayName}" in env ${envId} (state: ${state})`);
-    console.log(`[Dataverse] Workflow entity: category=5, type=1, statecode=${workflowEntity.statecode}`);
-    console.log(`[Dataverse] Definition triggers: ${Object.keys(fullDefinition.triggers || {}).join(', ') || '(none)'}`);
-    console.log(`[Dataverse] Definition actions: ${Object.keys(fullDefinition.actions || {}).join(', ') || '(none)'}`);
-    console.log(`[Dataverse] clientdata length: ${clientDataStr.length} chars`);
-
-    // ---- Step 1: Create the workflow in Dataverse ----
-    const result = await this.dataverseRequest(
-      envId,
-      '/api/data/v9.2/workflows',
-      'POST',
-      workflowEntity
-    );
-
-    const dataverseWorkflowId = result?.workflowid || 'unknown';
-    console.log(`[Dataverse] Flow created. Dataverse workflowid: ${dataverseWorkflowId}`);
-
-    // ---- Step 2: Resolve Flow Management API ID ----
-    let flowApiId = dataverseWorkflowId;
-    let resolvedVia = 'dataverse-workflowid';
-
-    if (dataverseWorkflowId !== 'unknown') {
-      try {
-        const resolved = await this.resolveFlowApiId(envId, dataverseWorkflowId);
-        flowApiId = resolved.flowApiId;
-        resolvedVia = resolved.resolvedVia;
-        console.log(`[Dataverse] Flow API ID resolved: ${flowApiId} (via ${resolvedVia})`);
-      } catch (resolveErr: any) {
-        console.warn(`[Dataverse] ID resolution failed: ${resolveErr.message}. Using Dataverse workflowid.`);
-      }
-    }
-
-    // ---- Step 3: Propagation delay + verification ----
-    let propagationVerified = false;
-    let propagationAttempts = 0;
-    const propagationStart = Date.now();
-
-    console.log(`[Propagation] Waiting ${PROPAGATION_DELAY_MS}ms for Flow Management API visibility...`);
-    await sleep(PROPAGATION_DELAY_MS);
-
-    // One verification attempt via Flow Management API
-    try {
-      propagationAttempts = 1;
-      const verifyUrl = `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowApiId}?api-version=${FLOW_API_VER}`;
-      await this.flowAdminRequest(verifyUrl);
-      propagationVerified = true;
-      console.log(`[Propagation] Flow ${flowApiId} verified in Flow Management API after ${Date.now() - propagationStart}ms`);
-    } catch (verifyErr: any) {
-      const is404 = verifyErr.message?.includes('404') || verifyErr.message?.includes('Could not find flow');
-      if (is404) {
-        console.log(`[Propagation] Flow ${flowApiId} not yet visible (404). Propagation still in progress. ` +
-          `Downstream get-flow-details will retry with backoff.`);
-      } else {
-        console.warn(`[Propagation] Verification failed (non-404): ${verifyErr.message}`);
-      }
-    }
-
-    const propagationMs = Date.now() - propagationStart;
-
-    return {
-      name: flowApiId,
-      id: `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowApiId}`,
-      type: 'Microsoft.ProcessSimple/environments/flows',
+    // Build Flow Management API request body (properties envelope)
+    const body: any = {
       properties: {
         displayName,
-        state: isStarted ? 'Started' : 'Stopped',
         definition: fullDefinition,
-        connectionReferences: connectionReferences || {},
-      },
-      _source: 'dataverse',
-      _idMapping: {
-        flowApiId,
-        dataverseWorkflowId,
-        resolvedVia,
-      },
-      _propagation: {
-        verified: propagationVerified,
-        delayMs: propagationMs,
-        attempts: propagationAttempts,
-        ...(propagationVerified ? { verifiedAt: new Date().toISOString() } : {}),
+        state: state === 'Started' ? 'Started' : 'Stopped',
       },
     };
-  }
 
-  /**
-   * Updates an existing Power Automate cloud flow via the Dataverse Web API.
+    if (connectionReferences && Object.keys(connectionReferences).length > 0) {
+      body.properties.connectionReferences = connectionReferences;
+    }
+
+    console.log(`[Flow] Creating flow '${displayName}' in env ${envId} via Flow Management API`);
+    console.log(`[Flow] State: ${body.properties.state}, Definition: ${JSON.stringify(fullDefinition).length} chars`);
+
+    // POST to Flow Management API — creates both Dataverse record AND Flow engine registration
+    const result = await this.flowAdminRequest(
+      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
+      'POST',
+      body
+    );
+
+    const flowId = result?.name || 'unknown';
+    const flowDisplayName = result?.properties?.displayName || displayName;
+    const flowState = result?.properties?.state || state;
+
+    console.log(`[Flow] ✅ Flow created: ${flowId} (${flowDisplayName})`);
+
+    return {
+      status: 'created',
+      flowId,
+      name: flowId,
+      displayName: flowDisplayName,
+      state: flowState,
+      definition: fullDefinition,
+      connectionReferences: connectionReferences || {},
+      _source: 'flow-management-api',
+      _note: 'Created via Flow Management API — fully registered with Flow engine',
+    };
+  }
+    /**
+   * Updates an existing Power Automate cloud flow via the Flow Management API.
+   * Uses PATCH on the Flow Admin endpoint instead of Dataverse to ensure
+   * changes are immediately reflected in the Flow engine.
    */
   async updateFlow(
     envId: string,
@@ -458,61 +400,55 @@ export class PowerPlatformClient {
       connectionReferences?: any;
     }
   ): Promise<any> {
-    const patch: any = {};
+    const body: any = { properties: {} };
 
-    if (updates.definition || updates.connectionReferences) {
-      const fullDefinition = updates.definition
-        ? (updates.definition['$schema']
-            ? updates.definition
-            : {
-                '$schema': WORKFLOW_SCHEMA,
-                contentVersion: '1.0.0.0',
-                triggers: updates.definition.triggers || {},
-                actions: updates.definition.actions || {},
-                ...(updates.definition.parameters ? { parameters: updates.definition.parameters } : {}),
-              })
-        : undefined;
-
-      const clientDataObj: any = { properties: {}, schemaVersion: '1.0.0.0' };
-      if (fullDefinition) clientDataObj.properties.definition = fullDefinition;
-      if (updates.connectionReferences) {
-        clientDataObj.properties.connectionReferences = updates.connectionReferences;
-      }
-
-      if (Object.keys(clientDataObj.properties).length > 0) {
-        patch.clientdata = JSON.stringify(clientDataObj);
-        console.log(`[Dataverse] clientdata for update (${patch.clientdata.length} chars)`);
-      }
+    if (updates.displayName) {
+      body.properties.displayName = updates.displayName;
     }
 
-    if (updates.displayName) patch.name = updates.displayName;
+    if (updates.definition) {
+      body.properties.definition = updates.definition['$schema']
+        ? updates.definition
+        : {
+            '$schema': WORKFLOW_SCHEMA,
+            contentVersion: '1.0.0.0',
+            triggers: updates.definition.triggers || {},
+            actions: updates.definition.actions || {},
+            ...(updates.definition.parameters ? { parameters: updates.definition.parameters } : {}),
+          };
+    }
+
+    if (updates.connectionReferences) {
+      body.properties.connectionReferences = updates.connectionReferences;
+    }
 
     if (updates.state) {
-      const isStarted = updates.state === 'Started';
-      patch.statecode = isStarted ? 1 : 0;
-      patch.statuscode = isStarted ? 2 : 1;
+      body.properties.state = updates.state === 'Started' ? 'Started' : 'Stopped';
     }
 
-    console.log(`[Dataverse] Updating flow ${flowId} in env ${envId}`);
-    console.log(`[Dataverse] Update fields: ${Object.keys(patch).join(', ')}`);
+    const updateFields = Object.keys(body.properties).join(', ');
+    console.log(`[Flow] Updating flow ${flowId} in env ${envId} via Flow Management API`);
+    console.log(`[Flow] Update fields: ${updateFields}`);
 
-    const workflowGuid = flowId.includes('/') ? (flowId.split('/').pop() || flowId) : flowId;
-
-    const result = await this.dataverseRequest(
-      envId,
-      `/api/data/v9.2/workflows(${workflowGuid})`,
+    const result = await this.flowAdminRequest(
+      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
       'PATCH',
-      patch
+      body
     );
 
+    const updatedDisplayName = result?.properties?.displayName || updates.displayName;
+    const updatedState = result?.properties?.state || updates.state;
+
+    console.log(`[Flow] ✅ Flow updated: ${flowId}`);
+
     return {
-      name: flowId,
+      name: result?.name || flowId,
       properties: {
-        ...(updates.displayName ? { displayName: updates.displayName } : {}),
-        ...(updates.state ? { state: updates.state } : {}),
+        ...(updatedDisplayName ? { displayName: updatedDisplayName } : {}),
+        ...(updatedState ? { state: updatedState } : {}),
         ...(updates.definition ? { definition: updates.definition } : {}),
       },
-      _source: 'dataverse',
+      _source: 'flow-management-api',
       _raw: result,
     };
   }
