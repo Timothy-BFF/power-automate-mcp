@@ -12,7 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.3.3';
+const VERSION = '2.4.0';
 
 // =============================================================================
 // Core Services
@@ -445,6 +445,19 @@ const sseTransports = new Map<string, SSEServerTransport>();
 
 app.get('/sse', async (req: Request, res: Response) => {
   console.log('[SSE] Connection initiated');
+  
+  // ── SSE Reconnect Guard ──────────────────────────────────────
+  // Simtheory.ai may reconnect (keepalive, network blip, session
+  // refresh). The MCP SDK enforces one transport per Protocol
+  // instance. Without this guard, a reconnect crashes the process
+  // with "Already connected to a transport" (protocol.js:217).
+  try {
+    await mcpServer.close();
+    console.log('[SSE] Previous transport closed (reconnect detected)');
+  } catch (_) {
+    // No existing connection — first connect. That's fine.
+  }
+
   const transport = new SSEServerTransport('/messages', res);
   sseTransports.set(transport.sessionId, transport);
   res.on('close', () => {
@@ -556,9 +569,9 @@ app.listen(PORT, () => {
   console.log(`[Init] SSE:    http://localhost:${PORT}/sse`);
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
-  console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin + Dataverse dynamic (4 scopes)`);
-  console.log(`[Init] Write:  Dataverse Web API (create + update flows)`);
-  console.log(`[Init] ID:     workflowidunique bridge (Dataverse -> Flow API)`);
-  console.log(`[Init] Tools:  ${toolDefs.length} (including Dataverse-backed create + update)`);
+  console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
+  console.log(`[Init] Write:  Flow Management API (create + update flows)`);
+  console.log(`[Init] ID:     Direct Flow API (no bridge needed)`);
+  console.log(`[Init] Tools:  ${toolDefs.length} (including Flow API-backed create + update)`);
   console.log('');
 });
