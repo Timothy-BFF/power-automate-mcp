@@ -1,152 +1,225 @@
 # Phase 2 Wiring Guide — v3.0.0 Integration
 
-This guide documents the exact changes needed in existing files to complete
-the v3.0.0 per-user delegated auth integration.
+Now that I've seen the actual source code, here are the EXACT changes needed.
 
-## Overview
+## Architecture Insight
 
-Phase 1 created:
-- `src/auth/user-auth-manager.ts` — Device Code Flow
-- `src/auth/token-router.ts` — Dual-token dispatcher
-- `src/auth/index.ts` — Barrel exports
-- `src/config/delegated-auth-settings.ts` — New env vars
-- `src/config/auth-tool-definitions.ts` — Auth tool schemas
+- `src/config/` contains only `environment-resolver.ts` and `index.ts` (no separate settings or tool-definitions files)
+- Tool definitions are inline in `src/index.ts` via `const toolDefs: ToolDefinition[]`
+- Each tool uses `{ name, description, inputSchema, handler }` pattern
+- Handlers use `ok(data)` and `fail(msg)` helpers
+- `PowerPlatformClient` uses `flowAdminRequest()` for all Flow API calls
 
-Phase 2 created:
-- `src/tools/auth-tool-handlers.ts` — Handler implementations
-- `src/v3-bootstrap.ts` — Singleton initialization module
-- This wiring guide
+---
 
-## Changes Required in Existing Files
+## Change 1: `src/index.ts` — Register Auth Tools (4 lines)
 
-### 1. `src/index.ts` — Main Server Entry Point
-
-**Add these imports** (near the top, with other imports):
+### Step 1a: Add imports (after existing imports, around line 9)
 
 ```typescript
-import { initV3Auth, v3 } from './v3-bootstrap';
+// === v3.0.0: Per-User Delegated Auth ===
+import { UserAuthManager } from './auth/user-auth-manager.js';
+import { createV3AuthTools } from './tools/v3-auth-tools.js';
 ```
 
-**Add initialization** (after AzureTokenManager is created, before server starts):
+### Step 1b: Initialize UserAuthManager (after `const client = new PowerPlatformClient(tokenManager);`)
 
 ```typescript
-// Initialize v3 dual-token auth system
-// Pass the existing token manager's getToken method
-initV3Auth(() => azureTokenManager.getToken());
+// === v3.0.0: Initialize per-user auth ===
+const userAuthManager = new UserAuthManager();
 ```
 
-**Add auth tools to tools/list** (in the ListToolsRequestSchema handler):
+### Step 1c: Add auth tools to toolDefs array
+
+Find the `const toolDefs: ToolDefinition[] = [` line and change the array to spread in auth tools:
 
 ```typescript
-// In the tools/list handler, spread the auth tools into the existing array:
-tools: [
-  ...existingToolDefinitions,
-  ...v3.authToolDefinitions,  // ← ADD THIS LINE
-]
+const toolDefs: ToolDefinition[] = [
+  // ... all existing tool definitions stay exactly as they are ...
+
+  // === v3.0.0: Per-User Auth Tools ===
+  ...createV3AuthTools(userAuthManager),
+];
 ```
 
-**Add auth tool dispatch to tools/call** (at the TOP of the CallToolRequestSchema handler):
+Alternatively, add after the closing of the last existing tool entry:
 
 ```typescript
-// At the start of the tools/call handler, before the existing switch/if:
-const authResult = await v3.dispatchAuthTool(toolName, args);
-if (authResult) return authResult;
-
-// ... existing tool handling continues below ...
+  // (end of last existing tool)
+  },
+  // === v3.0.0: Per-User Auth Tools (pa-auth-start, pa-auth-poll, pa-auth-status) ===
+  ...createV3AuthTools(userAuthManager),
+];
 ```
 
-### 2. `src/api/power-platform-client.ts` — API Client
+That's it. **4 lines total** to add auth tools.
 
-The existing client likely calls `this.tokenManager.getToken()` to get
-the service principal token for all requests. For v3, write operations
-need to use the user's delegated token instead.
+---
 
-**Option A: Minimal Change (Recommended)**
+## Change 2: `src/api/power-platform-client.ts` — Token Override for Writes
 
-Add an optional `tokenOverride` parameter to methods that perform writes:
+This enables write operations to use the user's delegated token instead of
+the service principal token.
+
+### Step 2a: Add optional `tokenOverride` to `flowAdminRequest`
+
+Find the `flowAdminRequest` method (private method that all Flow API calls go through).
+It likely looks like:
 
 ```typescript
-// In each write method (createFlow, updateFlow, deleteFlow, etc.):
-async createFlow(
-  environmentId: string,
-  definition: any,
-  tokenOverride?: string  // ← ADD THIS
-): Promise<any> {
-  const token = tokenOverride || await this.tokenManager.getToken();
-  // ... rest of method uses `token` for the Authorization header
+private async flowAdminRequest(path: string, method: string = 'GET', body?: any): Promise<any> {
+  const token = await this.tokenManager.getToken('https://service.flow.microsoft.com/.default');
+  // ... axios/fetch with Authorization: Bearer ${token}
 }
 ```
 
-Then in `index.ts`, before calling write methods:
+Add an optional 4th parameter:
 
 ```typescript
-// For write operations, get the user token via TokenRouter:
-const token = await v3.getToken('pa-create-flow', userId);
-const result = await powerPlatformClient.createFlow(envId, definition, token);
+private async flowAdminRequest(
+  path: string,
+  method: string = 'GET',
+  body?: any,
+  tokenOverride?: string  // ← ADD THIS
+): Promise<any> {
+  const token = tokenOverride || await this.tokenManager.getToken('https://service.flow.microsoft.com/.default');
+  // ... rest stays the same
+}
 ```
 
-**Option B: Full Integration**
+### Step 2b: Thread `tokenOverride` through write methods
 
-Replace the token source entirely:
+For each write method, add `tokenOverride` parameter and pass it through:
 
 ```typescript
-// Replace:
-const token = await this.tokenManager.getToken();
+async createFlow(envId: string, ..., tokenOverride?: string): Promise<any> {
+  // ... existing body construction ...
+  const result = await this.flowAdminRequest(
+    `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
+    'POST',
+    body,
+    tokenOverride  // ← ADD THIS
+  );
+  // ... rest stays the same
+}
 
-// With:
-const token = await v3.getToken(toolName, userId);
+async updateFlow(envId: string, flowId: string, updates: {...}, tokenOverride?: string): Promise<any> {
+  // ... pass tokenOverride to flowAdminRequest
+}
+
+async deleteFlow(envId: string, flowId: string, tokenOverride?: string): Promise<any> {
+  return this.flowAdminRequest(
+    `/providers/.../${flowId}?api-version=${FLOW_API_VER}`,
+    'DELETE',
+    undefined,
+    tokenOverride  // ← ADD THIS
+  );
+}
+
+async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop', tokenOverride?: string): Promise<any> {
+  return this.flowAdminRequest(
+    `/providers/.../${flowId}/${action}?api-version=${FLOW_API_VER}`,
+    'POST',
+    undefined,
+    tokenOverride  // ← ADD THIS
+  );
+}
+
+async triggerFlow(envId: string, flowId: string, body?: any, tokenOverride?: string): Promise<any> {
+  return this.flowAdminRequest(
+    `/providers/.../${flowId}/triggers/manual/run?api-version=${FLOW_API_VER}`,
+    'POST',
+    body || {},
+    tokenOverride  // ← ADD THIS
+  );
+}
+
+async cancelRun(envId: string, flowId: string, runId: string, tokenOverride?: string): Promise<any> {
+  return this.flowAdminRequest(
+    `/providers/.../${runId}/cancel?api-version=${FLOW_API_VER}`,
+    'POST',
+    undefined,
+    tokenOverride  // ← ADD THIS
+  );
+}
 ```
 
-This requires passing `toolName` and `userId` through the call chain.
+### Step 2c: Wire token override in index.ts write tool handlers
 
-### 3. `src/config/settings.ts` — Environment Variables
-
-**Add the new env vars** to whatever config object/function loads them:
+In each WRITE tool handler in `index.ts`, get the user token before calling the client:
 
 ```typescript
-// Add to the settings/config:
-PA_USER_CLIENT_ID: process.env.PA_USER_CLIENT_ID || '',
-PA_USER_TENANT_ID: process.env.PA_USER_TENANT_ID || process.env.AZURE_TENANT_ID || '',
+// Example for pa-create-flow handler:
+handler: async (p: any) => {
+  try {
+    const envId = resolveEnvironmentId(p.environmentId);
+    // === v3.0.0: Get user token for write operations ===
+    let userToken: string | undefined;
+    try {
+      userToken = await userAuthManager.getAccessToken() || undefined;
+    } catch { /* falls back to service principal */ }
+    const r = await client.createFlow(envId, p.displayName, p.definition, ..., userToken);
+    return ok(r);
+  } catch (e: any) { return fail(e.message); }
+},
 ```
 
-Note: The `UserAuthManager` reads these directly from `process.env`,
-so this step is optional but recommended for documentation/validation.
+---
+
+## Change 3: Version Bump
+
+In `src/index.ts`, update:
+```typescript
+const VERSION = '3.0.0';
+```
+
+---
 
 ## Railway Environment Variables
 
-Add these to the `intelligent-youthfulness` Railway project:
+Add to `intelligent-youthfulness` project on Railway:
 
 ```
 PA_USER_CLIENT_ID=<your-device-code-app-registration-client-id>
-PA_USER_TENANT_ID=<your-tenant-id>  (or omit if same as AZURE_TENANT_ID)
+PA_USER_TENANT_ID=<your-tenant-id>
 ```
 
-## Azure AD App Registration Requirements
+---
 
-The `PA_USER_CLIENT_ID` app registration must have:
+## Azure AD App Registration Checklist
 
-1. **Authentication** → Allow public client flows → **Yes** (required for Device Code Flow)
-2. **API Permissions** → `https://service.flow.microsoft.com/.default` (delegated)
-3. **Supported account types** → Accounts in this organizational directory only
+The `PA_USER_CLIENT_ID` app must have:
 
-## Testing
+1. **Authentication → Allow public client flows → Yes** (required for Device Code Flow)
+2. **API Permissions → Flow Service: `https://service.flow.microsoft.com/.default`** (delegated)
+3. **Supported account types → Single tenant** (this org directory only)
 
-### Smoke Test: Auth Tools
+---
 
-1. Call `pa-auth-status` → should return `{ authenticated: false, delegated_auth_configured: true }`
-2. Call `pa-auth-start` with `{ user_id: "timothy@bolthousefresh.com" }` → should return device code + URL
-3. Visit the URL, enter the code, sign in
-4. Call `pa-auth-poll` → should return `{ status: "authenticated" }`
-5. Call `pa-auth-status` → should show authenticated with token expiry
+## Phased Rollout
 
-### Smoke Test: Write Operations
+### Phase 2a (Auth Tools Only — no existing code changes)
+Just add the 4 lines in Change 1 to `index.ts`. This gives you:
+- `pa-auth-start` / `pa-auth-poll` / `pa-auth-status` tools
+- Users can authenticate
+- Write operations still use service principal (existing behavior)
 
-1. Authenticate via steps above
-2. Call `pa-create-flow` → should use the user's delegated token
-3. Verify the flow appears in Power Automate portal under the user's account
+### Phase 2b (Token Override — minimal existing code changes)
+Apply Change 2 to `power-platform-client.ts` and the write tool handlers.
+- Write operations now use user's delegated token when available
+- Falls back to service principal if user isn't authenticated
 
-### Regression Test: Read Operations
+Recommendation: Ship Phase 2a first, test auth flow, then Phase 2b.
 
-1. Call `pa-list-flows` → should still work via service principal (no user auth needed)
-2. Call `pa-get-flow-details` → same
-3. Call `pa-get-run-history` → same
+---
+
+## Smoke Test
+
+1. Deploy to Railway
+2. Call `pa-auth-status` → `{ authenticated: false, delegated_auth_configured: true }`
+3. Call `pa-auth-start { user_id: "timothy@bolthousefresh.com" }` → device code
+4. Visit URL, enter code, sign in
+5. Call `pa-auth-poll` → `{ status: "authenticated" }`
+6. Call `pa-auth-status` → shows token expiry
+7. Call `pa-list-flows` → still works (service principal, no change)
+8. (Phase 2b) Call `pa-create-flow` → uses Timothy's delegated token
