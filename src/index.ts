@@ -9,6 +9,7 @@ import { resolveEnvironmentId } from './config/environment-resolver.js';
 import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
 import { createV3AuthTools } from './tools/v3-auth-tools.js';
+import { registerAuthTools } from './tools/register-auth-tools.js';
 
 // =============================================================================
 // Configuration
@@ -444,6 +445,8 @@ app.get('/mcp', (_req: Request, res: Response) => {
 app.get('/api', (_req: Request, res: Response) => {
   res.json({ name: 'power-automate-mcp', version: VERSION, status: 'ready' });
 });
+
+registerAuthTools(mcpServer, userAuthManager);
 
 // --- SSE Transport ---
 const sseTransports = new Map<string, SSEServerTransport>();
