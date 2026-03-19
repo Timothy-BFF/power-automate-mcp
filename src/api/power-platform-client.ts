@@ -362,7 +362,7 @@ export class PowerPlatformClient {
 
     // POST to Flow Management API — creates both Dataverse record AND Flow engine registration
     const result = await this.flowAdminRequest(
-      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
+      /providers/Microsoft.ProcessSimple/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
       'POST',
       body
     );
@@ -431,7 +431,7 @@ export class PowerPlatformClient {
     console.log(`[Flow] Update fields: ${updateFields}`);
 
     const result = await this.flowAdminRequest(
-      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
+      /providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
       'PATCH',
       body
     );
