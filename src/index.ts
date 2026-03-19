@@ -7,18 +7,21 @@ import { AzureTokenManager } from './auth/azure-token-manager.js';
 import { PowerPlatformClient } from './api/power-platform-client.js';
 import { resolveEnvironmentId } from './config/environment-resolver.js';
 import { ToolResult, ToolDefinition } from './types.js';
+import { UserAuthManager } from './auth/user-auth-manager.js';
+import { createV3AuthTools } from './tools/v3-auth-tools.js';
 
 // =============================================================================
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '2.4.0';
+const VERSION = '3.0.0';
 
 // =============================================================================
 // Core Services
 // =============================================================================
 const tokenManager = new AzureTokenManager();
 const client = new PowerPlatformClient(tokenManager);
+const userAuthManager = new UserAuthManager();
 
 // Pre-warm tokens (BAP + Flow + PowerApps scopes; Dataverse scope acquired on-demand)
 (async () => {
@@ -357,8 +360,10 @@ const toolDefs: ToolDefinition[] = [
         return ok({ count: connections.length, environmentId: envId, connections });
       } catch (e: any) { return fail(e.message); }
     },
-  },
-];
+    },
+   // === v3.0.0: Per-User Delegated Auth Tools ===
+      ...createV3AuthTools(userAuthManager),
+  ];
 
 // =============================================================================
 // MCP Server Setup (SSE transport)
