@@ -372,7 +372,8 @@ const toolDefs: ToolDefinition[] = [
 const mcpServer = new McpServer({ name: 'power-automate-mcp', version: VERSION });
 
 // Register tools with MCP server using Zod schemas derived from JSON Schema defs
-for (const tool of toolDefs) {
+const authToolNames = new Set(['pa-auth-start', 'pa-auth-poll', 'pa-auth-status']);
+for (const tool of toolDefs.filter(t => !authToolNames.has(t.name))) {
   const props = (tool.inputSchema as any).properties || {};
   const required: string[] = (tool.inputSchema as any).required || [];
   const shape: Record<string, z.ZodTypeAny> = {};
