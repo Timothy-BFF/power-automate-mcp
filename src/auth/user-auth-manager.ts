@@ -43,6 +43,7 @@ export interface AuthStatusResult {
   message: string;
   pending: boolean;
   authenticatedUsers: string[];
+  expiresIn?: number;
 }
 
 // =========================================================================
@@ -241,7 +242,7 @@ export class UserAuthManager {
 
       this.pendingAuths.delete(userId);
 
-      console.log(`[UserAuth] \u2705 ${userId} authenticated successfully`);
+      console.log(`[UserAuth] ✅ ${userId} authenticated successfully`);
       console.log(`[UserAuth]   Token TTL: ${data.expires_in}s, Refresh token: ${data.refresh_token ? 'yes' : 'no'}`);
 
       return {
@@ -300,13 +301,15 @@ export class UserAuthManager {
       const hasPending = this.pendingAuths.has(userId);
 
       if (token && (token.expiresAt > Date.now() || token.refreshToken)) {
-        const minutesLeft = Math.max(0, Math.round((token.expiresAt - Date.now()) / 60000));
+        const secondsLeft = Math.max(0, Math.round((token.expiresAt - Date.now()) / 1000));
+        const minutesLeft = Math.max(0, Math.round(secondsLeft / 60));
         return {
           authenticated: true,
           userId,
           message: `${userId} is authenticated (expires in ${minutesLeft} min, refresh: ${token.refreshToken ? 'available' : 'none'})`,
           pending: false,
           authenticatedUsers,
+          expiresIn: secondsLeft,
         };
       }
 
@@ -318,10 +321,21 @@ export class UserAuthManager {
           : `${userId} is not authenticated. Use pa-auth-start to begin.`,
         pending: hasPending,
         authenticatedUsers,
+        expiresIn: 0,
       };
     }
 
     // No specific user — return general status
+    // If there's a default user, include their expiresIn
+    let expiresIn = 0;
+    const defaultUser = this.getDefaultUserId();
+    if (defaultUser) {
+      const token = this.tokens.get(defaultUser);
+      if (token) {
+        expiresIn = Math.max(0, Math.round((token.expiresAt - Date.now()) / 1000));
+      }
+    }
+
     return {
       authenticated: authenticatedUsers.length > 0,
       userId: authenticatedUsers[0] || null,
@@ -330,6 +344,7 @@ export class UserAuthManager {
         : 'No users authenticated. Use pa-auth-start to begin device code login.',
       pending: this.pendingAuths.size > 0,
       authenticatedUsers,
+      expiresIn,
     };
   }
 
@@ -415,7 +430,7 @@ export class UserAuthManager {
         acquiredAt: Date.now(),
       });
 
-      console.log(`[UserAuth] \u2705 Token refreshed for ${userId} (TTL: ${data.expires_in}s)`);
+      console.log(`[UserAuth] ✅ Token refreshed for ${userId} (TTL: ${data.expires_in}s)`);
       return true;
     } catch (error: any) {
       const errMsg = error.response?.data?.error_description || error.response?.data?.error || error.message;
