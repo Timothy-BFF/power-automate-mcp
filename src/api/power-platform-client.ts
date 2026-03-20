@@ -82,6 +82,23 @@ function ensureRequiredParameters(definition: any, displayName: string): any {
   return def;
 }
 
+/**
+ * Unwraps a definition if the agent sent it as a single-element array.
+ * Agents sometimes send definition: [{...}] instead of definition: {...}
+ * which causes Microsoft to return 400 InvalidRequestContent:
+ *   "Could not find member '0' on object of type 'FlowTemplate'.
+ *    Path 'properties.definition.0'"
+ *
+ * v3.0.2: Auto-unwrap to prevent agent loops on this error.
+ */
+function unwrapDefinitionIfArray(definition: any, label: string): any {
+  if (Array.isArray(definition) && definition.length === 1) {
+    console.log(`[Flow] Auto-unwrapped definition array for '${label}'`);
+    return definition[0];
+  }
+  return definition;
+}
+
 export class PowerPlatformClient {
   private tm: AzureTokenManager;
   private userAuth: UserAuthManager | null;
@@ -473,6 +490,7 @@ export class PowerPlatformClient {
   //   4. Falls back to service principal if no user token available
   //
   // DEFINITION AUTO-FIX (v3.0.2):
+  //   - Definition array unwrap (v3.0.2) — [{...}] → {...}
   //   - $schema injection (v3.0.1)
   //   - contentVersion injection (v3.0.1)
   //   - Empty definition guard (v3.0.1)
@@ -486,7 +504,7 @@ export class PowerPlatformClient {
    * Uses the authenticated user's delegated token to ensure the flow
    * is owned by that user's identity.
    *
-   * v3.0.2: Auto-injects $connections + $authentication parameters.
+   * v3.0.2: Auto-unwraps definition array, injects $connections + $authentication.
    * v3.0.1: Robust $schema injection + empty definition validation.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
@@ -497,8 +515,12 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
+    // --- Array unwrap guard (v3.0.2) ---
+    // Agent sometimes sends definition as [{...}] instead of {...}
+    // Auto-unwrap to prevent "Path 'properties.definition.0'" errors
+    definition = unwrapDefinitionIfArray(definition, displayName);
+
     // --- Robust schema injection ---
-    // Always ensure $schema, contentVersion, triggers, and actions exist.
     let fullDefinition = { ...definition };
     if (!fullDefinition['$schema']) {
       fullDefinition['$schema'] = WORKFLOW_SCHEMA;
@@ -514,14 +536,9 @@ export class PowerPlatformClient {
     }
 
     // --- Required parameters injection (v3.0.2) ---
-    // Power Automate requires parameters.$connections AND parameters.$authentication
-    // for flows with connector-based triggers/actions.
-    // Without $connections: 400 "missing the required parameter '$connections'"
-    // Without $authentication: 400 "missing the required parameter '$authentication'"
     fullDefinition = ensureRequiredParameters(fullDefinition, displayName);
 
     // --- Empty definition guard ---
-    // Reject definitions where BOTH triggers and actions are empty.
     const triggerCount = Object.keys(fullDefinition.triggers).length;
     const actionCount = Object.keys(fullDefinition.actions).length;
 
@@ -589,7 +606,7 @@ export class PowerPlatformClient {
    * Updates an existing Power Automate cloud flow via the Flow Management API.
    * Uses the authenticated user's delegated token to ensure proper authorization.
    *
-   * v3.0.2: Auto-injects $connections + $authentication parameters.
+   * v3.0.2: Auto-unwraps definition array, injects $connections + $authentication.
    * v3.0.1: Robust $schema injection.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
@@ -610,8 +627,11 @@ export class PowerPlatformClient {
     }
 
     if (updates.definition) {
+      // --- Array unwrap guard (v3.0.2) ---
+      let defInput = unwrapDefinitionIfArray(updates.definition, `flow ${flowId}`);
+
       // Robust schema injection for updates too
-      let def = { ...updates.definition };
+      let def = { ...defInput };
       if (!def['$schema']) {
         def['$schema'] = WORKFLOW_SCHEMA;
       }
