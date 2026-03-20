@@ -68,50 +68,161 @@ function ensureRequiredParameters(definition: any, displayName: string): any {
 }
 
 /**
+ * Aggressively parses a string into a JSON object.
+ *
+ * ROOT CAUSE (confirmed 2026-03-20 23:34 via diagnostic logs):
+ * The MCP SDK/SSE transport delivers the definition as a STRING, not an object.
+ * JSON.parse() fails on it — meaning it's malformed, double-encoded, or has
+ * invisible characters (BOM, control chars, etc.).
+ *
+ * When our code then does `{ ...stringValue }`, JavaScript spreads each CHARACTER
+ * into numeric keys: { "0": "{", "1": "\"", "2": "t", ... }
+ * Microsoft sees definition.0 (the first character) and returns 400.
+ *
+ * This function tries every known recovery strategy:
+ *   1. Direct JSON.parse
+ *   2. Trim whitespace + strip BOM
+ *   3. Double-decode (JSON string inside JSON string)
+ *   4. Triple-decode (for extreme transport nesting)
+ *   5. Extract JSON from surrounding noise via regex
+ */
+function aggressiveJsonParse(str: string, label: string): any | null {
+  // Log first 500 chars for diagnosis
+  const preview = str.length > 500 ? str.substring(0, 500) + '...' : str;
+  console.log(`[Flow:Parse] Raw string (${str.length} chars) for '${label}': ${preview}`);
+
+  // Attempt 1: Direct parse
+  try {
+    const result = JSON.parse(str);
+    console.log(`[Flow:Parse] \u2705 Direct JSON.parse succeeded for '${label}'`);
+    return result;
+  } catch (e) {
+    console.log(`[Flow:Parse] Direct parse failed for '${label}': ${(e as Error).message}`);
+  }
+
+  // Attempt 2: Trim whitespace + strip BOM (\uFEFF) + strip null bytes
+  const cleaned = str.replace(/^\uFEFF/, '').replace(/\0/g, '').trim();
+  if (cleaned !== str) {
+    try {
+      const result = JSON.parse(cleaned);
+      console.log(`[Flow:Parse] \u2705 Parsed after BOM/whitespace cleanup for '${label}'`);
+      return result;
+    } catch (e) {
+      console.log(`[Flow:Parse] BOM-cleaned parse failed for '${label}'`);
+    }
+  }
+
+  // Attempt 3: Double-decode — the string might be a JSON-encoded string
+  // e.g., '"{\\"triggers\\":{}}"' → '{"triggers":{}}'
+  try {
+    const inner = JSON.parse(cleaned);
+    if (typeof inner === 'string') {
+      const result = JSON.parse(inner);
+      console.log(`[Flow:Parse] \u2705 Double-decode succeeded for '${label}'`);
+      return result;
+    }
+  } catch (e) {
+    console.log(`[Flow:Parse] Double-decode failed for '${label}'`);
+  }
+
+  // Attempt 4: Triple-decode (extreme transport nesting)
+  try {
+    let val: any = cleaned;
+    for (let depth = 0; depth < 5; depth++) {
+      val = JSON.parse(val);
+      if (typeof val === 'object' && val !== null) {
+        console.log(`[Flow:Parse] \u2705 Multi-decode succeeded at depth ${depth + 1} for '${label}'`);
+        return val;
+      }
+      if (typeof val !== 'string') break;
+    }
+  } catch (e) {
+    console.log(`[Flow:Parse] Multi-decode failed for '${label}'`);
+  }
+
+  // Attempt 5: Extract JSON object from surrounding noise via regex
+  // Look for the outermost { ... } block
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const result = JSON.parse(jsonMatch[0]);
+      console.log(`[Flow:Parse] \u2705 Regex extraction succeeded for '${label}'`);
+      return result;
+    } catch (e) {
+      console.log(`[Flow:Parse] Regex extraction failed for '${label}'`);
+    }
+  }
+
+  // Attempt 6: Unescape common transport escaping patterns
+  // Sometimes the transport double-escapes: \\" → \", \\n → \n
+  const unescaped = cleaned
+    .replace(/\\\\/g, '\\')
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t');
+  if (unescaped !== cleaned) {
+    try {
+      const result = JSON.parse(unescaped);
+      console.log(`[Flow:Parse] \u2705 Unescape parse succeeded for '${label}'`);
+      return result;
+    } catch (e) {
+      console.log(`[Flow:Parse] Unescape parse failed for '${label}'`);
+    }
+
+    // Try regex on unescaped too
+    const unescapedMatch = unescaped.match(/\{[\s\S]*\}/);
+    if (unescapedMatch) {
+      try {
+        const result = JSON.parse(unescapedMatch[0]);
+        console.log(`[Flow:Parse] \u2705 Unescape + regex succeeded for '${label}'`);
+        return result;
+      } catch (e) {
+        console.log(`[Flow:Parse] Unescape + regex failed for '${label}'`);
+      }
+    }
+  }
+
+  // All attempts exhausted
+  console.error(`[Flow:Parse] \u274c ALL parse attempts failed for '${label}'. String char codes (first 50): [${Array.from(str.substring(0, 50)).map(c => c.charCodeAt(0)).join(', ')}]`);
+  return null;
+}
+
+/**
  * Sanitizes a flow definition received from the MCP transport layer.
  *
- * PROBLEM (confirmed by Jose's agent 2026-03-20):
- * The MCP SDK / SSE transport layer adds numeric string keys ("0", "1", etc.)
- * to complex objects during transfer. This happens REGARDLESS of whether the
- * agent sends an object or an array — the transport corrupts both.
+ * ROOT CAUSE (confirmed via diagnostic logs 2026-03-20):
+ * The definition arrives as a STRING, not an object. When spread into an object
+ * via { ...stringValue }, each CHARACTER becomes a numeric key:
+ *   { "0": "{", "1": "\"", "2": "t", ... }
+ * Microsoft sees definition.0 and returns 400 InvalidRequestContent.
  *
- * Evidence:
- *   - Agent sends definition: {...}  → transport adds "0" key → 400 error
- *   - Agent sends definition: [{...}] → transport adds "0" key → 400 error
- *   - Single-action definitions pass (too small to trigger corruption)
- *   - Multi-action definitions always fail
- *
- * Microsoft returns:
- *   400 InvalidRequestContent: "Could not find member '0' on FlowTemplate.
- *   Path 'properties.definition.0'"
- *
- * FIX (v3.0.2 aggressive):
- *   1. Parse JSON strings (if definition arrives as string)
- *   2. Unwrap real arrays: [{...}] → {...}
- *   3. Strip ALL numeric keys from the definition object
- *      (workflow definitions only have named keys: $schema, triggers,
- *       actions, parameters, contentVersion, outputs, staticResults)
- *   4. Diagnostic logging: log shape before and after sanitization
+ * This function handles:
+ *   1. Strings: aggressive multi-strategy JSON parsing
+ *   2. Arrays: [{...}] → {...} unwrap
+ *   3. Numeric-key objects: strip all numeric keys (transport artifacts)
  */
 function sanitizeDefinition(definition: any, label: string): any {
-  // --- Diagnostic: log what arrived ---
   const inputType = typeof definition;
   const inputIsArray = Array.isArray(definition);
   const inputKeys = (definition && typeof definition === 'object' && !inputIsArray)
     ? Object.keys(definition)
     : null;
-  console.log(`[Flow:Sanitize] Input for '${label}': type=${inputType}, isArray=${inputIsArray}, keys=${inputKeys ? JSON.stringify(inputKeys) : 'N/A'}`);
+  console.log(`[Flow:Sanitize] Input for '${label}': type=${inputType}, isArray=${inputIsArray}, keys=${inputKeys ? JSON.stringify(inputKeys.slice(0, 20)) : 'N/A'}${inputKeys && inputKeys.length > 20 ? ` (+${inputKeys.length - 20} more)` : ''}`);
 
   let def = definition;
 
-  // Step 1: Parse JSON strings
+  // Step 1: Parse strings with aggressive multi-strategy parser
   if (typeof def === 'string') {
-    try {
-      def = JSON.parse(def);
-      console.log(`[Flow:Sanitize] Parsed JSON string for '${label}'`);
-    } catch (e) {
-      console.error(`[Flow:Sanitize] Failed to parse definition string for '${label}'`);
-      return def;
+    const parsed = aggressiveJsonParse(def, label);
+    if (parsed !== null && typeof parsed === 'object') {
+      def = parsed;
+    } else {
+      // CRITICAL: Do NOT return the raw string — spreading it creates numeric keys
+      console.error(`[Flow:Sanitize] \u274c Cannot parse definition string for '${label}' — returning empty definition to prevent spread corruption`);
+      return {
+        triggers: {},
+        actions: {},
+      };
     }
   }
 
@@ -125,22 +236,17 @@ function sanitizeDefinition(definition: any, label: string): any {
       def = def[0];
     } else {
       console.error(`[Flow:Sanitize] Definition is empty array for '${label}'`);
-      return {};
+      return { triggers: {}, actions: {} };
     }
   }
 
   // Step 3: Strip ALL numeric keys from the object
-  // Workflow definitions should NEVER have numeric keys.
-  // Valid top-level keys: $schema, contentVersion, triggers, actions,
-  //   parameters, outputs, staticResults, description
   if (def && typeof def === 'object' && !Array.isArray(def)) {
     const numericKeys = Object.keys(def).filter(k => /^\d+$/.test(k));
 
     if (numericKeys.length > 0) {
-      console.log(`[Flow:Sanitize] Stripping ${numericKeys.length} numeric key(s) from '${label}': [${numericKeys.join(', ')}]`);
+      console.log(`[Flow:Sanitize] Stripping ${numericKeys.length} numeric key(s) from '${label}': [${numericKeys.slice(0, 10).join(', ')}]${numericKeys.length > 10 ? '...' : ''}`);
 
-      // If the ONLY keys are numeric, this is a pure transport artifact {"0": {...}}
-      // In that case, unwrap the value of the first numeric key
       const nonNumericKeys = Object.keys(def).filter(k => !/^\d+$/.test(k));
       if (nonNumericKeys.length === 0 && numericKeys.length === 1) {
         const inner = def[numericKeys[0]];
@@ -148,9 +254,13 @@ function sanitizeDefinition(definition: any, label: string): any {
           console.log(`[Flow:Sanitize] Pure numeric-key object — unwrapping '${numericKeys[0]}' for '${label}'`);
           def = inner;
         }
+      } else if (nonNumericKeys.length === 0 && numericKeys.length > 1) {
+        // ALL keys are numeric — this is a fully spread string
+        // The original string was not parseable, return empty
+        console.error(`[Flow:Sanitize] \u274c Definition is fully spread string (${numericKeys.length} char keys) for '${label}' — returning empty definition`);
+        return { triggers: {}, actions: {} };
       } else {
-        // Mixed object: has both numeric and workflow keys
-        // Strip the numeric keys, keep everything else
+        // Mixed: has both numeric and workflow keys — strip numeric, keep rest
         const cleaned: any = {};
         for (const key of Object.keys(def)) {
           if (!/^\d+$/.test(key)) {
@@ -162,11 +272,11 @@ function sanitizeDefinition(definition: any, label: string): any {
     }
   }
 
-  // --- Diagnostic: log what we're sending ---
+  // Diagnostic: log what we're sending
   const outputKeys = (def && typeof def === 'object' && !Array.isArray(def))
     ? Object.keys(def)
     : null;
-  console.log(`[Flow:Sanitize] Output for '${label}': keys=${outputKeys ? JSON.stringify(outputKeys) : 'N/A'}`);
+  console.log(`[Flow:Sanitize] Output for '${label}': keys=${outputKeys ? JSON.stringify(outputKeys.slice(0, 20)) : 'N/A'}`);
 
   return def;
 }
@@ -522,7 +632,6 @@ export class PowerPlatformClient {
     // --- Sanitize definition (v3.0.2 aggressive) ---
     definition = sanitizeDefinition(definition, displayName);
 
-    // --- Robust schema injection ---
     let fullDefinition = { ...definition };
     if (!fullDefinition['$schema']) {
       fullDefinition['$schema'] = WORKFLOW_SCHEMA;
@@ -537,10 +646,8 @@ export class PowerPlatformClient {
       fullDefinition.actions = {};
     }
 
-    // --- Required parameters injection (v3.0.2) ---
     fullDefinition = ensureRequiredParameters(fullDefinition, displayName);
 
-    // --- Empty definition guard ---
     const triggerCount = Object.keys(fullDefinition.triggers).length;
     const actionCount = Object.keys(fullDefinition.actions).length;
 
@@ -636,7 +743,6 @@ export class PowerPlatformClient {
         def.actions = {};
       }
 
-      // Required parameters injection (v3.0.2)
       def = ensureRequiredParameters(def, `flow ${flowId}`);
 
       body.properties.definition = def;
