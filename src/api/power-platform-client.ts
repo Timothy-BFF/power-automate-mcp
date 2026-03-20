@@ -19,7 +19,6 @@ const POWERAPPS_API_VER = '2016-11-01';
 
 const WORKFLOW_SCHEMA = 'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#';
 
-// Propagation delay settings (Dataverse write -> Flow Management API visibility)
 const PROPAGATION_DELAY_MS = 5000;
 const PROPAGATION_RETRY_DELAY_MS = 5000;
 const PROPAGATION_MAX_RETRIES = 3;
@@ -69,43 +68,107 @@ function ensureRequiredParameters(definition: any, displayName: string): any {
 }
 
 /**
- * Unwraps a definition if the agent sent it as an array or as a
- * numeric-keyed object (MCP transport artifact).
+ * Sanitizes a flow definition received from the MCP transport layer.
  *
- * The MCP SDK / JSON transport layer sometimes converts:
- *   [{...}]  (array)  →  {"0": {...}}  (object with numeric keys)
- * before it reaches our code. Both cause Microsoft to return:
- *   400 InvalidRequestContent: "Could not find member '0' on FlowTemplate"
+ * PROBLEM (confirmed by Jose's agent 2026-03-20):
+ * The MCP SDK / SSE transport layer adds numeric string keys ("0", "1", etc.)
+ * to complex objects during transfer. This happens REGARDLESS of whether the
+ * agent sends an object or an array — the transport corrupts both.
  *
- * v3.0.2: Handles both real arrays AND numeric-key objects.
+ * Evidence:
+ *   - Agent sends definition: {...}  → transport adds "0" key → 400 error
+ *   - Agent sends definition: [{...}] → transport adds "0" key → 400 error
+ *   - Single-action definitions pass (too small to trigger corruption)
+ *   - Multi-action definitions always fail
+ *
+ * Microsoft returns:
+ *   400 InvalidRequestContent: "Could not find member '0' on FlowTemplate.
+ *   Path 'properties.definition.0'"
+ *
+ * FIX (v3.0.2 aggressive):
+ *   1. Parse JSON strings (if definition arrives as string)
+ *   2. Unwrap real arrays: [{...}] → {...}
+ *   3. Strip ALL numeric keys from the definition object
+ *      (workflow definitions only have named keys: $schema, triggers,
+ *       actions, parameters, contentVersion, outputs, staticResults)
+ *   4. Diagnostic logging: log shape before and after sanitization
  */
-function unwrapDefinitionIfArray(definition: any, label: string): any {
-  // Case 1: Real array — [{...}]
-  if (Array.isArray(definition) && definition.length === 1) {
-    console.log(`[Flow] Auto-unwrapped definition array for '${label}'`);
-    return definition[0];
+function sanitizeDefinition(definition: any, label: string): any {
+  // --- Diagnostic: log what arrived ---
+  const inputType = typeof definition;
+  const inputIsArray = Array.isArray(definition);
+  const inputKeys = (definition && typeof definition === 'object' && !inputIsArray)
+    ? Object.keys(definition)
+    : null;
+  console.log(`[Flow:Sanitize] Input for '${label}': type=${inputType}, isArray=${inputIsArray}, keys=${inputKeys ? JSON.stringify(inputKeys) : 'N/A'}`);
+
+  let def = definition;
+
+  // Step 1: Parse JSON strings
+  if (typeof def === 'string') {
+    try {
+      def = JSON.parse(def);
+      console.log(`[Flow:Sanitize] Parsed JSON string for '${label}'`);
+    } catch (e) {
+      console.error(`[Flow:Sanitize] Failed to parse definition string for '${label}'`);
+      return def;
+    }
   }
 
-  // Case 2: MCP transport artifact — {"0": {...}}
-  // The JSON transport converts [{...}] into {"0": {...}} which is an
-  // object with a single numeric key "0" and no standard workflow keys.
-  if (definition && typeof definition === 'object' && !Array.isArray(definition)) {
-    const keys = Object.keys(definition);
-    const hasNumericZero = keys.includes('0');
-    const hasWorkflowKeys = keys.some(k =>
-      ['triggers', 'actions', '$schema', 'contentVersion', 'parameters'].includes(k)
-    );
+  // Step 2: Unwrap real arrays — [{...}] → {...}
+  if (Array.isArray(def)) {
+    if (def.length === 1 && def[0] && typeof def[0] === 'object') {
+      console.log(`[Flow:Sanitize] Unwrapped real array for '${label}'`);
+      def = def[0];
+    } else if (def.length > 1) {
+      console.warn(`[Flow:Sanitize] Definition is array with ${def.length} elements for '${label}' — using first element`);
+      def = def[0];
+    } else {
+      console.error(`[Flow:Sanitize] Definition is empty array for '${label}'`);
+      return {};
+    }
+  }
 
-    if (hasNumericZero && !hasWorkflowKeys) {
-      const inner = definition['0'];
-      if (inner && typeof inner === 'object') {
-        console.log(`[Flow] Auto-unwrapped numeric-key definition for '${label}' (MCP transport artifact: {"0": {...}})`);
-        return inner;
+  // Step 3: Strip ALL numeric keys from the object
+  // Workflow definitions should NEVER have numeric keys.
+  // Valid top-level keys: $schema, contentVersion, triggers, actions,
+  //   parameters, outputs, staticResults, description
+  if (def && typeof def === 'object' && !Array.isArray(def)) {
+    const numericKeys = Object.keys(def).filter(k => /^\d+$/.test(k));
+
+    if (numericKeys.length > 0) {
+      console.log(`[Flow:Sanitize] Stripping ${numericKeys.length} numeric key(s) from '${label}': [${numericKeys.join(', ')}]`);
+
+      // If the ONLY keys are numeric, this is a pure transport artifact {"0": {...}}
+      // In that case, unwrap the value of the first numeric key
+      const nonNumericKeys = Object.keys(def).filter(k => !/^\d+$/.test(k));
+      if (nonNumericKeys.length === 0 && numericKeys.length === 1) {
+        const inner = def[numericKeys[0]];
+        if (inner && typeof inner === 'object') {
+          console.log(`[Flow:Sanitize] Pure numeric-key object — unwrapping '${numericKeys[0]}' for '${label}'`);
+          def = inner;
+        }
+      } else {
+        // Mixed object: has both numeric and workflow keys
+        // Strip the numeric keys, keep everything else
+        const cleaned: any = {};
+        for (const key of Object.keys(def)) {
+          if (!/^\d+$/.test(key)) {
+            cleaned[key] = def[key];
+          }
+        }
+        def = cleaned;
       }
     }
   }
 
-  return definition;
+  // --- Diagnostic: log what we're sending ---
+  const outputKeys = (def && typeof def === 'object' && !Array.isArray(def))
+    ? Object.keys(def)
+    : null;
+  console.log(`[Flow:Sanitize] Output for '${label}': keys=${outputKeys ? JSON.stringify(outputKeys) : 'N/A'}`);
+
+  return def;
 }
 
 export class PowerPlatformClient {
@@ -440,8 +503,8 @@ export class PowerPlatformClient {
   // Flows — WRITE Operations (Delegated User Token)
   // =========================================================================
   //
-  // DEFINITION AUTO-FIX (v3.0.2):
-  //   1. Definition array/numeric-key unwrap — [{...}] or {"0":{...}} → {...}
+  // DEFINITION AUTO-FIX PIPELINE (v3.0.2):
+  //   1. sanitizeDefinition() — parse strings, unwrap arrays, strip numeric keys
   //   2. $schema + contentVersion injection (v3.0.1)
   //   3. Empty definition guard (v3.0.1)
   //   4. $connections parameter injection (v3.0.2)
@@ -456,8 +519,8 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
-    // --- Array / numeric-key unwrap (v3.0.2) ---
-    definition = unwrapDefinitionIfArray(definition, displayName);
+    // --- Sanitize definition (v3.0.2 aggressive) ---
+    definition = sanitizeDefinition(definition, displayName);
 
     // --- Robust schema injection ---
     let fullDefinition = { ...definition };
@@ -556,10 +619,10 @@ export class PowerPlatformClient {
     }
 
     if (updates.definition) {
-      // --- Array / numeric-key unwrap (v3.0.2) ---
-      let defInput = unwrapDefinitionIfArray(updates.definition, `flow ${flowId}`);
+      // --- Sanitize definition (v3.0.2 aggressive) ---
+      let def = sanitizeDefinition(updates.definition, `flow ${flowId}`);
 
-      let def = { ...defInput };
+      def = { ...def };
       if (!def['$schema']) {
         def['$schema'] = WORKFLOW_SCHEMA;
       }
