@@ -174,6 +174,7 @@ export class PowerPlatformClient {
    *   3. Falls back to service principal (legacy behavior)
    *
    * Includes 401 retry with auto-refresh (same pattern as service principal).
+   * v3.0.1: Now logs error responses for server-side debugging.
    */
   private async userFlowRequest(
     path: string,
@@ -197,9 +198,18 @@ export class PowerPlatformClient {
 
         try {
           const resp = await axios({ method, url, data, headers });
+          console.log(`[Flow] \u2705 ${method} ${url} \u2192 ${resp.status} [delegated: ${resolvedUser}]`);
           if (resp.status === 204) return { _status: 204, success: true };
           return resp.data;
         } catch (error: any) {
+          // \u2014\u2014\u2014 LOG THE ERROR (critical for debugging) \u2014\u2014\u2014
+          if (error.response) {
+            console.error(`[Flow] \u274c Error ${error.response.status} on ${method} ${url} [delegated: ${resolvedUser}]`);
+            console.error(`[Flow] Response body:`, JSON.stringify(error.response.data, null, 2));
+          } else {
+            console.error(`[Flow] Network error on ${method} ${url} [delegated: ${resolvedUser}]:`, error.message);
+          }
+
           // 401 \u2192 attempt token refresh + single retry
           if (error.response?.status === 401) {
             console.log(`[Flow] 401 on delegated request for ${resolvedUser}, attempting refresh...`);
@@ -208,9 +218,14 @@ export class PowerPlatformClient {
               headers['Authorization'] = `Bearer ${freshToken}`;
               try {
                 const retry = await axios({ method, url, data, headers });
+                console.log(`[Flow] \u2705 Retry succeeded: ${method} ${url} \u2192 ${retry.status} [delegated: ${resolvedUser}]`);
                 if (retry.status === 204) return { _status: 204, success: true };
                 return retry.data;
               } catch (retryError: any) {
+                if (retryError.response) {
+                  console.error(`[Flow] \u274c Retry also failed: ${retryError.response.status} on ${method} ${url}`);
+                  console.error(`[Flow] Retry response:`, JSON.stringify(retryError.response.data, null, 2));
+                }
                 throw this.fmtWriteErr(retryError);
               }
             }
@@ -421,6 +436,7 @@ export class PowerPlatformClient {
    * Uses the authenticated user's delegated token to ensure the flow
    * is owned by that user's identity.
    *
+   * v3.0.1: Robust $schema injection + empty definition validation.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
   async createFlow(
@@ -430,16 +446,48 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
-    // Ensure proper Logic Apps schema envelope
-    const fullDefinition = definition['$schema']
-      ? definition
-      : {
-          '$schema': WORKFLOW_SCHEMA,
-          contentVersion: '1.0.0.0',
-          triggers: definition.triggers || {},
-          actions: definition.actions || {},
-          ...(definition.parameters ? { parameters: definition.parameters } : {}),
-        };
+    // \u2014\u2014\u2014 Robust schema injection \u2014\u2014\u2014
+    // Always ensure $schema, contentVersion, triggers, and actions exist.
+    // Handles all edge cases:
+    //   - Agent sends complete definition with $schema \u2192 pass through, ensure contentVersion
+    //   - Agent sends {triggers, actions} without $schema \u2192 wrap with schema envelope
+    //   - Agent sends partial definition \u2192 fill in missing pieces
+    const fullDefinition = { ...definition };
+    if (!fullDefinition['$schema']) {
+      fullDefinition['$schema'] = WORKFLOW_SCHEMA;
+    }
+    if (!fullDefinition.contentVersion) {
+      fullDefinition.contentVersion = '1.0.0.0';
+    }
+    if (!fullDefinition.triggers) {
+      fullDefinition.triggers = {};
+    }
+    if (!fullDefinition.actions) {
+      fullDefinition.actions = {};
+    }
+
+    // \u2014\u2014\u2014 Empty definition guard \u2014\u2014\u2014
+    // Reject definitions where BOTH triggers and actions are empty.
+    // These produce 173-char skeletons that Microsoft's API rejects or creates corrupted flows.
+    const triggerCount = Object.keys(fullDefinition.triggers).length;
+    const actionCount = Object.keys(fullDefinition.actions).length;
+
+    if (triggerCount === 0 && actionCount === 0) {
+      console.error(`[Flow] \u274c Rejected empty definition for '${displayName}' (0 triggers, 0 actions)`);
+      throw new Error(
+        `Invalid flow definition: both triggers and actions are empty. ` +
+        `A valid Power Automate flow requires at least one trigger (e.g., Recurrence, Request, ` +
+        `OpenApiConnection) and at least one action (e.g., Compose, HTTP, OpenApiConnection). ` +
+        `Please provide a complete workflow definition object.`
+      );
+    }
+
+    if (triggerCount === 0) {
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers \u2014 flow may not execute`);
+    }
+    if (actionCount === 0) {
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions \u2014 flow will do nothing when triggered`);
+    }
 
     // Build Flow Management API request body (properties envelope)
     const body: any = {
@@ -455,7 +503,7 @@ export class PowerPlatformClient {
     }
 
     console.log(`[Flow] Creating flow '${displayName}' in env ${envId} via Flow Management API`);
-    console.log(`[Flow] State: ${body.properties.state}, Definition: ${JSON.stringify(fullDefinition).length} chars`);
+    console.log(`[Flow] State: ${body.properties.state}, Definition: ${JSON.stringify(fullDefinition).length} chars, Triggers: ${triggerCount}, Actions: ${actionCount}`);
 
     // POST via delegated user token (or service principal fallback)
     const result = await this.userFlowRequest(
@@ -488,6 +536,7 @@ export class PowerPlatformClient {
    * Updates an existing Power Automate cloud flow via the Flow Management API.
    * Uses the authenticated user's delegated token to ensure proper authorization.
    *
+   * v3.0.1: Robust $schema injection (same pattern as createFlow).
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
   async updateFlow(
@@ -507,15 +556,21 @@ export class PowerPlatformClient {
     }
 
     if (updates.definition) {
-      body.properties.definition = updates.definition['$schema']
-        ? updates.definition
-        : {
-            '$schema': WORKFLOW_SCHEMA,
-            contentVersion: '1.0.0.0',
-            triggers: updates.definition.triggers || {},
-            actions: updates.definition.actions || {},
-            ...(updates.definition.parameters ? { parameters: updates.definition.parameters } : {}),
-          };
+      // Robust schema injection for updates too
+      const def = { ...updates.definition };
+      if (!def['$schema']) {
+        def['$schema'] = WORKFLOW_SCHEMA;
+      }
+      if (!def.contentVersion) {
+        def.contentVersion = '1.0.0.0';
+      }
+      if (!def.triggers) {
+        def.triggers = {};
+      }
+      if (!def.actions) {
+        def.actions = {};
+      }
+      body.properties.definition = def;
     }
 
     if (updates.connectionReferences) {
