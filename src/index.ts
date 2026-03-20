@@ -424,7 +424,7 @@ app.get('/health', (_req: Request, res: Response) => {
     auth: {
       azureAD: process.env.AZURE_CLIENT_ID ? 'configured' : 'missing',
       simtheoryAuth: process.env.SIMTHEORY_AUTH_TOKEN ? 'configured' : 'missing',
-      userAuth: userAuthManager.isConfigured() ? 'configured (dual-token mode)' : 'not configured',
+      userAuth: userAuthManager.isConfigured() ? 'configured (dual-token)' : 'not configured',
     },
   });
 });
@@ -583,7 +583,7 @@ app.listen(PORT, () => {
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
   console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
   console.log(`[Init] Write:  Delegated user token via Device Code Flow`);
-  console.log(`[Init] Auth:   ${userAuthManager.isConfigured() ? 'UserAuth configured (dual-token mode)' : 'UserAuth not configured (service-principal only)'}`);
+  console.log(`[Init] Auth:   ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
   console.log(`[Init] Tools:  ${toolDefs.length} (including Flow API-backed create + update)`);
   console.log('');
 });
