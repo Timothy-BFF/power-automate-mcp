@@ -293,35 +293,17 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows — WRITE Operations (Dataverse Web API)
+  // Flows — WRITE Operations (Flow Management API)
   // =========================================================================
   //
   // ARCHITECTURE NOTES:
-  // - Flow API does NOT support create/update with service principal auth
-  // - Dataverse Web API is the supported path for application-only auth
-  // - Identity mapping: workflowidunique bridges Dataverse ↔ Flow API
-  // - Propagation delay: 5-30s between Dataverse write and Flow API visibility
+  // - Write operations use /environments/ (NOT /scopes/admin/) path
+  // - This ensures flows are created/updated under the calling identity
+  // - Read operations continue to use /scopes/admin/ for admin visibility
   //
-  // CLIENTDATA FORMAT:
-  //   {
-  //     "properties": { "definition": {...}, "connectionReferences": {} },
-  //     "schemaVersion": "1.0.0.0"
-  //   }
-  //   - displayName in entity 'name' field ONLY
-  //   - schemaVersion REQUIRED at clientdata root
   // =========================================================================
 
   /**
-   * Creates a new Power Automate cloud flow via the Dataverse Web API.
-   *
-   * Post-creation workflow (per IT team recommendation):
-   *   1. POST workflow entity → get Dataverse workflowid
-   *   2. GET workflowidunique → resolve Flow API ID
-   *   3. Wait for propagation delay (5s)
-   *   4. Verify flow visible via Flow Management API
-   *   5. Return with full ID mapping + propagation status
-   */
-    /**
    * Creates a new Power Automate cloud flow via the Flow Management API.
    * This creates the flow directly in the Flow engine (not just Dataverse),
    * eliminating the propagation gap that caused FlowNotFound 404 errors.
@@ -362,7 +344,7 @@ export class PowerPlatformClient {
 
     // POST to Flow Management API — creates both Dataverse record AND Flow engine registration
     const result = await this.flowAdminRequest(
-      /providers/Microsoft.ProcessSimple/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
+      `/providers/Microsoft.ProcessSimple/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
       'POST',
       body
     );
@@ -385,9 +367,10 @@ export class PowerPlatformClient {
       _note: 'Created via Flow Management API — fully registered with Flow engine',
     };
   }
-    /**
+
+  /**
    * Updates an existing Power Automate cloud flow via the Flow Management API.
-   * Uses PATCH on the Flow Admin endpoint instead of Dataverse to ensure
+   * Uses PATCH on the standard endpoint instead of Dataverse to ensure
    * changes are immediately reflected in the Flow engine.
    */
   async updateFlow(
@@ -431,7 +414,7 @@ export class PowerPlatformClient {
     console.log(`[Flow] Update fields: ${updateFields}`);
 
     const result = await this.flowAdminRequest(
-      /providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
+      `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
       'PATCH',
       body
     );
