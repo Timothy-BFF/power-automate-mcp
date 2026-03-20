@@ -21,8 +21,8 @@ const VERSION = '3.0.0';
 // Core Services
 // =============================================================================
 const tokenManager = new AzureTokenManager();
-const client = new PowerPlatformClient(tokenManager);
-const userAuthManager = new UserAuthManager();
+const userAuthManager = new UserAuthManager();                          // BEFORE client
+const client = new PowerPlatformClient(tokenManager, userAuthManager);  // BOTH passed in
 
 // Pre-warm tokens (BAP + Flow + PowerApps scopes; Dataverse scope acquired on-demand)
 (async () => {
@@ -125,7 +125,7 @@ const toolDefs: ToolDefinition[] = [
   // ---- Tool 3: Create Flow ----
   {
     name: 'pa-create-flow',
-    description: 'Creates a new Power Automate cloud flow. Provide a display name and a workflow definition object containing triggers and actions. The definition follows the Azure Logic Apps workflow definition schema. Common trigger types: Recurrence, Request, OpenApiConnection. Common action types: Compose, HTTP, OpenApiConnection, Condition, ForEach, Scope. Flows are created in Stopped state by default for safety. Use pa-enable-disable-flow to start them after creation.',
+    description: 'Creates a new Power Automate cloud flow. Provide a display name and a workflow definition object containing triggers and actions. The definition follows the Azure Logic Apps workflow definition schema. Common trigger types: Recurrence, Request, OpenApiConnection. Common action types: Compose, HTTP, OpenApiConnection, Condition, ForEach, Scope. Flows are created in Stopped state by default for safety. Use pa-enable-disable-flow to start them after creation. IMPORTANT: This tool requires per-user authentication. If not authenticated, use pa-auth-start first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -145,10 +145,11 @@ const toolDefs: ToolDefinition[] = [
         const r = await client.createFlow(envId, p.displayName, p.definition, p.state || 'Stopped', p.connectionReferences);
         return ok({
           status: 'created',
-          flowId: r.name,
-          displayName: r.properties?.displayName || p.displayName,
-          state: r.properties?.state || p.state || 'Stopped',
+          flowId: r.name || r.flowId,
+          displayName: r.displayName || r.properties?.displayName || p.displayName,
+          state: r.state || r.properties?.state || p.state || 'Stopped',
           _source: r._source,
+          _authType: r._authType,
           _idMapping: r._idMapping,
         });
       } catch (e: any) { return fail(e.message); }
@@ -157,7 +158,7 @@ const toolDefs: ToolDefinition[] = [
   // ---- Tool 4: Update Flow ----
   {
     name: 'pa-update-flow',
-    description: 'Updates an existing Power Automate flow. Can modify the display name, workflow definition, state, and connection references. Provide only the properties you want to change. Definition updates must include the complete triggers and actions.',
+    description: 'Updates an existing Power Automate flow. Can modify the display name, workflow definition, state, and connection references. Provide only the properties you want to change. Definition updates must include the complete triggers and actions. IMPORTANT: This tool requires per-user authentication. If not authenticated, use pa-auth-start first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -185,6 +186,7 @@ const toolDefs: ToolDefinition[] = [
           flowId: p.flowId,
           updatedProperties: Object.keys(updates),
           _source: r._source,
+          _authType: r._authType,
         });
       } catch (e: any) { return fail(e.message); }
     },
@@ -361,10 +363,10 @@ const toolDefs: ToolDefinition[] = [
         return ok({ count: connections.length, environmentId: envId, connections });
       } catch (e: any) { return fail(e.message); }
     },
-    },
-   // === v3.0.0: Per-User Delegated Auth Tools ===
-      ...createV3AuthTools(userAuthManager),
-  ];
+  },
+  // === v3.0.0: Per-User Delegated Auth Tools ===
+  ...createV3AuthTools(userAuthManager),
+];
 
 // =============================================================================
 // MCP Server Setup (SSE transport)
@@ -422,6 +424,7 @@ app.get('/health', (_req: Request, res: Response) => {
     auth: {
       azureAD: process.env.AZURE_CLIENT_ID ? 'configured' : 'missing',
       simtheoryAuth: process.env.SIMTHEORY_AUTH_TOKEN ? 'configured' : 'missing',
+      userAuth: userAuthManager.isConfigured() ? 'configured (dual-token mode)' : 'not configured',
     },
   });
 });
@@ -579,8 +582,8 @@ app.listen(PORT, () => {
   console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
   console.log(`[Init] Health: http://localhost:${PORT}/health`);
   console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
-  console.log(`[Init] Write:  Flow Management API (create + update flows)`);
-  console.log(`[Init] ID:     Direct Flow API (no bridge needed)`);
+  console.log(`[Init] Write:  Delegated user token via Device Code Flow`);
+  console.log(`[Init] Auth:   ${userAuthManager.isConfigured() ? 'UserAuth configured (dual-token mode)' : 'UserAuth not configured (service-principal only)'}`);
   console.log(`[Init] Tools:  ${toolDefs.length} (including Flow API-backed create + update)`);
   console.log('');
 });
