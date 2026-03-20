@@ -21,7 +21,32 @@
 import axios from 'axios';
 
 // =========================================================================
-// Types
+// Exported Types (consumed by auth/index.ts, register-auth-tools.ts, etc.)
+// =========================================================================
+
+export interface AuthStartResult {
+  userCode: string;
+  verificationUri: string;
+  expiresIn: number;
+  message: string;
+}
+
+export interface AuthPollResult {
+  status: 'authenticated' | 'pending' | 'expired' | 'error';
+  message: string;
+  userId?: string;
+}
+
+export interface AuthStatusResult {
+  authenticated: boolean;
+  userId: string | null;
+  message: string;
+  pending: boolean;
+  authenticatedUsers: string[];
+}
+
+// =========================================================================
+// Internal Types
 // =========================================================================
 
 interface UserToken {
@@ -59,15 +84,23 @@ export class UserAuthManager {
   private tokens: Map<string, UserToken> = new Map();
   private pendingAuths: Map<string, PendingDeviceAuth> = new Map();
 
-  constructor(tenantId: string, clientId: string, scope?: string) {
-    this.tenantId = tenantId;
-    this.clientId = clientId;
+  /**
+   * Constructor — accepts optional args; falls back to environment variables.
+   * This makes it backward-compatible with existing code that calls new UserAuthManager().
+   */
+  constructor(tenantId?: string, clientId?: string, scope?: string) {
+    this.tenantId = tenantId || process.env.AZURE_TENANT_ID || '';
+    this.clientId = clientId || process.env.AZURE_CLIENT_ID || '';
     this.scope = scope || DEFAULT_SCOPE;
 
-    console.log('[UserAuth] Delegated auth configured (Device Code Flow)');
-    console.log(`[UserAuth]   Tenant: ${tenantId}`);
-    console.log(`[UserAuth]   Client: ${clientId.substring(0, 8)}...`);
-    console.log(`[UserAuth]   Scope: ${this.scope}`);
+    if (this.tenantId && this.clientId) {
+      console.log('[UserAuth] Delegated auth configured (Device Code Flow)');
+      console.log(`[UserAuth]   Tenant: ${this.tenantId}`);
+      console.log(`[UserAuth]   Client: ${this.clientId.substring(0, 8)}...`);
+      console.log(`[UserAuth]   Scope: ${this.scope}`);
+    } else {
+      console.warn('[UserAuth] Missing AZURE_TENANT_ID or AZURE_CLIENT_ID — device code flow disabled');
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -83,6 +116,18 @@ export class UserAuthManager {
   }
 
   // -----------------------------------------------------------------------
+  // Configuration Check
+  // -----------------------------------------------------------------------
+
+  /**
+   * Returns true if tenantId and clientId are configured.
+   * Used by v3-auth-tools.ts to check if device code flow is available.
+   */
+  isConfigured(): boolean {
+    return !!(this.tenantId && this.clientId);
+  }
+
+  // -----------------------------------------------------------------------
   // Device Code Flow: Start
   // -----------------------------------------------------------------------
 
@@ -92,12 +137,11 @@ export class UserAuthManager {
    *
    * @param userId - The user's email (e.g., jose@bolthousefresh.com)
    */
-  async startAuth(userId: string): Promise<{
-    userCode: string;
-    verificationUri: string;
-    expiresIn: number;
-    message: string;
-  }> {
+  async startAuth(userId: string): Promise<AuthStartResult> {
+    if (!this.isConfigured()) {
+      throw new Error('Device code flow not configured — AZURE_TENANT_ID and AZURE_CLIENT_ID required.');
+    }
+
     console.log(`[UserAuth] Starting device code flow for: ${userId}`);
 
     const params = new URLSearchParams({
@@ -147,11 +191,7 @@ export class UserAuthManager {
    *
    * @param userId - The user's email
    */
-  async pollAuth(userId: string): Promise<{
-    status: 'authenticated' | 'pending' | 'expired' | 'error';
-    message: string;
-    userId?: string;
-  }> {
+  async pollAuth(userId: string): Promise<AuthPollResult> {
     const pending = this.pendingAuths.get(userId);
     if (!pending) {
       // Already authenticated?
@@ -223,7 +263,7 @@ export class UserAuthManager {
       if (errorCode === 'slow_down') {
         return {
           status: 'pending',
-          message: 'Polling too fast \u2014 please wait a moment and try again.',
+          message: 'Polling too fast — please wait a moment and try again.',
         };
       }
 
@@ -235,7 +275,7 @@ export class UserAuthManager {
         };
       }
 
-      console.error(`[UserAuth] Poll error for ${userId}: ${errorCode} \u2014 ${errorDesc}`);
+      console.error(`[UserAuth] Poll error for ${userId}: ${errorCode} — ${errorDesc}`);
       return {
         status: 'error',
         message: `Authentication error: ${errorDesc || errorCode || error.message}`,
@@ -244,23 +284,16 @@ export class UserAuthManager {
   }
 
   // -----------------------------------------------------------------------
-  // Auth Status
+  // Auth Status (dual method names for backward compatibility)
   // -----------------------------------------------------------------------
 
   /**
    * Returns the current authentication status for a specific user or all users.
+   * Aliased as getStatus() for backward compatibility with register-auth-tools.ts
+   * and v3-auth-tools.ts.
    */
-  getAuthStatus(userId?: string): {
-    authenticated: boolean;
-    userId: string | null;
-    message: string;
-    pending: boolean;
-    authenticatedUsers: string[];
-  } {
-    const authenticatedUsers = Array.from(this.tokens.keys()).filter(uid => {
-      const t = this.tokens.get(uid)!;
-      return t.expiresAt > Date.now() || t.refreshToken;
-    });
+  getAuthStatus(userId?: string): AuthStatusResult {
+    const authenticatedUsers = this.listAuthenticatedUsers();
 
     if (userId) {
       const token = this.tokens.get(userId);
@@ -281,14 +314,14 @@ export class UserAuthManager {
         authenticated: false,
         userId,
         message: hasPending
-          ? `${userId} has a pending device code login \u2014 use pa-auth-poll to complete.`
+          ? `${userId} has a pending device code login — use pa-auth-poll to complete.`
           : `${userId} is not authenticated. Use pa-auth-start to begin.`,
         pending: hasPending,
         authenticatedUsers,
       };
     }
 
-    // No specific user \u2014 return general status
+    // No specific user — return general status
     return {
       authenticated: authenticatedUsers.length > 0,
       userId: authenticatedUsers[0] || null,
@@ -298,6 +331,13 @@ export class UserAuthManager {
       pending: this.pendingAuths.size > 0,
       authenticatedUsers,
     };
+  }
+
+  /**
+   * Alias for getAuthStatus() — called by register-auth-tools.ts and v3-auth-tools.ts.
+   */
+  getStatus(userId?: string): AuthStatusResult {
+    return this.getAuthStatus(userId);
   }
 
   // -----------------------------------------------------------------------
@@ -337,7 +377,7 @@ export class UserAuthManager {
 
       // Token expired and refresh failed or unavailable
       if (token.expiresAt < Date.now()) {
-        console.warn(`[UserAuth] Token expired for ${targetUser} \u2014 re-authentication required`);
+        console.warn(`[UserAuth] Token expired for ${targetUser} — re-authentication required`);
         this.tokens.delete(targetUser);
         return null;
       }
@@ -385,7 +425,7 @@ export class UserAuthManager {
   }
 
   // -----------------------------------------------------------------------
-  // Utility
+  // Utility Methods
   // -----------------------------------------------------------------------
 
   /**
@@ -398,6 +438,20 @@ export class UserAuthManager {
       }
     }
     return false;
+  }
+
+  /**
+   * Returns a list of all currently authenticated user IDs (emails).
+   * Called by register-auth-tools.ts and v3-auth-tools.ts.
+   */
+  listAuthenticatedUsers(): string[] {
+    const users: string[] = [];
+    for (const [userId, token] of this.tokens) {
+      if (token.expiresAt > Date.now() || token.refreshToken) {
+        users.push(userId);
+      }
+    }
+    return users;
   }
 
   /**
