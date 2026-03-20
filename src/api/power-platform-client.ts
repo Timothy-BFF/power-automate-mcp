@@ -19,7 +19,7 @@ const POWERAPPS_API_VER = '2016-11-01';
 
 const WORKFLOW_SCHEMA = 'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#';
 
-// Propagation delay settings (Dataverse write \u2192 Flow Management API visibility)
+// Propagation delay settings (Dataverse write -> Flow Management API visibility)
 // IT team confirmed: 5-30 seconds is typical. We use conservative defaults.
 const PROPAGATION_DELAY_MS = 5000;        // Initial wait after creation
 const PROPAGATION_RETRY_DELAY_MS = 5000;  // Delay between retries
@@ -37,6 +37,33 @@ const DATAVERSE_HEADERS: Record<string, string> = {
 // =========================================================================
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Ensures the workflow definition has the required $connections parameter.
+ * Power Automate requires parameters.$connections for any flow that uses
+ * connector-based triggers or actions (Recurrence, OpenApiConnection, etc.).
+ *
+ * v3.0.2: Auto-injected to prevent 400 InvalidPowerFlow errors.
+ */
+function ensureConnectionsParameter(definition: any): { definition: any; injected: boolean } {
+  const def = { ...definition };
+  let injected = false;
+
+  if (!def.parameters) {
+    def.parameters = {};
+    injected = true;
+  }
+
+  if (!def.parameters['$connections']) {
+    def.parameters['$connections'] = {
+      defaultValue: {},
+      type: 'Object',
+    };
+    injected = true;
+  }
+
+  return { definition: def, injected };
 }
 
 export class PowerPlatformClient {
@@ -63,7 +90,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Private Transport Methods \u2014 Service Principal (Read Operations)
+  // Private Transport Methods — Service Principal (Read Operations)
   // =========================================================================
 
   private async bapRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
@@ -161,7 +188,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Private Transport \u2014 Delegated User Token (Write Operations)
+  // Private Transport — Delegated User Token (Write Operations)
   // =========================================================================
 
   /**
@@ -174,7 +201,7 @@ export class PowerPlatformClient {
    *   3. Falls back to service principal (legacy behavior)
    *
    * Includes 401 retry with auto-refresh (same pattern as service principal).
-   * v3.0.1: Now logs error responses for server-side debugging.
+   * v3.0.1: Logs error responses for server-side debugging.
    */
   private async userFlowRequest(
     path: string,
@@ -184,7 +211,7 @@ export class PowerPlatformClient {
   ): Promise<any> {
     const url = path.startsWith('http') ? path : `${FLOW_BASE}${path}`;
 
-    // \u2014\u2014\u2014 Attempt 1: Delegated user token \u2014\u2014\u2014
+    // --- Attempt 1: Delegated user token ---
     if (this.userAuth) {
       const userToken = await this.userAuth.getAccessToken(userId);
       if (userToken) {
@@ -202,7 +229,7 @@ export class PowerPlatformClient {
           if (resp.status === 204) return { _status: 204, success: true };
           return resp.data;
         } catch (error: any) {
-          // \u2014\u2014\u2014 LOG THE ERROR (critical for debugging) \u2014\u2014\u2014
+          // --- LOG THE ERROR (critical for debugging) ---
           if (error.response) {
             console.error(`[Flow] \u274c Error ${error.response.status} on ${method} ${url} [delegated: ${resolvedUser}]`);
             console.error(`[Flow] Response body:`, JSON.stringify(error.response.data, null, 2));
@@ -210,7 +237,7 @@ export class PowerPlatformClient {
             console.error(`[Flow] Network error on ${method} ${url} [delegated: ${resolvedUser}]:`, error.message);
           }
 
-          // 401 \u2192 attempt token refresh + single retry
+          // 401 -> attempt token refresh + single retry
           if (error.response?.status === 401) {
             console.log(`[Flow] 401 on delegated request for ${resolvedUser}, attempting refresh...`);
             const freshToken = await this.userAuth.getAccessToken(userId);
@@ -238,7 +265,7 @@ export class PowerPlatformClient {
       console.log('[Flow] No delegated token available for write operation');
     }
 
-    // \u2014\u2014\u2014 Fallback: Service principal \u2014\u2014\u2014
+    // --- Fallback: Service principal ---
     console.log(`[Flow] ${method} ${url} [service-principal fallback]`);
     console.log('[Flow] \u26a0\ufe0f Write operations may require user auth \u2014 use pa-auth-start if this fails');
     return this.request(url, method, FLOW_SCOPE, data);
@@ -307,13 +334,13 @@ export class PowerPlatformClient {
    * Resolves the Flow Management API ID from a Dataverse workflowid.
    *
    * ARCHITECTURE BOUNDARY (confirmed by IT team):
-   *   Dataverse workflowid \u2260 Flow Management API flowId
+   *   Dataverse workflowid != Flow Management API flowId
    *   Bridge field: workflowidunique (in Dataverse workflow entity)
    *
    * Fallback chain:
    *   1. workflowidunique (primary bridge)
    *   2. resourceid (some environments)
-   *   3. Original workflowid (last resort \u2014 may cause 404)
+   *   3. Original workflowid (last resort — may cause 404)
    */
   private async resolveFlowApiId(
     envId: string,
@@ -343,7 +370,7 @@ export class PowerPlatformClient {
         return { flowApiId: resourceid, dataverseId: dataverseWorkflowId, resolvedVia: 'resourceid' };
       }
 
-      console.warn(`[IdResolver] No bridge field found \u2014 using Dataverse workflowid as fallback`);
+      console.warn(`[IdResolver] No bridge field found — using Dataverse workflowid as fallback`);
       return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId, resolvedVia: 'dataverse-workflowid' };
     } catch (error: any) {
       console.warn(`[IdResolver] Resolution failed: ${error.message}. Using fallback.`);
@@ -362,7 +389,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows \u2014 READ Operations (Flow Admin API \u2014 /scopes/admin/ path)
+  // Flows — READ Operations (Flow Admin API — /scopes/admin/ path)
   // =========================================================================
 
   async listFlows(envId: string, filter?: string, top?: number): Promise<any> {
@@ -404,7 +431,7 @@ export class PowerPlatformClient {
           continue;
         }
 
-        // Not a 404, or exhausted retries \u2014 throw
+        // Not a 404, or exhausted retries — throw
         throw error;
       }
     }
@@ -414,7 +441,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows \u2014 WRITE Operations (Delegated User Token)
+  // Flows — WRITE Operations (Delegated User Token)
   // =========================================================================
   //
   // ARCHITECTURE NOTES:
@@ -429,6 +456,12 @@ export class PowerPlatformClient {
   //   3. On 401: refresh + single retry (same pattern as service principal)
   //   4. Falls back to service principal if no user token available
   //
+  // DEFINITION AUTO-FIX (v3.0.2):
+  //   - $schema injection (v3.0.1)
+  //   - contentVersion injection (v3.0.1)
+  //   - Empty definition guard (v3.0.1)
+  //   - $connections parameter injection (v3.0.2) — prevents InvalidPowerFlow
+  //
   // =========================================================================
 
   /**
@@ -436,6 +469,7 @@ export class PowerPlatformClient {
    * Uses the authenticated user's delegated token to ensure the flow
    * is owned by that user's identity.
    *
+   * v3.0.2: Auto-injects $connections parameter to prevent InvalidPowerFlow errors.
    * v3.0.1: Robust $schema injection + empty definition validation.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
@@ -446,13 +480,9 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
-    // \u2014\u2014\u2014 Robust schema injection \u2014\u2014\u2014
+    // --- Robust schema injection ---
     // Always ensure $schema, contentVersion, triggers, and actions exist.
-    // Handles all edge cases:
-    //   - Agent sends complete definition with $schema \u2192 pass through, ensure contentVersion
-    //   - Agent sends {triggers, actions} without $schema \u2192 wrap with schema envelope
-    //   - Agent sends partial definition \u2192 fill in missing pieces
-    const fullDefinition = { ...definition };
+    let fullDefinition = { ...definition };
     if (!fullDefinition['$schema']) {
       fullDefinition['$schema'] = WORKFLOW_SCHEMA;
     }
@@ -466,9 +496,20 @@ export class PowerPlatformClient {
       fullDefinition.actions = {};
     }
 
-    // \u2014\u2014\u2014 Empty definition guard \u2014\u2014\u2014
+    // --- $connections parameter injection (v3.0.2) ---
+    // Power Automate requires parameters.$connections for flows with
+    // connector-based triggers/actions (Recurrence, OpenApiConnection, etc.).
+    // Without this, Microsoft returns 400 InvalidPowerFlow:
+    //   "The provided flow definition with a recurrent trigger is missing
+    //    the required parameter '$connections'."
+    const connResult = ensureConnectionsParameter(fullDefinition);
+    fullDefinition = connResult.definition;
+    if (connResult.injected) {
+      console.log(`[Flow] Auto-injected parameters.$connections into definition for '${displayName}'`);
+    }
+
+    // --- Empty definition guard ---
     // Reject definitions where BOTH triggers and actions are empty.
-    // These produce 173-char skeletons that Microsoft's API rejects or creates corrupted flows.
     const triggerCount = Object.keys(fullDefinition.triggers).length;
     const actionCount = Object.keys(fullDefinition.actions).length;
 
@@ -483,10 +524,10 @@ export class PowerPlatformClient {
     }
 
     if (triggerCount === 0) {
-      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers \u2014 flow may not execute`);
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers — flow may not execute`);
     }
     if (actionCount === 0) {
-      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions \u2014 flow will do nothing when triggered`);
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions — flow will do nothing when triggered`);
     }
 
     // Build Flow Management API request body (properties envelope)
@@ -528,7 +569,7 @@ export class PowerPlatformClient {
       connectionReferences: connectionReferences || {},
       _source: 'flow-management-api',
       _authType: this.userAuth?.hasAuthenticatedUser() ? 'delegated' : 'service-principal',
-      _note: 'Created via Flow Management API \u2014 fully registered with Flow engine',
+      _note: 'Created via Flow Management API — fully registered with Flow engine',
     };
   }
 
@@ -536,7 +577,8 @@ export class PowerPlatformClient {
    * Updates an existing Power Automate cloud flow via the Flow Management API.
    * Uses the authenticated user's delegated token to ensure proper authorization.
    *
-   * v3.0.1: Robust $schema injection (same pattern as createFlow).
+   * v3.0.2: Auto-injects $connections parameter (same as createFlow).
+   * v3.0.1: Robust $schema injection.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
   async updateFlow(
@@ -557,7 +599,7 @@ export class PowerPlatformClient {
 
     if (updates.definition) {
       // Robust schema injection for updates too
-      const def = { ...updates.definition };
+      let def = { ...updates.definition };
       if (!def['$schema']) {
         def['$schema'] = WORKFLOW_SCHEMA;
       }
@@ -570,6 +612,14 @@ export class PowerPlatformClient {
       if (!def.actions) {
         def.actions = {};
       }
+
+      // $connections parameter injection (v3.0.2)
+      const connResult = ensureConnectionsParameter(def);
+      def = connResult.definition;
+      if (connResult.injected) {
+        console.log(`[Flow] Auto-injected parameters.$connections into update definition for flow ${flowId}`);
+      }
+
       body.properties.definition = def;
     }
 
@@ -611,7 +661,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Management \u2014 LIFECYCLE (Flow Admin API)
+  // Flow Management — LIFECYCLE (Flow Admin API)
   // =========================================================================
 
   async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop'): Promise<any> {
