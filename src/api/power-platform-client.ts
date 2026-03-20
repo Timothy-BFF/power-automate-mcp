@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { AzureTokenManager } from '../auth/azure-token-manager.js';
+import { UserAuthManager } from '../auth/user-auth-manager.js';
 
 // =========================================================================
 // API Configuration Constants
@@ -18,7 +19,7 @@ const POWERAPPS_API_VER = '2016-11-01';
 
 const WORKFLOW_SCHEMA = 'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#';
 
-// Propagation delay settings (Dataverse write → Flow Management API visibility)
+// Propagation delay settings (Dataverse write \u2192 Flow Management API visibility)
 // IT team confirmed: 5-30 seconds is typical. We use conservative defaults.
 const PROPAGATION_DELAY_MS = 5000;        // Initial wait after creation
 const PROPAGATION_RETRY_DELAY_MS = 5000;  // Delay between retries
@@ -40,14 +41,29 @@ function sleep(ms: number): Promise<void> {
 
 export class PowerPlatformClient {
   private tm: AzureTokenManager;
+  private userAuth: UserAuthManager | null;
   private dataverseUrlCache: Map<string, string | null> = new Map();
 
-  constructor(tokenManager: AzureTokenManager) {
+  constructor(tokenManager: AzureTokenManager, userAuthManager?: UserAuthManager) {
     this.tm = tokenManager;
+    this.userAuth = userAuthManager || null;
+
+    if (this.userAuth) {
+      console.log('[PowerPlatformClient] Dual-token mode: service principal (read) + delegated user (write)');
+    }
+  }
+
+  /**
+   * Connect a UserAuthManager after construction.
+   * Enables delegated user tokens for write operations (createFlow, updateFlow).
+   */
+  setUserAuthManager(userAuth: UserAuthManager): void {
+    this.userAuth = userAuth;
+    console.log('[PowerPlatformClient] User auth manager connected for delegated write operations');
   }
 
   // =========================================================================
-  // Private Transport Methods
+  // Private Transport Methods \u2014 Service Principal (Read Operations)
   // =========================================================================
 
   private async bapRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
@@ -145,6 +161,96 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
+  // Private Transport \u2014 Delegated User Token (Write Operations)
+  // =========================================================================
+
+  /**
+   * Makes an authenticated request using a delegated user token.
+   * Used for write operations (create/update flows) that require user identity.
+   *
+   * Token resolution order:
+   *   1. Specific userId's token (if provided)
+   *   2. Most recently authenticated user's token (auto-resolve)
+   *   3. Falls back to service principal (legacy behavior)
+   *
+   * Includes 401 retry with auto-refresh (same pattern as service principal).
+   */
+  private async userFlowRequest(
+    path: string,
+    method: string = 'GET',
+    data?: any,
+    userId?: string
+  ): Promise<any> {
+    const url = path.startsWith('http') ? path : `${FLOW_BASE}${path}`;
+
+    // \u2014\u2014\u2014 Attempt 1: Delegated user token \u2014\u2014\u2014
+    if (this.userAuth) {
+      const userToken = await this.userAuth.getAccessToken(userId);
+      if (userToken) {
+        const resolvedUser = userId || this.userAuth.getDefaultUserId() || 'delegated-user';
+        console.log(`[Flow] ${method} ${url} [delegated: ${resolvedUser}]`);
+
+        const headers: Record<string, string> = {
+          'Authorization': `Bearer ${userToken}`,
+          'Content-Type': 'application/json',
+        };
+
+        try {
+          const resp = await axios({ method, url, data, headers });
+          if (resp.status === 204) return { _status: 204, success: true };
+          return resp.data;
+        } catch (error: any) {
+          // 401 \u2192 attempt token refresh + single retry
+          if (error.response?.status === 401) {
+            console.log(`[Flow] 401 on delegated request for ${resolvedUser}, attempting refresh...`);
+            const freshToken = await this.userAuth.getAccessToken(userId);
+            if (freshToken && freshToken !== userToken) {
+              headers['Authorization'] = `Bearer ${freshToken}`;
+              try {
+                const retry = await axios({ method, url, data, headers });
+                if (retry.status === 204) return { _status: 204, success: true };
+                return retry.data;
+              } catch (retryError: any) {
+                throw this.fmtWriteErr(retryError);
+              }
+            }
+          }
+          throw this.fmtWriteErr(error);
+        }
+      }
+
+      // UserAuth exists but no token available
+      console.log('[Flow] No delegated token available for write operation');
+    }
+
+    // \u2014\u2014\u2014 Fallback: Service principal \u2014\u2014\u2014
+    console.log(`[Flow] ${method} ${url} [service-principal fallback]`);
+    console.log('[Flow] \u26a0\ufe0f Write operations may require user auth \u2014 use pa-auth-start if this fails');
+    return this.request(url, method, FLOW_SCOPE, data);
+  }
+
+  /**
+   * Format error for write operations with auth guidance.
+   */
+  private fmtWriteErr(error: any): Error {
+    if (error.response) {
+      const status = error.response.status;
+      const data = error.response.data;
+      const msg = data?.error?.message || data?.error?.code || data?.message || JSON.stringify(data);
+
+      if (status === 401 || status === 403) {
+        return new Error(
+          `API Error ${status}: ${msg}\n\n` +
+          `This write operation requires delegated user authentication.\n` +
+          `Use pa-auth-start to authenticate with your Microsoft account, then try again.`
+        );
+      }
+      return new Error(`API Error ${status}: ${msg}`);
+    }
+    return new Error(`Request failed: ${error.message}`);
+  }
+
+  // =========================================================================
   // Dataverse URL Discovery (cached per environment)
   // =========================================================================
 
@@ -186,13 +292,13 @@ export class PowerPlatformClient {
    * Resolves the Flow Management API ID from a Dataverse workflowid.
    *
    * ARCHITECTURE BOUNDARY (confirmed by IT team):
-   *   Dataverse workflowid ≠ Flow Management API flowId
+   *   Dataverse workflowid \u2260 Flow Management API flowId
    *   Bridge field: workflowidunique (in Dataverse workflow entity)
    *
    * Fallback chain:
    *   1. workflowidunique (primary bridge)
    *   2. resourceid (some environments)
-   *   3. Original workflowid (last resort — may cause 404)
+   *   3. Original workflowid (last resort \u2014 may cause 404)
    */
   private async resolveFlowApiId(
     envId: string,
@@ -222,7 +328,7 @@ export class PowerPlatformClient {
         return { flowApiId: resourceid, dataverseId: dataverseWorkflowId, resolvedVia: 'resourceid' };
       }
 
-      console.warn(`[IdResolver] No bridge field found — using Dataverse workflowid as fallback`);
+      console.warn(`[IdResolver] No bridge field found \u2014 using Dataverse workflowid as fallback`);
       return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId, resolvedVia: 'dataverse-workflowid' };
     } catch (error: any) {
       console.warn(`[IdResolver] Resolution failed: ${error.message}. Using fallback.`);
@@ -241,7 +347,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows — READ Operations (Flow Admin API — /scopes/admin/ path)
+  // Flows \u2014 READ Operations (Flow Admin API \u2014 /scopes/admin/ path)
   // =========================================================================
 
   async listFlows(envId: string, filter?: string, top?: number): Promise<any> {
@@ -283,7 +389,7 @@ export class PowerPlatformClient {
           continue;
         }
 
-        // Not a 404, or exhausted retries — throw
+        // Not a 404, or exhausted retries \u2014 throw
         throw error;
       }
     }
@@ -293,20 +399,29 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows — WRITE Operations (Flow Management API)
+  // Flows \u2014 WRITE Operations (Delegated User Token)
   // =========================================================================
   //
   // ARCHITECTURE NOTES:
-  // - Write operations use /environments/ (NOT /scopes/admin/) path
-  // - This ensures flows are created/updated under the calling identity
-  // - Read operations continue to use /scopes/admin/ for admin visibility
+  // - Write operations (create/update) use delegated user tokens via Device Code Flow
+  // - This ensures flows are owned by the user who created them
+  // - If no user is authenticated, falls back to service principal (may fail)
+  // - Users authenticate once via pa-auth-start, refresh tokens last ~90 days
+  //
+  // TOKEN RESOLUTION:
+  //   1. userFlowRequest() checks UserAuthManager for a valid delegated token
+  //   2. Auto-refreshes if < 5 min remaining (transparent to caller)
+  //   3. On 401: refresh + single retry (same pattern as service principal)
+  //   4. Falls back to service principal if no user token available
   //
   // =========================================================================
 
   /**
    * Creates a new Power Automate cloud flow via the Flow Management API.
-   * This creates the flow directly in the Flow engine (not just Dataverse),
-   * eliminating the propagation gap that caused FlowNotFound 404 errors.
+   * Uses the authenticated user's delegated token to ensure the flow
+   * is owned by that user's identity.
+   *
+   * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
   async createFlow(
     envId: string,
@@ -342,8 +457,8 @@ export class PowerPlatformClient {
     console.log(`[Flow] Creating flow '${displayName}' in env ${envId} via Flow Management API`);
     console.log(`[Flow] State: ${body.properties.state}, Definition: ${JSON.stringify(fullDefinition).length} chars`);
 
-    // POST to Flow Management API — creates both Dataverse record AND Flow engine registration
-    const result = await this.flowAdminRequest(
+    // POST via delegated user token (or service principal fallback)
+    const result = await this.userFlowRequest(
       `/providers/Microsoft.ProcessSimple/environments/${envId}/flows?api-version=${FLOW_API_VER}`,
       'POST',
       body
@@ -353,7 +468,7 @@ export class PowerPlatformClient {
     const flowDisplayName = result?.properties?.displayName || displayName;
     const flowState = result?.properties?.state || state;
 
-    console.log(`[Flow] ✅ Flow created: ${flowId} (${flowDisplayName})`);
+    console.log(`[Flow] \u2705 Flow created: ${flowId} (${flowDisplayName})`);
 
     return {
       status: 'created',
@@ -364,14 +479,16 @@ export class PowerPlatformClient {
       definition: fullDefinition,
       connectionReferences: connectionReferences || {},
       _source: 'flow-management-api',
-      _note: 'Created via Flow Management API — fully registered with Flow engine',
+      _authType: this.userAuth?.hasAuthenticatedUser() ? 'delegated' : 'service-principal',
+      _note: 'Created via Flow Management API \u2014 fully registered with Flow engine',
     };
   }
 
   /**
    * Updates an existing Power Automate cloud flow via the Flow Management API.
-   * Uses PATCH on the standard endpoint instead of Dataverse to ensure
-   * changes are immediately reflected in the Flow engine.
+   * Uses the authenticated user's delegated token to ensure proper authorization.
+   *
+   * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
   async updateFlow(
     envId: string,
@@ -413,7 +530,8 @@ export class PowerPlatformClient {
     console.log(`[Flow] Updating flow ${flowId} in env ${envId} via Flow Management API`);
     console.log(`[Flow] Update fields: ${updateFields}`);
 
-    const result = await this.flowAdminRequest(
+    // PATCH via delegated user token (or service principal fallback)
+    const result = await this.userFlowRequest(
       `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`,
       'PATCH',
       body
@@ -422,7 +540,7 @@ export class PowerPlatformClient {
     const updatedDisplayName = result?.properties?.displayName || updates.displayName;
     const updatedState = result?.properties?.state || updates.state;
 
-    console.log(`[Flow] ✅ Flow updated: ${flowId}`);
+    console.log(`[Flow] \u2705 Flow updated: ${flowId}`);
 
     return {
       name: result?.name || flowId,
@@ -432,12 +550,13 @@ export class PowerPlatformClient {
         ...(updates.definition ? { definition: updates.definition } : {}),
       },
       _source: 'flow-management-api',
+      _authType: this.userAuth?.hasAuthenticatedUser() ? 'delegated' : 'service-principal',
       _raw: result,
     };
   }
 
   // =========================================================================
-  // Flow Management — LIFECYCLE (Flow Admin API)
+  // Flow Management \u2014 LIFECYCLE (Flow Admin API)
   // =========================================================================
 
   async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop'): Promise<any> {

@@ -1,491 +1,423 @@
 /**
- * UserAuthManager — Per-user delegated authentication via OAuth 2.0 Device Code Flow.
+ * UserAuthManager — Per-user OAuth 2.0 Device Code Flow
  *
- * Ported from Power Interpreter MCP's MSAuthManager (Python) to TypeScript.
- * Handles the full device code lifecycle: initiate → poll → token store → auto-refresh.
+ * Ported from Power Interpreter's MSAuthManager (Python) to TypeScript.
+ * Provides delegated authentication for Flow Management API write operations.
  *
- * Token storage: In-memory (survives for the lifetime of the process).
- * Future: PostgreSQL persistence (same pattern as Power Interpreter).
+ * Architecture:
+ *   - Each user authenticates via microsoft.com/devicelogin
+ *   - Tokens stored in-memory per userId (email)
+ *   - Auto-refresh when < 5 minutes remaining
+ *   - Refresh tokens valid for ~90 days
  *
- * @version 3.0.1
+ * Integration with PowerPlatformClient:
+ *   - getAccessToken(userId?) returns a valid bearer token
+ *   - Auto-resolves to most recently authenticated user if no userId specified
+ *   - Used by createFlow() and updateFlow() for delegated write operations
+ *
+ * @version 2.0.0
  */
 
 import axios from 'axios';
 
-// =============================================================================
-// Interfaces
-// =============================================================================
+// =========================================================================
+// Types
+// =========================================================================
 
-/** Mapped from Azure AD device code endpoint response (snake_case → camelCase) */
-interface DeviceCodeResponse {
-  deviceCode: string;
-  userCode: string;
-  verificationUri: string;
-  expiresIn: number;
-  interval: number;
-  message: string;
-}
-
-/** Mapped from Azure AD token endpoint response (snake_case → camelCase) */
-interface TokenResponse {
+interface UserToken {
   accessToken: string;
-  refreshToken?: string;
-  expiresIn: number;
-  tokenType: string;
-  scope?: string;
-}
-
-/** Per-user token data stored in memory */
-interface UserTokenData {
-  accessToken: string;
-  refreshToken?: string;
-  expiresAt: number; // Unix timestamp (ms)
+  refreshToken: string | null;
+  expiresAt: number;
   userId: string;
-  acquiredAt: number; // Unix timestamp (ms)
+  acquiredAt: number;
 }
 
-/** Tracks a pending device code auth flow */
-interface PendingAuth {
+interface PendingDeviceAuth {
   deviceCode: string;
   userCode: string;
   verificationUri: string;
-  expiresAt: number; // Unix timestamp (ms)
+  expiresAt: number;
   interval: number;
   userId: string;
 }
 
-/** Result returned by startAuth */
-export interface AuthStartResult {
-  userCode: string;
-  verificationUri: string;
-  expiresIn: number;
-  message: string;
-}
-
-/** Result returned by pollAuth */
-export interface AuthPollResult {
-  status: 'authenticated' | 'pending' | 'expired' | 'error';
-  message: string;
-  userId?: string;
-}
-
-/** Result returned by getStatus */
-export interface AuthStatusResult {
-  authenticated: boolean;
-  message: string;
-  userId?: string;
-  expiresIn?: number;
-}
-
-// =============================================================================
+// =========================================================================
 // Constants
-// =============================================================================
+// =========================================================================
 
-const FLOW_SCOPE = 'https://service.flow.microsoft.com/.default offline_access';
-const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // Refresh if < 5 min remaining
+const REFRESH_BUFFER_MS = 5 * 60 * 1000;  // Refresh when < 5 min remaining
+const DEFAULT_SCOPE = 'https://service.flow.microsoft.com/.default offline_access';
 
-// =============================================================================
+// =========================================================================
 // UserAuthManager
-// =============================================================================
+// =========================================================================
 
 export class UserAuthManager {
-  private tokens: Map<string, UserTokenData> = new Map();
-  private pendingAuths: Map<string, PendingAuth> = new Map();
-  private clientId: string;
   private tenantId: string;
+  private clientId: string;
+  private scope: string;
+  private tokens: Map<string, UserToken> = new Map();
+  private pendingAuths: Map<string, PendingDeviceAuth> = new Map();
 
-  constructor() {
-    this.clientId = process.env.PA_USER_CLIENT_ID || '';
-    this.tenantId = process.env.PA_USER_TENANT_ID || process.env.AZURE_TENANT_ID || '';
+  constructor(tenantId: string, clientId: string, scope?: string) {
+    this.tenantId = tenantId;
+    this.clientId = clientId;
+    this.scope = scope || DEFAULT_SCOPE;
 
-    if (this.clientId && this.tenantId) {
-      console.log('[UserAuth] Delegated auth configured (Device Code Flow)');
-      console.log(`[UserAuth]   Tenant: ${this.tenantId}`);
-      console.log(`[UserAuth]   Client: ${this.clientId.substring(0, 8)}...`);
-      console.log(`[UserAuth]   Scope:  ${FLOW_SCOPE}`);
-    } else {
-      console.warn('[UserAuth] Delegated auth NOT configured — missing PA_USER_CLIENT_ID or PA_USER_TENANT_ID');
-      console.warn('[UserAuth] Auth tools will be registered but will return configuration errors');
-    }
+    console.log('[UserAuth] Delegated auth configured (Device Code Flow)');
+    console.log(`[UserAuth]   Tenant: ${tenantId}`);
+    console.log(`[UserAuth]   Client: ${clientId.substring(0, 8)}...`);
+    console.log(`[UserAuth]   Scope: ${this.scope}`);
   }
 
-  // ===========================================================================
-  // Public: Configuration Check
-  // ===========================================================================
+  // -----------------------------------------------------------------------
+  // Azure AD Endpoints
+  // -----------------------------------------------------------------------
 
-  /** Returns true if the required env vars are set */
-  isConfigured(): boolean {
-    return !!(this.clientId && this.tenantId);
+  private get tokenEndpoint(): string {
+    return `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/token`;
   }
 
-  // ===========================================================================
-  // Public: Start Device Code Flow
-  // ===========================================================================
+  private get deviceCodeEndpoint(): string {
+    return `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/devicecode`;
+  }
 
-  async startAuth(userId: string): Promise<AuthStartResult> {
-    if (!this.isConfigured()) {
-      throw new Error(
-        'Delegated auth not configured. Set PA_USER_CLIENT_ID and PA_USER_TENANT_ID environment variables.'
-      );
-    }
+  // -----------------------------------------------------------------------
+  // Device Code Flow: Start
+  // -----------------------------------------------------------------------
 
-    const normalizedId = userId.toLowerCase().trim();
-    console.log(`[UserAuth] Starting device code flow for: ${normalizedId}`);
+  /**
+   * Initiates the OAuth 2.0 Device Code Flow for a specific user.
+   * Returns a user_code and verification_uri for the user to complete sign-in.
+   *
+   * @param userId - The user's email (e.g., jose@bolthousefresh.com)
+   */
+  async startAuth(userId: string): Promise<{
+    userCode: string;
+    verificationUri: string;
+    expiresIn: number;
+    message: string;
+  }> {
+    console.log(`[UserAuth] Starting device code flow for: ${userId}`);
 
-    const url = `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/devicecode`;
-
-    const response = await axios.post(
-      url,
-      new URLSearchParams({
-        client_id: this.clientId,
-        scope: FLOW_SCOPE,
-      }).toString(),
-      {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      }
-    );
-
-    // Azure AD returns snake_case — map to our camelCase interface
-    const raw = response.data;
-    const deviceCode: DeviceCodeResponse = {
-      deviceCode: raw.device_code,
-      userCode: raw.user_code,
-      verificationUri: raw.verification_uri,
-      expiresIn: raw.expires_in,
-      interval: raw.interval || 5,
-      message: raw.message,
-    };
-
-    // Store pending auth
-    this.pendingAuths.set(normalizedId, {
-      deviceCode: deviceCode.deviceCode,
-      userCode: deviceCode.userCode,
-      verificationUri: deviceCode.verificationUri,
-      expiresAt: Date.now() + deviceCode.expiresIn * 1000,
-      interval: deviceCode.interval,
-      userId: normalizedId,
+    const params = new URLSearchParams({
+      client_id: this.clientId,
+      scope: this.scope,
     });
-
-    console.log(`[UserAuth] Device code issued for ${normalizedId}: ${deviceCode.userCode}`);
-    console.log(`[UserAuth] Verification URL: ${deviceCode.verificationUri}`);
-    console.log(`[UserAuth] Expires in: ${deviceCode.expiresIn}s`);
-
-    return {
-      userCode: deviceCode.userCode,
-      verificationUri: deviceCode.verificationUri,
-      expiresIn: deviceCode.expiresIn,
-      message: deviceCode.message,
-    };
-  }
-
-  // ===========================================================================
-  // Public: Poll for Auth Completion
-  // ===========================================================================
-
-  async pollAuth(userId?: string): Promise<AuthPollResult> {
-    if (!this.isConfigured()) {
-      throw new Error('Delegated auth not configured.');
-    }
-
-    const resolvedId = this.resolvePendingUserId(userId);
-    if (!resolvedId) {
-      return {
-        status: 'error',
-        message: userId
-          ? `No pending authentication for user: ${userId}`
-          : 'No pending authentication found. Call pa-auth-start first.',
-      };
-    }
-
-    const pending = this.pendingAuths.get(resolvedId)!;
-
-    // Check expiry
-    if (Date.now() > pending.expiresAt) {
-      this.pendingAuths.delete(resolvedId);
-      return {
-        status: 'expired',
-        message: 'Device code expired. Call pa-auth-start to begin a new authentication.',
-        userId: resolvedId,
-      };
-    }
-
-    // Poll Azure AD token endpoint
-    const url = `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/token`;
 
     try {
-      const response = await axios.post(
-        url,
-        new URLSearchParams({
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-          client_id: this.clientId,
-          device_code: pending.deviceCode,
-        }).toString(),
-        {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          validateStatus: () => true, // Don't throw on 400 (pending)
-        }
-      );
+      const response = await axios.post(this.deviceCodeEndpoint, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
 
-      if (response.status === 200) {
-        // Azure AD returns snake_case — map to camelCase
-        const raw = response.data;
-        const tokenData: TokenResponse = {
-          accessToken: raw.access_token,
-          refreshToken: raw.refresh_token,
-          expiresIn: raw.expires_in,
-          tokenType: raw.token_type,
-          scope: raw.scope,
-        };
+      const data = response.data;
 
-        // Store token
-        this.tokens.set(resolvedId, {
-          accessToken: tokenData.accessToken,
-          refreshToken: tokenData.refreshToken,
-          expiresAt: Date.now() + tokenData.expiresIn * 1000,
-          userId: resolvedId,
-          acquiredAt: Date.now(),
-        });
+      // Store pending auth state
+      this.pendingAuths.set(userId, {
+        deviceCode: data.device_code,
+        userCode: data.user_code,
+        verificationUri: data.verification_uri,
+        expiresAt: Date.now() + (data.expires_in * 1000),
+        interval: data.interval || 5,
+        userId,
+      });
 
-        // Clean up pending
-        this.pendingAuths.delete(resolvedId);
+      console.log(`[UserAuth] Device code issued for ${userId}: ${data.user_code}`);
 
-        console.log(`[UserAuth] ✅ Authentication complete for: ${resolvedId}`);
-        console.log(`[UserAuth]   Token expires in: ${tokenData.expiresIn}s`);
-        console.log(`[UserAuth]   Refresh token: ${tokenData.refreshToken ? 'present' : 'none'}`);
+      return {
+        userCode: data.user_code,
+        verificationUri: data.verification_uri,
+        expiresIn: data.expires_in,
+        message: data.message || `To sign in, visit ${data.verification_uri} and enter code: ${data.user_code}`,
+      };
+    } catch (error: any) {
+      const msg = error.response?.data?.error_description || error.message;
+      console.error(`[UserAuth] Device code request failed: ${msg}`);
+      throw new Error(`Failed to start authentication: ${msg}`);
+    }
+  }
 
+  // -----------------------------------------------------------------------
+  // Device Code Flow: Poll
+  // -----------------------------------------------------------------------
+
+  /**
+   * Polls Azure AD to check if the user has completed device code sign-in.
+   * Returns 'authenticated' on success, 'pending' while waiting, or 'expired'/'error'.
+   *
+   * @param userId - The user's email
+   */
+  async pollAuth(userId: string): Promise<{
+    status: 'authenticated' | 'pending' | 'expired' | 'error';
+    message: string;
+    userId?: string;
+  }> {
+    const pending = this.pendingAuths.get(userId);
+    if (!pending) {
+      // Already authenticated?
+      if (this.tokens.has(userId)) {
         return {
           status: 'authenticated',
-          message: `Successfully authenticated as ${resolvedId}. Write operations are now available.`,
-          userId: resolvedId,
+          message: `${userId} is already authenticated.`,
+          userId,
         };
       }
-
-      // 400 with authorization_pending = user hasn't completed login yet
-      if (response.data?.error === 'authorization_pending') {
-        return {
-          status: 'pending',
-          message: `Waiting for user to complete login at ${pending.verificationUri} with code ${pending.userCode}`,
-          userId: resolvedId,
-        };
-      }
-
-      // 400 with slow_down = polling too fast
-      if (response.data?.error === 'slow_down') {
-        return {
-          status: 'pending',
-          message: 'Polling too fast. Please wait a few more seconds before trying again.',
-          userId: resolvedId,
-        };
-      }
-
-      // Other errors
-      const errorDesc = response.data?.error_description || response.data?.error || 'Unknown error';
-      console.error(`[UserAuth] Auth poll error for ${resolvedId}: ${errorDesc}`);
       return {
         status: 'error',
-        message: `Authentication error: ${errorDesc}`,
-        userId: resolvedId,
+        message: `No pending authentication for ${userId}. Use pa-auth-start first.`,
       };
-    } catch (e: any) {
-      console.error(`[UserAuth] Network error during poll for ${resolvedId}: ${e.message}`);
+    }
+
+    // Check if device code expired
+    if (Date.now() > pending.expiresAt) {
+      this.pendingAuths.delete(userId);
+      return {
+        status: 'expired',
+        message: 'Device code expired. Please start a new authentication with pa-auth-start.',
+      };
+    }
+
+    try {
+      const params = new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        client_id: this.clientId,
+        device_code: pending.deviceCode,
+      });
+
+      const response = await axios.post(this.tokenEndpoint, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+
+      const data = response.data;
+
+      // Success — store the token
+      this.tokens.set(userId, {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token || null,
+        expiresAt: Date.now() + (data.expires_in * 1000),
+        userId,
+        acquiredAt: Date.now(),
+      });
+
+      this.pendingAuths.delete(userId);
+
+      console.log(`[UserAuth] \u2705 ${userId} authenticated successfully`);
+      console.log(`[UserAuth]   Token TTL: ${data.expires_in}s, Refresh token: ${data.refresh_token ? 'yes' : 'no'}`);
+
+      return {
+        status: 'authenticated',
+        message: `Successfully authenticated as ${userId}. You can now create and update flows.`,
+        userId,
+      };
+    } catch (error: any) {
+      const errorCode = error.response?.data?.error;
+      const errorDesc = error.response?.data?.error_description || '';
+
+      if (errorCode === 'authorization_pending') {
+        return {
+          status: 'pending',
+          message: 'Waiting for user to complete sign-in at microsoft.com/devicelogin...',
+        };
+      }
+
+      if (errorCode === 'slow_down') {
+        return {
+          status: 'pending',
+          message: 'Polling too fast \u2014 please wait a moment and try again.',
+        };
+      }
+
+      if (errorCode === 'expired_token') {
+        this.pendingAuths.delete(userId);
+        return {
+          status: 'expired',
+          message: 'Device code expired. Please start a new authentication with pa-auth-start.',
+        };
+      }
+
+      console.error(`[UserAuth] Poll error for ${userId}: ${errorCode} \u2014 ${errorDesc}`);
       return {
         status: 'error',
-        message: `Network error during authentication: ${e.message}`,
-        userId: resolvedId,
+        message: `Authentication error: ${errorDesc || errorCode || error.message}`,
       };
     }
   }
 
-  // ===========================================================================
-  // Public: Get Access Token (with auto-refresh)
-  // ===========================================================================
+  // -----------------------------------------------------------------------
+  // Auth Status
+  // -----------------------------------------------------------------------
 
-  async getAccessToken(userId?: string): Promise<string | null> {
-    const resolvedId = this.resolveTokenUserId(userId);
-    if (!resolvedId) return null;
+  /**
+   * Returns the current authentication status for a specific user or all users.
+   */
+  getAuthStatus(userId?: string): {
+    authenticated: boolean;
+    userId: string | null;
+    message: string;
+    pending: boolean;
+    authenticatedUsers: string[];
+  } {
+    const authenticatedUsers = Array.from(this.tokens.keys()).filter(uid => {
+      const t = this.tokens.get(uid)!;
+      return t.expiresAt > Date.now() || t.refreshToken;
+    });
 
-    const tokenData = this.tokens.get(resolvedId);
-    if (!tokenData) return null;
+    if (userId) {
+      const token = this.tokens.get(userId);
+      const hasPending = this.pendingAuths.has(userId);
 
-    // Check if token needs refresh (< 5 min remaining)
-    const timeRemaining = tokenData.expiresAt - Date.now();
-    if (timeRemaining < TOKEN_REFRESH_BUFFER_MS) {
-      console.log(`[UserAuth] Token for ${resolvedId} expiring in ${Math.floor(timeRemaining / 1000)}s — refreshing`);
-
-      if (tokenData.refreshToken) {
-        try {
-          await this.refreshUserToken(resolvedId);
-          const refreshed = this.tokens.get(resolvedId);
-          if (refreshed) return refreshed.accessToken;
-        } catch (e: any) {
-          console.error(`[UserAuth] Refresh failed for ${resolvedId}: ${e.message}`);
-          // Token expired and refresh failed — user must re-authenticate
-          this.tokens.delete(resolvedId);
-          return null;
-        }
-      } else {
-        // No refresh token — token will expire
-        if (timeRemaining <= 0) {
-          console.warn(`[UserAuth] Token expired for ${resolvedId} — no refresh token`);
-          this.tokens.delete(resolvedId);
-          return null;
-        }
-      }
-    }
-
-    return tokenData.accessToken;
-  }
-
-  // ===========================================================================
-  // Public: Status Check
-  // ===========================================================================
-
-  getStatus(userId?: string): AuthStatusResult {
-    if (!this.isConfigured()) {
-      return {
-        authenticated: false,
-        message: 'Delegated auth not configured. Set PA_USER_CLIENT_ID and PA_USER_TENANT_ID.',
-      };
-    }
-
-    const resolvedId = this.resolveTokenUserId(userId);
-
-    if (!resolvedId) {
-      // Check if there's a pending auth
-      if (this.pendingAuths.size > 0) {
-        const pending = Array.from(this.pendingAuths.values())[0];
+      if (token && (token.expiresAt > Date.now() || token.refreshToken)) {
+        const minutesLeft = Math.max(0, Math.round((token.expiresAt - Date.now()) / 60000));
         return {
-          authenticated: false,
-          message: `Authentication pending for ${pending.userId}. Visit ${pending.verificationUri} and enter code ${pending.userCode}.`,
-          userId: pending.userId,
+          authenticated: true,
+          userId,
+          message: `${userId} is authenticated (expires in ${minutesLeft} min, refresh: ${token.refreshToken ? 'available' : 'none'})`,
+          pending: false,
+          authenticatedUsers,
         };
       }
 
       return {
         authenticated: false,
-        message: 'No users authenticated. Use pa-auth-start to begin device code login.',
+        userId,
+        message: hasPending
+          ? `${userId} has a pending device code login \u2014 use pa-auth-poll to complete.`
+          : `${userId} is not authenticated. Use pa-auth-start to begin.`,
+        pending: hasPending,
+        authenticatedUsers,
       };
     }
 
-    const tokenData = this.tokens.get(resolvedId);
-    if (!tokenData) {
-      return {
-        authenticated: false,
-        message: `No token found for ${resolvedId}.`,
-        userId: resolvedId,
-      };
-    }
-
-    const expiresIn = Math.floor((tokenData.expiresAt - Date.now()) / 1000);
-
-    if (expiresIn <= 0) {
-      return {
-        authenticated: false,
-        message: `Token expired for ${resolvedId}. Use pa-auth-start to re-authenticate.`,
-        userId: resolvedId,
-        expiresIn: 0,
-      };
-    }
-
+    // No specific user \u2014 return general status
     return {
-      authenticated: true,
-      message: `Authenticated as ${resolvedId}.`,
-      userId: resolvedId,
-      expiresIn,
+      authenticated: authenticatedUsers.length > 0,
+      userId: authenticatedUsers[0] || null,
+      message: authenticatedUsers.length > 0
+        ? `${authenticatedUsers.length} user(s) authenticated: ${authenticatedUsers.join(', ')}`
+        : 'No users authenticated. Use pa-auth-start to begin device code login.',
+      pending: this.pendingAuths.size > 0,
+      authenticatedUsers,
     };
   }
 
-  // ===========================================================================
-  // Public: List Authenticated Users
-  // ===========================================================================
+  // -----------------------------------------------------------------------
+  // Access Token (for PowerPlatformClient integration)
+  // -----------------------------------------------------------------------
 
-  listAuthenticatedUsers(): string[] {
-    return Array.from(this.tokens.keys()).filter((userId) => {
-      const data = this.tokens.get(userId);
-      return data && data.expiresAt > Date.now();
-    });
-  }
-
-  // ===========================================================================
-  // Private: Refresh Token
-  // ===========================================================================
-
-  private async refreshUserToken(userId: string): Promise<void> {
-    const tokenData = this.tokens.get(userId);
-    if (!tokenData?.refreshToken) {
-      throw new Error(`No refresh token for ${userId}`);
+  /**
+   * Gets a valid access token for the specified user.
+   * Auto-refreshes if the token is within 5 minutes of expiry.
+   * Returns null if no token is available (user must authenticate).
+   *
+   * This is the primary integration point with PowerPlatformClient.
+   * Called by userFlowRequest() for delegated write operations.
+   */
+  async getAccessToken(userId?: string): Promise<string | null> {
+    const targetUser = userId || this.getDefaultUserId();
+    if (!targetUser) {
+      console.log('[UserAuth] No authenticated user available for token request');
+      return null;
     }
 
-    console.log(`[UserAuth] Refreshing token for: ${userId}`);
-
-    const url = `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/token`;
-
-    const response = await axios.post(
-      url,
-      new URLSearchParams({
-        grant_type: 'refresh_token',
-        client_id: this.clientId,
-        refresh_token: tokenData.refreshToken,
-        scope: FLOW_SCOPE,
-      }).toString(),
-      {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      }
-    );
-
-    // Azure AD returns snake_case — map directly
-    const raw = response.data;
-
-    this.tokens.set(userId, {
-      accessToken: raw.access_token,
-      refreshToken: raw.refresh_token || tokenData.refreshToken, // Keep old if not returned
-      expiresAt: Date.now() + raw.expires_in * 1000,
-      userId,
-      acquiredAt: Date.now(),
-    });
-
-    console.log(`[UserAuth] ✅ Token refreshed for ${userId} — expires in ${raw.expires_in}s`);
-  }
-
-  // ===========================================================================
-  // Private: User ID Resolution
-  // ===========================================================================
-
-  /** Resolve user ID from pending auths (for poll) */
-  private resolvePendingUserId(userId?: string): string | null {
-    if (userId) {
-      const normalized = userId.toLowerCase().trim();
-      return this.pendingAuths.has(normalized) ? normalized : null;
+    const token = this.tokens.get(targetUser);
+    if (!token) {
+      console.log(`[UserAuth] No token found for ${targetUser}`);
+      return null;
     }
-    // Auto-resolve: return most recent pending
-    if (this.pendingAuths.size === 1) {
-      return Array.from(this.pendingAuths.keys())[0];
-    }
-    return null;
-  }
 
-  /** Resolve user ID from token store (for getAccessToken / getStatus) */
-  private resolveTokenUserId(userId?: string): string | null {
-    if (userId) {
-      const normalized = userId.toLowerCase().trim();
-      return this.tokens.has(normalized) ? normalized : null;
-    }
-    // Auto-resolve: return most recent token
-    if (this.tokens.size === 1) {
-      return Array.from(this.tokens.keys())[0];
-    }
-    // Multiple users — find most recently acquired
-    if (this.tokens.size > 1) {
-      let latest: string | null = null;
-      let latestTime = 0;
-      for (const [id, data] of this.tokens.entries()) {
-        if (data.acquiredAt > latestTime) {
-          latestTime = data.acquiredAt;
-          latest = id;
+    // Auto-refresh if < 5 min remaining
+    if (token.expiresAt - Date.now() < REFRESH_BUFFER_MS) {
+      if (token.refreshToken) {
+        console.log(`[UserAuth] Token for ${targetUser} expiring soon, refreshing...`);
+        const refreshed = await this.refreshTokenForUser(targetUser, token.refreshToken);
+        if (refreshed) {
+          return this.tokens.get(targetUser)!.accessToken;
         }
       }
-      return latest;
+
+      // Token expired and refresh failed or unavailable
+      if (token.expiresAt < Date.now()) {
+        console.warn(`[UserAuth] Token expired for ${targetUser} \u2014 re-authentication required`);
+        this.tokens.delete(targetUser);
+        return null;
+      }
     }
-    return null;
+
+    return token.accessToken;
+  }
+
+  // -----------------------------------------------------------------------
+  // Token Refresh (internal)
+  // -----------------------------------------------------------------------
+
+  private async refreshTokenForUser(userId: string, refreshToken: string): Promise<boolean> {
+    try {
+      console.log(`[UserAuth] Refreshing token for ${userId}...`);
+
+      const params = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: this.clientId,
+        refresh_token: refreshToken,
+        scope: this.scope,
+      });
+
+      const response = await axios.post(this.tokenEndpoint, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+
+      const data = response.data;
+
+      this.tokens.set(userId, {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token || refreshToken,
+        expiresAt: Date.now() + (data.expires_in * 1000),
+        userId,
+        acquiredAt: Date.now(),
+      });
+
+      console.log(`[UserAuth] \u2705 Token refreshed for ${userId} (TTL: ${data.expires_in}s)`);
+      return true;
+    } catch (error: any) {
+      const errMsg = error.response?.data?.error_description || error.response?.data?.error || error.message;
+      console.error(`[UserAuth] Refresh failed for ${userId}: ${errMsg}`);
+      return false;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Utility
+  // -----------------------------------------------------------------------
+
+  /**
+   * Returns true if any user has a valid (or refreshable) token.
+   */
+  hasAuthenticatedUser(): boolean {
+    for (const [, token] of this.tokens) {
+      if (token.expiresAt > Date.now() || token.refreshToken) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Returns the userId of the most recently authenticated user.
+   */
+  getDefaultUserId(): string | null {
+    let latest: UserToken | null = null;
+    for (const [, token] of this.tokens) {
+      if (!latest || token.acquiredAt > latest.acquiredAt) {
+        latest = token;
+      }
+    }
+    return latest?.userId || null;
+  }
+
+  /**
+   * Invalidates a specific user's token (e.g., on 401 retry failure).
+   */
+  invalidateUser(userId: string): void {
+    this.tokens.delete(userId);
+    console.log(`[UserAuth] Token invalidated for ${userId}`);
   }
 }
