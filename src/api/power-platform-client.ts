@@ -40,30 +40,46 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Ensures the workflow definition has the required $connections parameter.
- * Power Automate requires parameters.$connections for any flow that uses
- * connector-based triggers or actions (Recurrence, OpenApiConnection, etc.).
+ * Ensures the workflow definition has all required connector parameters.
+ * Power Automate requires BOTH parameters.$connections AND parameters.$authentication
+ * for any flow that uses connector-based triggers or actions
+ * (Recurrence with connectors, OpenApiConnection, etc.).
  *
- * v3.0.2: Auto-injected to prevent 400 InvalidPowerFlow errors.
+ * v3.0.2: Auto-injects both to prevent 400 InvalidPowerFlow errors.
+ *   - $connections: Required for connector routing
+ *   - $authentication: Required for connector auth (SecureObject)
+ *
+ * Returns which parameters were injected for logging.
  */
-function ensureConnectionsParameter(definition: any): { definition: any; injected: boolean } {
+function ensureRequiredParameters(definition: any, displayName: string): any {
   const def = { ...definition };
-  let injected = false;
 
   if (!def.parameters) {
     def.parameters = {};
-    injected = true;
   }
 
+  // --- $connections: Required for connector-based flows ---
   if (!def.parameters['$connections']) {
     def.parameters['$connections'] = {
       defaultValue: {},
       type: 'Object',
     };
-    injected = true;
+    console.log(`[Flow] Auto-injected parameters.$connections for '${displayName}'`);
   }
 
-  return { definition: def, injected };
+  // --- $authentication: Required for connector auth ---
+  // Without this, Microsoft returns 400 InvalidPowerFlow:
+  //   "The provided flow definition with a recurrent trigger is missing
+  //    the required parameter '$authentication'."
+  if (!def.parameters['$authentication']) {
+    def.parameters['$authentication'] = {
+      defaultValue: {},
+      type: 'SecureObject',
+    };
+    console.log(`[Flow] Auto-injected parameters.$authentication for '${displayName}'`);
+  }
+
+  return def;
 }
 
 export class PowerPlatformClient {
@@ -460,7 +476,8 @@ export class PowerPlatformClient {
   //   - $schema injection (v3.0.1)
   //   - contentVersion injection (v3.0.1)
   //   - Empty definition guard (v3.0.1)
-  //   - $connections parameter injection (v3.0.2) — prevents InvalidPowerFlow
+  //   - $connections parameter injection (v3.0.2)
+  //   - $authentication parameter injection (v3.0.2)
   //
   // =========================================================================
 
@@ -469,7 +486,7 @@ export class PowerPlatformClient {
    * Uses the authenticated user's delegated token to ensure the flow
    * is owned by that user's identity.
    *
-   * v3.0.2: Auto-injects $connections parameter to prevent InvalidPowerFlow errors.
+   * v3.0.2: Auto-injects $connections + $authentication parameters.
    * v3.0.1: Robust $schema injection + empty definition validation.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
@@ -496,17 +513,12 @@ export class PowerPlatformClient {
       fullDefinition.actions = {};
     }
 
-    // --- $connections parameter injection (v3.0.2) ---
-    // Power Automate requires parameters.$connections for flows with
-    // connector-based triggers/actions (Recurrence, OpenApiConnection, etc.).
-    // Without this, Microsoft returns 400 InvalidPowerFlow:
-    //   "The provided flow definition with a recurrent trigger is missing
-    //    the required parameter '$connections'."
-    const connResult = ensureConnectionsParameter(fullDefinition);
-    fullDefinition = connResult.definition;
-    if (connResult.injected) {
-      console.log(`[Flow] Auto-injected parameters.$connections into definition for '${displayName}'`);
-    }
+    // --- Required parameters injection (v3.0.2) ---
+    // Power Automate requires parameters.$connections AND parameters.$authentication
+    // for flows with connector-based triggers/actions.
+    // Without $connections: 400 "missing the required parameter '$connections'"
+    // Without $authentication: 400 "missing the required parameter '$authentication'"
+    fullDefinition = ensureRequiredParameters(fullDefinition, displayName);
 
     // --- Empty definition guard ---
     // Reject definitions where BOTH triggers and actions are empty.
@@ -524,10 +536,10 @@ export class PowerPlatformClient {
     }
 
     if (triggerCount === 0) {
-      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers — flow may not execute`);
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers \u2014 flow may not execute`);
     }
     if (actionCount === 0) {
-      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions — flow will do nothing when triggered`);
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions \u2014 flow will do nothing when triggered`);
     }
 
     // Build Flow Management API request body (properties envelope)
@@ -569,7 +581,7 @@ export class PowerPlatformClient {
       connectionReferences: connectionReferences || {},
       _source: 'flow-management-api',
       _authType: this.userAuth?.hasAuthenticatedUser() ? 'delegated' : 'service-principal',
-      _note: 'Created via Flow Management API — fully registered with Flow engine',
+      _note: 'Created via Flow Management API \u2014 fully registered with Flow engine',
     };
   }
 
@@ -577,7 +589,7 @@ export class PowerPlatformClient {
    * Updates an existing Power Automate cloud flow via the Flow Management API.
    * Uses the authenticated user's delegated token to ensure proper authorization.
    *
-   * v3.0.2: Auto-injects $connections parameter (same as createFlow).
+   * v3.0.2: Auto-injects $connections + $authentication parameters.
    * v3.0.1: Robust $schema injection.
    * Requires: User authenticated via pa-auth-start + pa-auth-poll
    */
@@ -613,12 +625,8 @@ export class PowerPlatformClient {
         def.actions = {};
       }
 
-      // $connections parameter injection (v3.0.2)
-      const connResult = ensureConnectionsParameter(def);
-      def = connResult.definition;
-      if (connResult.injected) {
-        console.log(`[Flow] Auto-injected parameters.$connections into update definition for flow ${flowId}`);
-      }
+      // Required parameters injection (v3.0.2)
+      def = ensureRequiredParameters(def, `flow ${flowId}`);
 
       body.properties.definition = def;
     }
