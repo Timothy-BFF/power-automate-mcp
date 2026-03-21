@@ -74,22 +74,12 @@ function ensureRequiredParameters(definition: any, displayName: string): any {
 // The agent generates syntactically invalid JSON with stray brackets.
 // Error: "Unexpected token ] in JSON at position 619"
 //
-// The stray brackets likely come from Power Automate expressions like
-// @{addDays(utcNow(), -1)} or array indexing that the agent doesn't
-// properly escape inside JSON string values.
-//
 // Strategies:
-//   1. Position-targeted iterative removal (extract error position,
-//      remove offending char, retry — up to 20 iterations)
-//   2. Bracket-aware balancing (walk string respecting quotes/escapes,
-//      remove unmatched ] and } characters)
+//   1. Position-targeted iterative removal
+//   2. Bracket-aware balancing
 //   3. Combined: position removal + bracket balancing
 // =========================================================================
 
-/**
- * Extracts the error position from a JSON.parse error message.
- * Handles: "at position 619", "at column 619", "at character 619"
- */
 function extractErrorPosition(error: Error): number | null {
   const msg = error.message || '';
   const posMatch = msg.match(/(?:position|column|character)\s+(\d+)/i);
@@ -99,20 +89,12 @@ function extractErrorPosition(error: Error): number | null {
   return null;
 }
 
-/**
- * Walks through a JSON string respecting quoted strings and escapes,
- * and removes any unmatched ] or } characters.
- *
- * This handles the case where the agent puts stray brackets inside
- * string values (e.g., Power Automate expressions) that break parsing.
- */
 function balanceBrackets(str: string): string {
   const chars = Array.from(str);
   const toRemove = new Set<number>();
 
-  // Track bracket stacks
-  const squareStack: number[] = [];  // positions of unmatched [
-  const curlyStack: number[] = [];   // positions of unmatched {
+  const squareStack: number[] = [];
+  const curlyStack: number[] = [];
   let inString = false;
   let escapeNext = false;
 
@@ -136,14 +118,12 @@ function balanceBrackets(str: string): string {
 
     if (inString) continue;
 
-    // Outside strings — track brackets
     if (c === '[') {
       squareStack.push(i);
     } else if (c === ']') {
       if (squareStack.length > 0) {
         squareStack.pop();
       } else {
-        // Unmatched ] — mark for removal
         toRemove.add(i);
       }
     } else if (c === '{') {
@@ -152,23 +132,15 @@ function balanceBrackets(str: string): string {
       if (curlyStack.length > 0) {
         curlyStack.pop();
       } else {
-        // Unmatched } — mark for removal
         toRemove.add(i);
       }
     }
   }
 
-  // Also mark any unmatched opening brackets for removal
-  // (less common but handle it)
-  // Actually, unmatched openers are harder — the JSON likely
-  // needs a closing bracket added, not an opener removed.
-  // For now, only remove unmatched closers.
-
   if (toRemove.size === 0) {
     return str;
   }
 
-  // Build repaired string
   const result: string[] = [];
   for (let i = 0; i < chars.length; i++) {
     if (!toRemove.has(i)) {
@@ -179,24 +151,9 @@ function balanceBrackets(str: string): string {
   return result.join('');
 }
 
-/**
- * Attempts to repair malformed JSON by iteratively fixing parse errors.
- *
- * Strategy 1: Position-targeted removal
- *   - Parse, extract error position, remove offending char, retry
- *   - Up to 20 iterations (handles multiple stray brackets)
- *
- * Strategy 2: Bracket balancing
- *   - Walk the string respecting quotes/escapes
- *   - Remove any unmatched ] or } characters
- *
- * Strategy 3: Combined
- *   - Apply position removal first, then bracket balancing
- */
 function repairJson(str: string, label: string): any | null {
   console.log(`[Flow:Repair] Attempting JSON repair for '${label}' (${str.length} chars)`);
 
-  // Strategy 1: Position-targeted iterative removal
   let repaired = str;
   let lastPos = -1;
   for (let attempt = 0; attempt < 20; attempt++) {
@@ -211,7 +168,6 @@ function repairJson(str: string, label: string): any | null {
         break;
       }
       if (pos === lastPos) {
-        // Same position — we're stuck in a loop
         console.log(`[Flow:Repair] Stuck at position ${pos}, switching to bracket balancing`);
         break;
       }
@@ -224,12 +180,10 @@ function repairJson(str: string, label: string): any | null {
       console.log(`[Flow:Repair] Context: ...${context}...`);
       console.log(`[Flow:Repair]          ${contextMarker}`);
 
-      // Remove the offending character
       repaired = repaired.substring(0, pos) + repaired.substring(pos + 1);
     }
   }
 
-  // Strategy 2: Bracket balancing on original string
   console.log(`[Flow:Repair] Trying bracket balancing on original string for '${label}'`);
   try {
     const balanced = balanceBrackets(str);
@@ -246,7 +200,6 @@ function repairJson(str: string, label: string): any | null {
     console.log(`[Flow:Repair] Bracket balancing parse failed: ${e.message}`);
   }
 
-  // Strategy 3: Combined — position removal result + bracket balancing
   console.log(`[Flow:Repair] Trying combined repair for '${label}'`);
   try {
     const combined = balanceBrackets(repaired);
@@ -261,8 +214,6 @@ function repairJson(str: string, label: string): any | null {
     console.log(`[Flow:Repair] Combined repair parse failed: ${e.message}`);
   }
 
-  // Strategy 4: Bracket balancing on position-repaired string (if different from combined)
-  // Try parsing the position-repaired string directly
   if (repaired !== str) {
     try {
       const result = JSON.parse(repaired);
@@ -277,28 +228,10 @@ function repairJson(str: string, label: string): any | null {
   return null;
 }
 
-/**
- * Aggressively parses a string into a JSON object.
- *
- * ROOT CAUSE (confirmed 2026-03-20):
- * The MCP SDK/SSE transport delivers the definition as a STRING.
- * The agent sometimes generates malformed JSON with stray brackets
- * (e.g., "Unexpected token ] at position 619" from Power Automate
- * expression syntax leaking into JSON).
- *
- * Pipeline:
- *   1. Direct JSON.parse
- *   2. Trim + strip BOM + strip null bytes
- *   3. Double/multi-decode (nested JSON strings)
- *   4. JSON Repair Engine (position-targeted + bracket balancing)
- *   5. Regex extraction of outermost {...}
- *   6. Unescape transport patterns
- */
 function aggressiveJsonParse(str: string, label: string): any | null {
   const preview = str.length > 500 ? str.substring(0, 500) + '...' : str;
   console.log(`[Flow:Parse] Raw string (${str.length} chars) for '${label}': ${preview}`);
 
-  // Attempt 1: Direct parse
   try {
     const result = JSON.parse(str);
     console.log(`[Flow:Parse] \u2705 Direct JSON.parse succeeded for '${label}'`);
@@ -307,7 +240,6 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     console.log(`[Flow:Parse] Direct parse failed for '${label}': ${(e as Error).message}`);
   }
 
-  // Attempt 2: Trim + strip BOM + strip null bytes
   const cleaned = str.replace(/^\uFEFF/, '').replace(/\0/g, '').trim();
   if (cleaned !== str) {
     try {
@@ -319,7 +251,6 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     }
   }
 
-  // Attempt 3: Double-decode
   try {
     const inner = JSON.parse(cleaned);
     if (typeof inner === 'string') {
@@ -331,7 +262,6 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     console.log(`[Flow:Parse] Double-decode failed for '${label}'`);
   }
 
-  // Attempt 4: Multi-decode (up to 5 levels)
   try {
     let val: any = cleaned;
     for (let depth = 0; depth < 5; depth++) {
@@ -346,15 +276,11 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     console.log(`[Flow:Parse] Multi-decode failed for '${label}'`);
   }
 
-  // Attempt 5: JSON REPAIR ENGINE
-  // This is the critical new step — handles agent-generated malformed JSON
-  // with stray brackets from Power Automate expressions
   const repaired = repairJson(cleaned, label);
   if (repaired !== null && typeof repaired === 'object') {
     return repaired;
   }
 
-  // Attempt 6: Regex extraction of outermost {...}
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
@@ -364,7 +290,6 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     } catch (e) {
       console.log(`[Flow:Parse] Regex extraction failed for '${label}'`);
 
-      // Try repairing the regex-extracted string too
       const repairedExtract = repairJson(jsonMatch[0], `${label} (regex-extracted)`);
       if (repairedExtract !== null && typeof repairedExtract === 'object') {
         return repairedExtract;
@@ -372,7 +297,6 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     }
   }
 
-  // Attempt 7: Unescape transport patterns
   const unescaped = cleaned
     .replace(/\\\\/g, '\\')
     .replace(/\\"/g, '"')
@@ -386,7 +310,6 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     } catch (e) {
       console.log(`[Flow:Parse] Unescape parse failed for '${label}'`);
 
-      // Try repairing unescaped version
       const repairedUnescaped = repairJson(unescaped, `${label} (unescaped)`);
       if (repairedUnescaped !== null && typeof repairedUnescaped === 'object') {
         return repairedUnescaped;
@@ -394,23 +317,11 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     }
   }
 
-  // All attempts exhausted
   console.error(`[Flow:Parse] \u274c ALL parse+repair attempts failed for '${label}'.`);
   console.error(`[Flow:Parse] String char codes (first 50): [${Array.from(str.substring(0, 50)).map(c => c.charCodeAt(0)).join(', ')}]`);
   return null;
 }
 
-/**
- * Sanitizes a flow definition received from the MCP transport layer.
- *
- * Handles:
- *   1. Strings: aggressive multi-strategy JSON parsing + repair
- *   2. Arrays: [{...}] \u2192 {...} unwrap
- *   3. Numeric-key objects: strip all numeric keys (transport artifacts)
- *
- * v3.0.2 behavior change: if ALL parsing/repair fails, THROWS an error
- * instead of silently returning an empty definition (which wipes the flow).
- */
 function sanitizeDefinition(definition: any, label: string): any {
   const inputType = typeof definition;
   const inputIsArray = Array.isArray(definition);
@@ -421,14 +332,11 @@ function sanitizeDefinition(definition: any, label: string): any {
 
   let def = definition;
 
-  // Step 1: Parse strings with aggressive multi-strategy parser + repair
   if (typeof def === 'string') {
     const parsed = aggressiveJsonParse(def, label);
     if (parsed !== null && typeof parsed === 'object') {
       def = parsed;
     } else {
-      // CRITICAL: Do NOT return empty definition \u2014 that silently wipes the flow.
-      // Throw an error so the agent gets feedback about the malformed JSON.
       const errorPos = extractFirstErrorPosition(def);
       const contextHint = errorPos !== null
         ? ` Parse error near position ${errorPos}: "...${def.substring(Math.max(0, errorPos - 20), Math.min(def.length, errorPos + 20))}..."`
@@ -444,20 +352,18 @@ function sanitizeDefinition(definition: any, label: string): any {
     }
   }
 
-  // Step 2: Unwrap real arrays
   if (Array.isArray(def)) {
     if (def.length === 1 && def[0] && typeof def[0] === 'object') {
       console.log(`[Flow:Sanitize] Unwrapped real array for '${label}'`);
       def = def[0];
     } else if (def.length > 1) {
-      console.warn(`[Flow:Sanitize] Definition is array with ${def.length} elements for '${label}' \u2014 using first element`);
+      console.warn(`[Flow:Sanitize] Definition is array with ${def.length} elements for '${label}' - using first element`);
       def = def[0];
     } else {
       throw new Error('Invalid flow definition: received empty array.');
     }
   }
 
-  // Step 3: Strip ALL numeric keys
   if (def && typeof def === 'object' && !Array.isArray(def)) {
     const numericKeys = Object.keys(def).filter(k => /^\d+$/.test(k));
 
@@ -468,7 +374,7 @@ function sanitizeDefinition(definition: any, label: string): any {
       if (nonNumericKeys.length === 0 && numericKeys.length === 1) {
         const inner = def[numericKeys[0]];
         if (inner && typeof inner === 'object') {
-          console.log(`[Flow:Sanitize] Pure numeric-key object \u2014 unwrapping '${numericKeys[0]}' for '${label}'`);
+          console.log(`[Flow:Sanitize] Pure numeric-key object - unwrapping '${numericKeys[0]}' for '${label}'`);
           def = inner;
         }
       } else if (nonNumericKeys.length === 0 && numericKeys.length > 1) {
@@ -489,7 +395,6 @@ function sanitizeDefinition(definition: any, label: string): any {
     }
   }
 
-  // Diagnostic: log output shape
   const outputKeys = (def && typeof def === 'object' && !Array.isArray(def))
     ? Object.keys(def)
     : null;
@@ -498,9 +403,6 @@ function sanitizeDefinition(definition: any, label: string): any {
   return def;
 }
 
-/**
- * Helper: try to extract the first parse error position from a string.
- */
 function extractFirstErrorPosition(str: string): number | null {
   try {
     JSON.parse(str);
@@ -530,7 +432,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Private Transport Methods \u2014 Service Principal (Read Operations)
+  // Private Transport Methods -- Service Principal (Read Operations)
   // =========================================================================
 
   private async bapRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
@@ -628,7 +530,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Private Transport \u2014 Delegated User Token (Write Operations)
+  // Private Transport -- Delegated User Token (Write Operations)
   // =========================================================================
 
   private async userFlowRequest(
@@ -690,7 +592,7 @@ export class PowerPlatformClient {
     }
 
     console.log(`[Flow] ${method} ${url} [service-principal fallback]`);
-    console.log('[Flow] \u26a0\ufe0f Write operations may require user auth \u2014 use pa-auth-start if this fails');
+    console.log('[Flow] \u26a0\ufe0f Write operations may require user auth - use pa-auth-start if this fails');
     return this.request(url, method, FLOW_SCOPE, data);
   }
 
@@ -778,7 +680,7 @@ export class PowerPlatformClient {
         return { flowApiId: resourceid, dataverseId: dataverseWorkflowId, resolvedVia: 'resourceid' };
       }
 
-      console.warn(`[IdResolver] No bridge field found \u2014 using Dataverse workflowid as fallback`);
+      console.warn(`[IdResolver] No bridge field found - using Dataverse workflowid as fallback`);
       return { flowApiId: dataverseWorkflowId, dataverseId: dataverseWorkflowId, resolvedVia: 'dataverse-workflowid' };
     } catch (error: any) {
       console.warn(`[IdResolver] Resolution failed: ${error.message}. Using fallback.`);
@@ -797,7 +699,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows \u2014 READ Operations (Flow Admin API \u2014 /scopes/admin/ path)
+  // Flows -- READ Operations (Flow Admin API -- /scopes/admin/ path)
   // =========================================================================
 
   async listFlows(envId: string, filter?: string, top?: number): Promise<any> {
@@ -810,16 +712,34 @@ export class PowerPlatformClient {
     return this.flowAdminRequest(path);
   }
 
+  // =========================================================================
+  // GET FLOW DETAILS (v3.0.2 -- structured response)
+  //
+  // ROOT CAUSE (confirmed 2026-03-21 via Jose's agent logs):
+  //   The Flow Admin API returns the definition nested inside
+  //   response.properties.definition. Agents reading the top-level
+  //   response object see no triggers/actions and incorrectly conclude
+  //   "definition is empty" -- leading to unnecessary delete+recreate
+  //   cycles and the false conclusion "MCP tool cannot push definitions".
+  //
+  // FIX: Surface definition contents (trigger names, action names,
+  //   counts, connection references) at the top level of the return
+  //   object. Include _definitionStatus indicator and _definitionNote
+  //   guidance to prevent agents from making destructive decisions
+  //   based on a misread API response.
+  // =========================================================================
+
   async getFlowDetails(envId: string, flowId: string): Promise<any> {
     const url = `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}?api-version=${FLOW_API_VER}`;
 
+    let raw: any = null;
     for (let attempt = 0; attempt <= PROPAGATION_MAX_RETRIES; attempt++) {
       try {
-        const result = await this.flowAdminRequest(url);
+        raw = await this.flowAdminRequest(url);
         if (attempt > 0) {
           console.log(`[Flow] Flow ${flowId} found after ${attempt} retries (propagation delay)`);
         }
-        return result;
+        break;
       } catch (error: any) {
         const is404 = error.message?.includes('404') || error.message?.includes('Could not find flow');
 
@@ -835,19 +755,95 @@ export class PowerPlatformClient {
       }
     }
 
-    throw new Error(`Flow ${flowId} not found after ${PROPAGATION_MAX_RETRIES} retries (propagation timeout)`);
+    if (!raw) {
+      throw new Error(`Flow ${flowId} not found after ${PROPAGATION_MAX_RETRIES} retries (propagation timeout)`);
+    }
+
+    // =================================================================
+    // DEFINITION EXTRACTION (v3.0.2)
+    //
+    // The admin GET API nests data inside properties.definition.
+    // We surface everything at the top level so agents cannot misread.
+    // =================================================================
+    const props = raw?.properties || {};
+    const definition = props?.definition || {};
+    const triggers = definition?.triggers || {};
+    const actions = definition?.actions || {};
+    const connectionRefs = props?.connectionReferences || {};
+
+    const triggerNames = Object.keys(triggers);
+    const actionNames = Object.keys(actions);
+    const connectionNames = Object.keys(connectionRefs);
+
+    // Diagnostic logging
+    console.log(`[Flow:Details] Flow ${flowId}: ${triggerNames.length} trigger(s), ${actionNames.length} action(s), ${connectionNames.length} connection(s)`);
+    if (triggerNames.length > 0) {
+      console.log(`[Flow:Details] Triggers: [${triggerNames.join(', ')}]`);
+    }
+    if (actionNames.length > 0) {
+      console.log(`[Flow:Details] Actions: [${actionNames.join(', ')}]`);
+    }
+    if (triggerNames.length === 0 && actionNames.length === 0) {
+      console.warn(`[Flow:Details] \u26a0\ufe0f Definition appears empty for flow ${flowId}. ` +
+        `This may be normal if the admin GET endpoint omits the definition body. ` +
+        `Check the flow in the Power Automate portal to confirm.`);
+    }
+
+    // =================================================================
+    // STRUCTURED RETURN
+    //
+    // Agent sees everything at the top level -- no digging required.
+    // _definitionStatus and _definitionNote provide guardrails to
+    // prevent agents from making destructive decisions (delete/recreate)
+    // based on a misread API response.
+    // =================================================================
+    return {
+      flowId: raw?.name || flowId,
+      displayName: props?.displayName || 'Unknown',
+      state: props?.state || 'Unknown',
+      createdTime: props?.createdTime,
+      lastModifiedTime: props?.lastModifiedTime,
+      creator: props?.creator?.userId || props?.creator?.objectId || 'unknown',
+
+      // === DEFINITION (surfaced clearly for agent consumption) ===
+      definition: {
+        schema: definition?.['$schema'] || 'none',
+        contentVersion: definition?.contentVersion || 'none',
+        triggerCount: triggerNames.length,
+        triggerNames: triggerNames,
+        actionCount: actionNames.length,
+        actionNames: actionNames,
+        hasParameters: !!(definition?.parameters),
+        parameterNames: definition?.parameters ? Object.keys(definition.parameters) : [],
+        // Full trigger and action objects for detailed inspection
+        triggers: triggers,
+        actions: actions,
+      },
+
+      // === CONNECTIONS ===
+      connectionReferences: connectionRefs,
+      connectionCount: connectionNames.length,
+      connectionNames: connectionNames,
+
+      // === DEFINITION STATUS -- critical for agent decision-making ===
+      _definitionStatus: (triggerNames.length > 0 || actionNames.length > 0)
+        ? 'POPULATED'
+        : 'EMPTY_OR_NOT_RETURNED',
+      _definitionNote: (triggerNames.length === 0 && actionNames.length === 0)
+        ? 'WARNING: The admin API sometimes omits the full definition body in GET responses. ' +
+          'An empty definition here does NOT mean the flow has no definition. ' +
+          'If a previous create or PATCH returned 200, the definition IS saved. ' +
+          'Check the flow in the Power Automate portal designer to confirm visually. ' +
+          'Do NOT delete and recreate the flow based solely on an empty API response.'
+        : `Flow has ${triggerNames.length} trigger(s) [${triggerNames.join(', ')}] and ${actionNames.length} action(s) [${actionNames.join(', ')}].`,
+
+      // === RAW RESPONSE (for advanced debugging) ===
+      _raw: raw,
+    };
   }
 
   // =========================================================================
-  // Flows \u2014 WRITE Operations (Delegated User Token)
-  // =========================================================================
-  //
-  // DEFINITION AUTO-FIX PIPELINE (v3.0.2):
-  //   1. sanitizeDefinition() \u2014 parse strings, repair JSON, unwrap arrays, strip numeric keys
-  //   2. $schema + contentVersion injection
-  //   3. Empty definition guard
-  //   4. $connections + $authentication parameter injection
-  //
+  // Flows -- WRITE Operations (Delegated User Token)
   // =========================================================================
 
   async createFlow(
@@ -857,7 +853,6 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
-    // --- Sanitize definition (v3.0.2 aggressive + repair) ---
     definition = sanitizeDefinition(definition, displayName);
 
     let fullDefinition = { ...definition };
@@ -890,10 +885,10 @@ export class PowerPlatformClient {
     }
 
     if (triggerCount === 0) {
-      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers \u2014 flow may not execute`);
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no triggers - flow may not execute`);
     }
     if (actionCount === 0) {
-      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions \u2014 flow will do nothing when triggered`);
+      console.warn(`[Flow] \u26a0\ufe0f Definition for '${displayName}' has no actions - flow will do nothing when triggered`);
     }
 
     const body: any = {
@@ -917,23 +912,24 @@ export class PowerPlatformClient {
       body
     );
 
-    const flowId = result?.name || 'unknown';
+    const newFlowId = result?.name || 'unknown';
     const flowDisplayName = result?.properties?.displayName || displayName;
     const flowState = result?.properties?.state || state;
 
-    console.log(`[Flow] \u2705 Flow created: ${flowId} (${flowDisplayName})`);
+    console.log(`[Flow] \u2705 Flow created: ${newFlowId} (${flowDisplayName})`);
 
     return {
       status: 'created',
-      flowId,
-      name: flowId,
+      flowId: newFlowId,
+      name: newFlowId,
       displayName: flowDisplayName,
       state: flowState,
       definition: fullDefinition,
       connectionReferences: connectionReferences || {},
       _source: 'flow-management-api',
       _authType: this.userAuth?.hasAuthenticatedUser() ? 'delegated' : 'service-principal',
-      _note: 'Created via Flow Management API \u2014 fully registered with Flow engine',
+      _note: 'Created via Flow Management API. If the create returned 200/201, the definition IS saved. ' +
+        'Open the flow in Power Automate portal to authorize connections before enabling.',
     };
   }
 
@@ -954,7 +950,6 @@ export class PowerPlatformClient {
     }
 
     if (updates.definition) {
-      // --- Sanitize definition (v3.0.2 aggressive + repair) ---
       let def = sanitizeDefinition(updates.definition, `flow ${flowId}`);
 
       def = { ...def };
@@ -1013,7 +1008,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Management \u2014 LIFECYCLE (Flow Admin API)
+  // Flow Management -- LIFECYCLE (Flow Admin API)
   // =========================================================================
 
   async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop'): Promise<any> {
@@ -1030,9 +1025,25 @@ export class PowerPlatformClient {
     );
   }
 
+  // =========================================================================
+  // TRIGGER FLOW (v3.0.2 -- fixed path)
+  //
+  // ROOT CAUSE (confirmed 2026-03-21):
+  //   POST /scopes/admin/.../triggers/manual/run -> 404
+  //   The /scopes/admin/ path does NOT support trigger execution.
+  //
+  // FIX: Use userFlowRequest with standard /environments/ path.
+  //   manual trigger only works on flows with a Request (manual) trigger.
+  //   Recurrence-triggered flows cannot be run via this endpoint.
+  // =========================================================================
+
   async triggerFlow(envId: string, flowId: string, body?: any): Promise<any> {
-    return this.flowAdminRequest(
-      `/providers/Microsoft.ProcessSimple/scopes/admin/environments/${envId}/flows/${flowId}/triggers/manual/run?api-version=${FLOW_API_VER}`,
+    console.log(`[Flow] Triggering flow ${flowId} via delegated user path (non-admin)`);
+    console.log(`[Flow] Note: This only works for flows with a manual/Request trigger. ` +
+      `Recurrence-triggered flows run on their schedule and cannot be triggered via API.`);
+
+    return this.userFlowRequest(
+      `/providers/Microsoft.ProcessSimple/environments/${envId}/flows/${flowId}/triggers/manual/run?api-version=${FLOW_API_VER}`,
       'POST',
       body || {}
     );
