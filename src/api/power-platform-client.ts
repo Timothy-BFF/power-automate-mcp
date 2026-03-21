@@ -67,27 +67,234 @@ function ensureRequiredParameters(definition: any, displayName: string): any {
   return def;
 }
 
+// =========================================================================
+// JSON Repair Engine (v3.0.2)
+//
+// ROOT CAUSE (confirmed 2026-03-20 23:50 via diagnostic logs):
+// The agent generates syntactically invalid JSON with stray brackets.
+// Error: "Unexpected token ] in JSON at position 619"
+//
+// The stray brackets likely come from Power Automate expressions like
+// @{addDays(utcNow(), -1)} or array indexing that the agent doesn't
+// properly escape inside JSON string values.
+//
+// Strategies:
+//   1. Position-targeted iterative removal (extract error position,
+//      remove offending char, retry — up to 20 iterations)
+//   2. Bracket-aware balancing (walk string respecting quotes/escapes,
+//      remove unmatched ] and } characters)
+//   3. Combined: position removal + bracket balancing
+// =========================================================================
+
+/**
+ * Extracts the error position from a JSON.parse error message.
+ * Handles: "at position 619", "at column 619", "at character 619"
+ */
+function extractErrorPosition(error: Error): number | null {
+  const msg = error.message || '';
+  const posMatch = msg.match(/(?:position|column|character)\s+(\d+)/i);
+  if (posMatch) {
+    return parseInt(posMatch[1], 10);
+  }
+  return null;
+}
+
+/**
+ * Walks through a JSON string respecting quoted strings and escapes,
+ * and removes any unmatched ] or } characters.
+ *
+ * This handles the case where the agent puts stray brackets inside
+ * string values (e.g., Power Automate expressions) that break parsing.
+ */
+function balanceBrackets(str: string): string {
+  const chars = Array.from(str);
+  const toRemove = new Set<number>();
+
+  // Track bracket stacks
+  const squareStack: number[] = [];  // positions of unmatched [
+  const curlyStack: number[] = [];   // positions of unmatched {
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (c === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (c === '"' && !escapeNext) {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    // Outside strings — track brackets
+    if (c === '[') {
+      squareStack.push(i);
+    } else if (c === ']') {
+      if (squareStack.length > 0) {
+        squareStack.pop();
+      } else {
+        // Unmatched ] — mark for removal
+        toRemove.add(i);
+      }
+    } else if (c === '{') {
+      curlyStack.push(i);
+    } else if (c === '}') {
+      if (curlyStack.length > 0) {
+        curlyStack.pop();
+      } else {
+        // Unmatched } — mark for removal
+        toRemove.add(i);
+      }
+    }
+  }
+
+  // Also mark any unmatched opening brackets for removal
+  // (less common but handle it)
+  // Actually, unmatched openers are harder — the JSON likely
+  // needs a closing bracket added, not an opener removed.
+  // For now, only remove unmatched closers.
+
+  if (toRemove.size === 0) {
+    return str;
+  }
+
+  // Build repaired string
+  const result: string[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    if (!toRemove.has(i)) {
+      result.push(chars[i]);
+    }
+  }
+
+  return result.join('');
+}
+
+/**
+ * Attempts to repair malformed JSON by iteratively fixing parse errors.
+ *
+ * Strategy 1: Position-targeted removal
+ *   - Parse, extract error position, remove offending char, retry
+ *   - Up to 20 iterations (handles multiple stray brackets)
+ *
+ * Strategy 2: Bracket balancing
+ *   - Walk the string respecting quotes/escapes
+ *   - Remove any unmatched ] or } characters
+ *
+ * Strategy 3: Combined
+ *   - Apply position removal first, then bracket balancing
+ */
+function repairJson(str: string, label: string): any | null {
+  console.log(`[Flow:Repair] Attempting JSON repair for '${label}' (${str.length} chars)`);
+
+  // Strategy 1: Position-targeted iterative removal
+  let repaired = str;
+  let lastPos = -1;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      const result = JSON.parse(repaired);
+      console.log(`[Flow:Repair] \u2705 Position-targeted repair succeeded after ${attempt} removal(s) for '${label}'`);
+      return result;
+    } catch (e: any) {
+      const pos = extractErrorPosition(e);
+      if (pos === null || pos < 0 || pos >= repaired.length) {
+        console.log(`[Flow:Repair] Cannot extract position from error: ${e.message}`);
+        break;
+      }
+      if (pos === lastPos) {
+        // Same position — we're stuck in a loop
+        console.log(`[Flow:Repair] Stuck at position ${pos}, switching to bracket balancing`);
+        break;
+      }
+      lastPos = pos;
+
+      const badChar = repaired[pos];
+      const context = repaired.substring(Math.max(0, pos - 30), Math.min(repaired.length, pos + 30));
+      const contextMarker = ' '.repeat(Math.min(pos, 30)) + '^';
+      console.log(`[Flow:Repair] Error at pos ${pos}, char '${badChar}' (attempt ${attempt + 1})`);
+      console.log(`[Flow:Repair] Context: ...${context}...`);
+      console.log(`[Flow:Repair]          ${contextMarker}`);
+
+      // Remove the offending character
+      repaired = repaired.substring(0, pos) + repaired.substring(pos + 1);
+    }
+  }
+
+  // Strategy 2: Bracket balancing on original string
+  console.log(`[Flow:Repair] Trying bracket balancing on original string for '${label}'`);
+  try {
+    const balanced = balanceBrackets(str);
+    if (balanced !== str) {
+      const removedCount = str.length - balanced.length;
+      console.log(`[Flow:Repair] Bracket balancer removed ${removedCount} unmatched bracket(s)`);
+      const result = JSON.parse(balanced);
+      console.log(`[Flow:Repair] \u2705 Bracket balancing succeeded for '${label}'`);
+      return result;
+    } else {
+      console.log(`[Flow:Repair] Bracket balancer found no unmatched brackets`);
+    }
+  } catch (e: any) {
+    console.log(`[Flow:Repair] Bracket balancing parse failed: ${e.message}`);
+  }
+
+  // Strategy 3: Combined — position removal result + bracket balancing
+  console.log(`[Flow:Repair] Trying combined repair for '${label}'`);
+  try {
+    const combined = balanceBrackets(repaired);
+    if (combined !== repaired) {
+      const removedCount = repaired.length - combined.length;
+      console.log(`[Flow:Repair] Combined: removed ${removedCount} additional bracket(s)`);
+      const result = JSON.parse(combined);
+      console.log(`[Flow:Repair] \u2705 Combined repair succeeded for '${label}'`);
+      return result;
+    }
+  } catch (e: any) {
+    console.log(`[Flow:Repair] Combined repair parse failed: ${e.message}`);
+  }
+
+  // Strategy 4: Bracket balancing on position-repaired string (if different from combined)
+  // Try parsing the position-repaired string directly
+  if (repaired !== str) {
+    try {
+      const result = JSON.parse(repaired);
+      console.log(`[Flow:Repair] \u2705 Position-repaired string parsed on second pass for '${label}'`);
+      return result;
+    } catch (e: any) {
+      console.log(`[Flow:Repair] Position-repaired string still invalid: ${e.message}`);
+    }
+  }
+
+  console.error(`[Flow:Repair] \u274c All repair strategies failed for '${label}'`);
+  return null;
+}
+
 /**
  * Aggressively parses a string into a JSON object.
  *
- * ROOT CAUSE (confirmed 2026-03-20 23:34 via diagnostic logs):
- * The MCP SDK/SSE transport delivers the definition as a STRING, not an object.
- * JSON.parse() fails on it — meaning it's malformed, double-encoded, or has
- * invisible characters (BOM, control chars, etc.).
+ * ROOT CAUSE (confirmed 2026-03-20):
+ * The MCP SDK/SSE transport delivers the definition as a STRING.
+ * The agent sometimes generates malformed JSON with stray brackets
+ * (e.g., "Unexpected token ] at position 619" from Power Automate
+ * expression syntax leaking into JSON).
  *
- * When our code then does `{ ...stringValue }`, JavaScript spreads each CHARACTER
- * into numeric keys: { "0": "{", "1": "\"", "2": "t", ... }
- * Microsoft sees definition.0 (the first character) and returns 400.
- *
- * This function tries every known recovery strategy:
+ * Pipeline:
  *   1. Direct JSON.parse
- *   2. Trim whitespace + strip BOM
- *   3. Double-decode (JSON string inside JSON string)
- *   4. Triple-decode (for extreme transport nesting)
- *   5. Extract JSON from surrounding noise via regex
+ *   2. Trim + strip BOM + strip null bytes
+ *   3. Double/multi-decode (nested JSON strings)
+ *   4. JSON Repair Engine (position-targeted + bracket balancing)
+ *   5. Regex extraction of outermost {...}
+ *   6. Unescape transport patterns
  */
 function aggressiveJsonParse(str: string, label: string): any | null {
-  // Log first 500 chars for diagnosis
   const preview = str.length > 500 ? str.substring(0, 500) + '...' : str;
   console.log(`[Flow:Parse] Raw string (${str.length} chars) for '${label}': ${preview}`);
 
@@ -100,7 +307,7 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     console.log(`[Flow:Parse] Direct parse failed for '${label}': ${(e as Error).message}`);
   }
 
-  // Attempt 2: Trim whitespace + strip BOM (\uFEFF) + strip null bytes
+  // Attempt 2: Trim + strip BOM + strip null bytes
   const cleaned = str.replace(/^\uFEFF/, '').replace(/\0/g, '').trim();
   if (cleaned !== str) {
     try {
@@ -112,8 +319,7 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     }
   }
 
-  // Attempt 3: Double-decode — the string might be a JSON-encoded string
-  // e.g., '"{\\"triggers\\":{}}"' → '{"triggers":{}}'
+  // Attempt 3: Double-decode
   try {
     const inner = JSON.parse(cleaned);
     if (typeof inner === 'string') {
@@ -125,7 +331,7 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     console.log(`[Flow:Parse] Double-decode failed for '${label}'`);
   }
 
-  // Attempt 4: Triple-decode (extreme transport nesting)
+  // Attempt 4: Multi-decode (up to 5 levels)
   try {
     let val: any = cleaned;
     for (let depth = 0; depth < 5; depth++) {
@@ -140,8 +346,15 @@ function aggressiveJsonParse(str: string, label: string): any | null {
     console.log(`[Flow:Parse] Multi-decode failed for '${label}'`);
   }
 
-  // Attempt 5: Extract JSON object from surrounding noise via regex
-  // Look for the outermost { ... } block
+  // Attempt 5: JSON REPAIR ENGINE
+  // This is the critical new step — handles agent-generated malformed JSON
+  // with stray brackets from Power Automate expressions
+  const repaired = repairJson(cleaned, label);
+  if (repaired !== null && typeof repaired === 'object') {
+    return repaired;
+  }
+
+  // Attempt 6: Regex extraction of outermost {...}
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
@@ -150,11 +363,16 @@ function aggressiveJsonParse(str: string, label: string): any | null {
       return result;
     } catch (e) {
       console.log(`[Flow:Parse] Regex extraction failed for '${label}'`);
+
+      // Try repairing the regex-extracted string too
+      const repairedExtract = repairJson(jsonMatch[0], `${label} (regex-extracted)`);
+      if (repairedExtract !== null && typeof repairedExtract === 'object') {
+        return repairedExtract;
+      }
     }
   }
 
-  // Attempt 6: Unescape common transport escaping patterns
-  // Sometimes the transport double-escapes: \\" → \", \\n → \n
+  // Attempt 7: Unescape transport patterns
   const unescaped = cleaned
     .replace(/\\\\/g, '\\')
     .replace(/\\"/g, '"')
@@ -167,39 +385,31 @@ function aggressiveJsonParse(str: string, label: string): any | null {
       return result;
     } catch (e) {
       console.log(`[Flow:Parse] Unescape parse failed for '${label}'`);
-    }
 
-    // Try regex on unescaped too
-    const unescapedMatch = unescaped.match(/\{[\s\S]*\}/);
-    if (unescapedMatch) {
-      try {
-        const result = JSON.parse(unescapedMatch[0]);
-        console.log(`[Flow:Parse] \u2705 Unescape + regex succeeded for '${label}'`);
-        return result;
-      } catch (e) {
-        console.log(`[Flow:Parse] Unescape + regex failed for '${label}'`);
+      // Try repairing unescaped version
+      const repairedUnescaped = repairJson(unescaped, `${label} (unescaped)`);
+      if (repairedUnescaped !== null && typeof repairedUnescaped === 'object') {
+        return repairedUnescaped;
       }
     }
   }
 
   // All attempts exhausted
-  console.error(`[Flow:Parse] \u274c ALL parse attempts failed for '${label}'. String char codes (first 50): [${Array.from(str.substring(0, 50)).map(c => c.charCodeAt(0)).join(', ')}]`);
+  console.error(`[Flow:Parse] \u274c ALL parse+repair attempts failed for '${label}'.`);
+  console.error(`[Flow:Parse] String char codes (first 50): [${Array.from(str.substring(0, 50)).map(c => c.charCodeAt(0)).join(', ')}]`);
   return null;
 }
 
 /**
  * Sanitizes a flow definition received from the MCP transport layer.
  *
- * ROOT CAUSE (confirmed via diagnostic logs 2026-03-20):
- * The definition arrives as a STRING, not an object. When spread into an object
- * via { ...stringValue }, each CHARACTER becomes a numeric key:
- *   { "0": "{", "1": "\"", "2": "t", ... }
- * Microsoft sees definition.0 and returns 400 InvalidRequestContent.
- *
- * This function handles:
- *   1. Strings: aggressive multi-strategy JSON parsing
- *   2. Arrays: [{...}] → {...} unwrap
+ * Handles:
+ *   1. Strings: aggressive multi-strategy JSON parsing + repair
+ *   2. Arrays: [{...}] \u2192 {...} unwrap
  *   3. Numeric-key objects: strip all numeric keys (transport artifacts)
+ *
+ * v3.0.2 behavior change: if ALL parsing/repair fails, THROWS an error
+ * instead of silently returning an empty definition (which wipes the flow).
  */
 function sanitizeDefinition(definition: any, label: string): any {
   const inputType = typeof definition;
@@ -211,36 +421,43 @@ function sanitizeDefinition(definition: any, label: string): any {
 
   let def = definition;
 
-  // Step 1: Parse strings with aggressive multi-strategy parser
+  // Step 1: Parse strings with aggressive multi-strategy parser + repair
   if (typeof def === 'string') {
     const parsed = aggressiveJsonParse(def, label);
     if (parsed !== null && typeof parsed === 'object') {
       def = parsed;
     } else {
-      // CRITICAL: Do NOT return the raw string — spreading it creates numeric keys
-      console.error(`[Flow:Sanitize] \u274c Cannot parse definition string for '${label}' — returning empty definition to prevent spread corruption`);
-      return {
-        triggers: {},
-        actions: {},
-      };
+      // CRITICAL: Do NOT return empty definition \u2014 that silently wipes the flow.
+      // Throw an error so the agent gets feedback about the malformed JSON.
+      const errorPos = extractFirstErrorPosition(def);
+      const contextHint = errorPos !== null
+        ? ` Parse error near position ${errorPos}: "...${def.substring(Math.max(0, errorPos - 20), Math.min(def.length, errorPos + 20))}..."`
+        : '';
+      throw new Error(
+        `Cannot parse flow definition: the JSON is malformed.${contextHint} ` +
+        `This typically happens when Power Automate expressions (e.g., @{...}, @addDays(...)) ` +
+        `contain unescaped brackets. Please ensure all expressions are properly enclosed in ` +
+        `double-quoted JSON strings and that brackets within string values are balanced. ` +
+        `Definition was ${def.length} characters. The tool attempted 7 parse strategies ` +
+        `including JSON repair but could not recover a valid object.`
+      );
     }
   }
 
-  // Step 2: Unwrap real arrays — [{...}] → {...}
+  // Step 2: Unwrap real arrays
   if (Array.isArray(def)) {
     if (def.length === 1 && def[0] && typeof def[0] === 'object') {
       console.log(`[Flow:Sanitize] Unwrapped real array for '${label}'`);
       def = def[0];
     } else if (def.length > 1) {
-      console.warn(`[Flow:Sanitize] Definition is array with ${def.length} elements for '${label}' — using first element`);
+      console.warn(`[Flow:Sanitize] Definition is array with ${def.length} elements for '${label}' \u2014 using first element`);
       def = def[0];
     } else {
-      console.error(`[Flow:Sanitize] Definition is empty array for '${label}'`);
-      return { triggers: {}, actions: {} };
+      throw new Error('Invalid flow definition: received empty array.');
     }
   }
 
-  // Step 3: Strip ALL numeric keys from the object
+  // Step 3: Strip ALL numeric keys
   if (def && typeof def === 'object' && !Array.isArray(def)) {
     const numericKeys = Object.keys(def).filter(k => /^\d+$/.test(k));
 
@@ -251,16 +468,16 @@ function sanitizeDefinition(definition: any, label: string): any {
       if (nonNumericKeys.length === 0 && numericKeys.length === 1) {
         const inner = def[numericKeys[0]];
         if (inner && typeof inner === 'object') {
-          console.log(`[Flow:Sanitize] Pure numeric-key object — unwrapping '${numericKeys[0]}' for '${label}'`);
+          console.log(`[Flow:Sanitize] Pure numeric-key object \u2014 unwrapping '${numericKeys[0]}' for '${label}'`);
           def = inner;
         }
       } else if (nonNumericKeys.length === 0 && numericKeys.length > 1) {
-        // ALL keys are numeric — this is a fully spread string
-        // The original string was not parseable, return empty
-        console.error(`[Flow:Sanitize] \u274c Definition is fully spread string (${numericKeys.length} char keys) for '${label}' — returning empty definition`);
-        return { triggers: {}, actions: {} };
+        throw new Error(
+          `Invalid flow definition: object has only numeric keys (${numericKeys.length} chars) ` +
+          `which indicates the definition string was spread into characters. ` +
+          `Please provide a valid JSON object for the definition.`
+        );
       } else {
-        // Mixed: has both numeric and workflow keys — strip numeric, keep rest
         const cleaned: any = {};
         for (const key of Object.keys(def)) {
           if (!/^\d+$/.test(key)) {
@@ -272,13 +489,25 @@ function sanitizeDefinition(definition: any, label: string): any {
     }
   }
 
-  // Diagnostic: log what we're sending
+  // Diagnostic: log output shape
   const outputKeys = (def && typeof def === 'object' && !Array.isArray(def))
     ? Object.keys(def)
     : null;
   console.log(`[Flow:Sanitize] Output for '${label}': keys=${outputKeys ? JSON.stringify(outputKeys.slice(0, 20)) : 'N/A'}`);
 
   return def;
+}
+
+/**
+ * Helper: try to extract the first parse error position from a string.
+ */
+function extractFirstErrorPosition(str: string): number | null {
+  try {
+    JSON.parse(str);
+    return null;
+  } catch (e: any) {
+    return extractErrorPosition(e);
+  }
 }
 
 export class PowerPlatformClient {
@@ -301,7 +530,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Private Transport Methods — Service Principal (Read Operations)
+  // Private Transport Methods \u2014 Service Principal (Read Operations)
   // =========================================================================
 
   private async bapRequest(path: string, method: string = 'GET', data?: any): Promise<any> {
@@ -399,7 +628,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Private Transport — Delegated User Token (Write Operations)
+  // Private Transport \u2014 Delegated User Token (Write Operations)
   // =========================================================================
 
   private async userFlowRequest(
@@ -568,7 +797,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows — READ Operations (Flow Admin API — /scopes/admin/ path)
+  // Flows \u2014 READ Operations (Flow Admin API \u2014 /scopes/admin/ path)
   // =========================================================================
 
   async listFlows(envId: string, filter?: string, top?: number): Promise<any> {
@@ -610,15 +839,14 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flows — WRITE Operations (Delegated User Token)
+  // Flows \u2014 WRITE Operations (Delegated User Token)
   // =========================================================================
   //
   // DEFINITION AUTO-FIX PIPELINE (v3.0.2):
-  //   1. sanitizeDefinition() — parse strings, unwrap arrays, strip numeric keys
-  //   2. $schema + contentVersion injection (v3.0.1)
-  //   3. Empty definition guard (v3.0.1)
-  //   4. $connections parameter injection (v3.0.2)
-  //   5. $authentication parameter injection (v3.0.2)
+  //   1. sanitizeDefinition() \u2014 parse strings, repair JSON, unwrap arrays, strip numeric keys
+  //   2. $schema + contentVersion injection
+  //   3. Empty definition guard
+  //   4. $connections + $authentication parameter injection
   //
   // =========================================================================
 
@@ -629,7 +857,7 @@ export class PowerPlatformClient {
     state: string = 'Stopped',
     connectionReferences?: any
   ): Promise<any> {
-    // --- Sanitize definition (v3.0.2 aggressive) ---
+    // --- Sanitize definition (v3.0.2 aggressive + repair) ---
     definition = sanitizeDefinition(definition, displayName);
 
     let fullDefinition = { ...definition };
@@ -726,7 +954,7 @@ export class PowerPlatformClient {
     }
 
     if (updates.definition) {
-      // --- Sanitize definition (v3.0.2 aggressive) ---
+      // --- Sanitize definition (v3.0.2 aggressive + repair) ---
       let def = sanitizeDefinition(updates.definition, `flow ${flowId}`);
 
       def = { ...def };
@@ -785,7 +1013,7 @@ export class PowerPlatformClient {
   }
 
   // =========================================================================
-  // Flow Management — LIFECYCLE (Flow Admin API)
+  // Flow Management \u2014 LIFECYCLE (Flow Admin API)
   // =========================================================================
 
   async enableDisableFlow(envId: string, flowId: string, action: 'start' | 'stop'): Promise<any> {
