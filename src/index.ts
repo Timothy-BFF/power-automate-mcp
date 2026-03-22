@@ -15,7 +15,7 @@ import { registerAuthTools } from './tools/auth-tool-handlers.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '3.0.0';
+const VERSION = '3.0.3';
 
 // =============================================================================
 // Core Services
@@ -114,8 +114,11 @@ const toolDefs: ToolDefinition[] = [
         const envId = resolveEnvironmentId(p.environmentId);
         const result = await client.getFlowDetails(envId, p.flowId);
         // Strip _raw to keep response manageable for agents
-        const { _raw, ...clean } = result;
-        return ok(clean);
+        if (result && result._raw) {
+          const { _raw, ...clean } = result;
+          return ok(clean);
+        }
+        return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
@@ -343,6 +346,10 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // =========================================================================
+  // AUTH TOOLS (Device Code Flow)
+  // Methods: startAuth(), pollAuth(), getAuthStatus()
+  // =========================================================================
   // ---- Auth: Start Device Code Flow ----
   {
     name: 'pa-auth-start',
@@ -352,17 +359,18 @@ const toolDefs: ToolDefinition[] = [
       properties: {
         user_id: { type: 'string', description: 'User email (e.g., jose@company.com).' },
       },
+      required: ['user_id'],
     },
     handler: async (p: any) => {
       try {
-        const result = await userAuthManager.startDeviceCodeFlow(p.user_id);
+        if (!p.user_id) return fail('user_id is required. Provide the user email address.');
+        const result = await userAuthManager.startAuth(p.user_id);
         return ok({
           status: 'device_code_issued',
-          user_code: result.user_code,
-          verification_uri: result.verification_uri,
-          message: result.message || `Visit ${result.verification_uri} and enter code: ${result.user_code}`,
-          expires_in: result.expires_in,
-          interval: result.interval || 5,
+          user_code: result.userCode,
+          verification_uri: result.verificationUri,
+          message: result.message,
+          expires_in: result.expiresIn,
           _note: 'After user signs in, call pa-auth-poll to complete authentication.',
         });
       } catch (e: any) { return fail(e.message); }
@@ -380,24 +388,22 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
-        const result = await userAuthManager.pollForToken(p.user_id);
+        const targetUser = p.user_id || userAuthManager.getDefaultUserId();
+        if (!targetUser) return fail('No user_id provided and no pending auth found. Call pa-auth-start first.');
+        const result = await userAuthManager.pollAuth(targetUser);
         if (result.status === 'authenticated') {
           return ok({
             status: 'authenticated',
-            user_id: result.user_id || p.user_id || userAuthManager.getDefaultUserId(),
-            message: `Authenticated as ${result.user_id || p.user_id || userAuthManager.getDefaultUserId()}. Write operations available.`,
+            user_id: result.userId || targetUser,
+            message: result.message,
+            _note: 'You can now use pa-create-flow, pa-update-flow, and pa-trigger-flow.',
           });
         }
         if (result.status === 'pending') {
-          return ok({ status: 'pending', message: 'User has not yet completed login. Call pa-auth-poll again in 5 seconds.' });
+          return ok({ status: 'pending', message: result.message });
         }
-        return ok({ status: result.status || 'error', message: result.message || 'Authentication failed. Call pa-auth-start again.' });
-      } catch (e: any) {
-        if (e.message?.includes('authorization_pending')) {
-          return ok({ status: 'pending', message: 'User has not yet completed login. Call pa-auth-poll again in 5 seconds.' });
-        }
-        return fail(e.message);
-      }
+        return ok({ status: result.status, message: result.message });
+      } catch (e: any) { return fail(e.message); }
     },
   },
   // ---- Auth: Status ----
@@ -412,17 +418,15 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
-        const hasUser = userAuthManager.hasAuthenticatedUser();
-        const defaultUser = userAuthManager.getDefaultUserId();
-        const targetUser = p.user_id || defaultUser;
-        if (!hasUser) {
-          return ok({ authenticated: false, user_id: targetUser || null, message: 'No authenticated user. Call pa-auth-start.' });
-        }
-        const token = await userAuthManager.getAccessToken(p.user_id);
-        if (token) {
-          return ok({ authenticated: true, user_id: targetUser, message: `Authenticated as ${targetUser}. Write operations available.` });
-        }
-        return ok({ authenticated: false, user_id: targetUser, message: 'Token expired. Call pa-auth-start to re-authenticate.' });
+        const status = userAuthManager.getAuthStatus(p.user_id);
+        return ok({
+          authenticated: status.authenticated,
+          user_id: status.userId,
+          message: status.message,
+          pending: status.pending,
+          authenticatedUsers: status.authenticatedUsers,
+          expiresIn: status.expiresIn,
+        });
       } catch (e: any) { return fail(e.message); }
     },
   },
@@ -464,7 +468,7 @@ function toZodProps(inputSchema: any): Record<string, any> {
 }
 
 // Register all tools on McpServer for SSE transport
-// Non-auth tools registered via toolDefs loop, auth via registerAuthTools
+// Auth tools included in toolDefs so both transports get TOOL_DESCRIPTIONS
 for (const def of toolDefs) {
   if (!def.name.startsWith('pa-auth-')) {
     const zodProps = toZodProps(def.inputSchema);
@@ -474,7 +478,7 @@ for (const def of toolDefs) {
 
 console.log(`[Init] MCP tools registered: ${toolDefs.filter(t => !t.name.startsWith('pa-auth-')).length}`);
 
-// Register auth tools on McpServer (uses TOOL_DESCRIPTIONS via auth-tool-handlers)
+// Register auth tools on McpServer via dedicated handler (uses TOOL_DESCRIPTIONS)
 registerAuthTools(mcpServer, userAuthManager);
 
 // =============================================================================
@@ -617,6 +621,6 @@ app.listen(PORT, () => {
   console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
   console.log(`[Init] Write:  Delegated user token via Device Code Flow`);
   console.log(`[Init] Auth:   ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
-  console.log(`[Init] Tools:  ${toolDefs.length} (including Flow API-backed create + update)`);
+  console.log(`[Init] Tools:  ${toolDefs.length} (15 MCP + 3 auth, enhanced descriptions)`);
   console.log('');
 });
