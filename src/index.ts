@@ -8,8 +8,8 @@ import { PowerPlatformClient } from './api/power-platform-client.js';
 import { resolveEnvironmentId } from './config/environment-resolver.js';
 import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
-import { createV3AuthTools } from './tools/v3-auth-tools.js';
-import { registerAuthTools } from './tools/register-auth-tools.js';
+import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
+import { registerAuthTools } from './tools/auth-tool-handlers.js';
 
 // =============================================================================
 // Configuration
@@ -21,10 +21,10 @@ const VERSION = '3.0.0';
 // Core Services
 // =============================================================================
 const tokenManager = new AzureTokenManager();
-const userAuthManager = new UserAuthManager();                          // BEFORE client
-const client = new PowerPlatformClient(tokenManager, userAuthManager);  // BOTH passed in
+const userAuthManager = new UserAuthManager();
+const client = new PowerPlatformClient(tokenManager, userAuthManager);
 
-// Pre-warm tokens (BAP + Flow + PowerApps scopes; Dataverse scope acquired on-demand)
+// Pre-warm tokens (BAP + Flow + PowerApps scopes)
 (async () => {
   try {
     await tokenManager.getToken('https://api.bap.microsoft.com/.default');
@@ -52,12 +52,15 @@ function fail(msg: string): ToolResult {
 
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
+//
+// v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS which include
+// mandatory flow creation procedure guidance for AI agents.
 // =============================================================================
 const toolDefs: ToolDefinition[] = [
-  // ---- Tool 0: List Environments ----
+  // ---- List Environments ----
   {
     name: 'pa-list-environments',
-    description: 'Lists all Power Platform environments accessible to the configured service principal. Returns environment ID, display name, location, SKU, and lifecycle state for each environment.',
+    description: TOOL_DESCRIPTIONS['pa-list-environments'],
     inputSchema: { type: 'object', properties: {} },
     handler: async () => {
       try {
@@ -70,15 +73,15 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 1: List Flows ----
+  // ---- List Flows ----
   {
     name: 'pa-list-flows',
-    description: 'Lists all Power Automate flows in a Power Platform environment. Returns flow name, display name, state (Started/Stopped), created time, and last modified time. Use filter to narrow by personal or shared flows. Provide environmentId or uses the default configured environment.',
+    description: TOOL_DESCRIPTIONS['pa-list-flows'],
     inputSchema: {
       type: 'object',
       properties: {
         environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
-        filter: { type: 'string', enum: ['personal', 'shared', 'all'], description: 'Filter by ownership type.' },
+        filter: { type: 'string', description: 'Filter: personal, shared, or all.' },
         top: { type: 'number', description: 'Maximum number of flows to return.' },
       },
     },
@@ -90,384 +93,415 @@ const toolDefs: ToolDefinition[] = [
           id: f.name, displayName: f.properties?.displayName, state: f.properties?.state,
           createdTime: f.properties?.createdTime, lastModifiedTime: f.properties?.lastModifiedTime,
         }));
-        return ok({ count: flows.length, environmentId: envId, flows });
+        return ok({ count: flows.length, flows });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 2: Get Flow Details ----
+  // ---- Get Flow Details ----
   {
     name: 'pa-get-flow-details',
-    description: 'Gets detailed information about a specific Power Automate flow including its definition, triggers, actions, connections, and current state.',
+    description: TOOL_DESCRIPTIONS['pa-get-flow-details'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        flowId: { type: 'string', description: 'Flow ID to retrieve details for.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.getFlowDetails(envId, p.flowId);
-        return ok({
-          id: r.name, displayName: r.properties?.displayName, state: r.properties?.state,
-          createdTime: r.properties?.createdTime, lastModifiedTime: r.properties?.lastModifiedTime,
-          definition: r.properties?.definition,
-          triggers: Object.keys(r.properties?.definition?.triggers || {}),
-          actions: Object.keys(r.properties?.definition?.actions || {}),
-          connectionReferences: r.properties?.connectionReferences,
-        });
+        const result = await client.getFlowDetails(envId, p.flowId);
+        // Strip _raw to keep response manageable for agents
+        const { _raw, ...clean } = result;
+        return ok(clean);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 3: Create Flow ----
+  // ---- Create Flow ----
   {
     name: 'pa-create-flow',
-    description: 'Creates a new Power Automate cloud flow. Provide a display name and a workflow definition object containing triggers and actions. The definition follows the Azure Logic Apps workflow definition schema. Common trigger types: Recurrence, Request, OpenApiConnection. Common action types: Compose, HTTP, OpenApiConnection, Condition, ForEach, Scope. Flows are created in Stopped state by default for safety. Use pa-enable-disable-flow to start them after creation. IMPORTANT: This tool requires per-user authentication. If not authenticated, use pa-auth-start first.',
+    description: TOOL_DESCRIPTIONS['pa-create-flow'],
     inputSchema: {
       type: 'object',
       properties: {
-        displayName: { type: 'string', description: 'Display name for the new flow.' },
-        definition: { type: 'object', description: 'Workflow definition with triggers and actions objects.' },
-        state: { type: 'string', enum: ['Started', 'Stopped'], description: 'Initial state. Defaults to Stopped for safety.' },
-        connectionReferences: { type: 'object', description: 'Connection references for connectors used in the flow.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        displayName: { type: 'string', description: 'Flow display name.' },
+        definition: { type: 'object', description: 'Complete workflow definition JSON with triggers and actions.' },
+        state: { type: 'string', description: 'Initial state: Started or Stopped (default: Stopped).' },
+        connectionReferences: { type: 'object', description: 'Connection references for connectors.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['displayName', 'definition'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.displayName) return fail('displayName is required');
-        if (!p.definition) return fail('definition is required');
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.createFlow(envId, p.displayName, p.definition, p.state || 'Stopped', p.connectionReferences);
-        return ok({
-          status: 'created',
-          flowId: r.name || r.flowId,
-          displayName: r.displayName || r.properties?.displayName || p.displayName,
-          state: r.state || r.properties?.state || p.state || 'Stopped',
-          _source: r._source,
-          _authType: r._authType,
-          _idMapping: r._idMapping,
-        });
+        const result = await client.createFlow(envId, p.displayName, p.definition, p.state, p.connectionReferences);
+        return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 4: Update Flow ----
+  // ---- Update Flow ----
   {
     name: 'pa-update-flow',
-    description: 'Updates an existing Power Automate flow. Can modify the display name, workflow definition, state, and connection references. Provide only the properties you want to change. Definition updates must include the complete triggers and actions. IMPORTANT: This tool requires per-user authentication. If not authenticated, use pa-auth-start first.',
+    description: TOOL_DESCRIPTIONS['pa-update-flow'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow to update.' },
-        displayName: { type: 'string', description: 'New display name for the flow.' },
-        definition: { type: 'object', description: 'New workflow definition with triggers and actions.' },
-        state: { type: 'string', enum: ['Started', 'Stopped'], description: 'New state for the flow.' },
+        flowId: { type: 'string', description: 'Flow ID to update.' },
+        displayName: { type: 'string', description: 'New display name.' },
+        definition: { type: 'object', description: 'Updated workflow definition JSON.' },
+        state: { type: 'string', description: 'New state: Started or Stopped.' },
         connectionReferences: { type: 'object', description: 'Updated connection references.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
         const envId = resolveEnvironmentId(p.environmentId);
         const updates: any = {};
         if (p.displayName) updates.displayName = p.displayName;
         if (p.definition) updates.definition = p.definition;
         if (p.state) updates.state = p.state;
         if (p.connectionReferences) updates.connectionReferences = p.connectionReferences;
-        const r = await client.updateFlow(envId, p.flowId, updates);
-        return ok({
-          status: 'updated',
-          flowId: p.flowId,
-          updatedProperties: Object.keys(updates),
-          _source: r._source,
-          _authType: r._authType,
-        });
+        const result = await client.updateFlow(envId, p.flowId, updates);
+        return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 5: Enable / Disable Flow ----
+  // ---- Enable Flow ----
   {
-    name: 'pa-enable-disable-flow',
-    description: 'Enables or disables a Power Automate flow. Use action "start" to enable or "stop" to disable the flow.',
+    name: 'pa-enable-flow',
+    description: TOOL_DESCRIPTIONS['pa-enable-flow'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
-        action: { type: 'string', enum: ['start', 'stop'], description: 'Action to perform.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        flowId: { type: 'string', description: 'Flow ID to enable.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
-      required: ['flowId', 'action'],
+      required: ['flowId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
-        if (!p.action) return fail('action is required (start or stop)');
         const envId = resolveEnvironmentId(p.environmentId);
-        await client.enableDisableFlow(envId, p.flowId, p.action);
-        return ok({ status: p.action === 'start' ? 'enabled' : 'disabled', flowId: p.flowId, action: p.action });
+        await client.enableDisableFlow(envId, p.flowId, 'start');
+        return ok({ status: 'enabled', flowId: p.flowId, message: `Flow ${p.flowId} has been enabled.` });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 6: Delete Flow ----
+  // ---- Disable Flow ----
+  {
+    name: 'pa-disable-flow',
+    description: TOOL_DESCRIPTIONS['pa-disable-flow'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'Flow ID to disable.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+      },
+      required: ['flowId'],
+    },
+    handler: async (p: any) => {
+      try {
+        const envId = resolveEnvironmentId(p.environmentId);
+        await client.enableDisableFlow(envId, p.flowId, 'stop');
+        return ok({ status: 'disabled', flowId: p.flowId, message: `Flow ${p.flowId} has been disabled.` });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Delete Flow ----
   {
     name: 'pa-delete-flow',
-    description: 'Permanently deletes a Power Automate flow. This action cannot be undone. Use with caution.',
+    description: TOOL_DESCRIPTIONS['pa-delete-flow'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow to delete.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        flowId: { type: 'string', description: 'Flow ID to delete.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
         const envId = resolveEnvironmentId(p.environmentId);
         await client.deleteFlow(envId, p.flowId);
-        return ok({ status: 'deleted', flowId: p.flowId });
+        return ok({ status: 'deleted', flowId: p.flowId, message: `Flow ${p.flowId} has been permanently deleted.` });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 7: Trigger Flow ----
+  // ---- Trigger Flow ----
   {
     name: 'pa-trigger-flow',
-    description: 'Manually triggers a Power Automate flow that has an HTTP request trigger. Optionally pass a JSON body to the trigger.',
+    description: TOOL_DESCRIPTIONS['pa-trigger-flow'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow to trigger.' },
-        triggerBody: { type: 'object', description: 'Optional JSON body to pass to the flow trigger.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        flowId: { type: 'string', description: 'Flow ID to trigger.' },
+        body: { type: 'object', description: 'Request body for the trigger.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.triggerFlow(envId, p.flowId, p.triggerBody);
-        return ok({ status: 'triggered', flowId: p.flowId, result: r });
+        const result = await client.triggerFlow(envId, p.flowId, p.body);
+        return ok({ status: 'triggered', flowId: p.flowId, result });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 8: Get Run History ----
+  // ---- Get Run History ----
   {
     name: 'pa-get-run-history',
-    description: 'Gets the run history for a specific Power Automate flow. Returns run ID, status (Succeeded/Failed/Running/Cancelled), start time, end time, and trigger information.',
+    description: TOOL_DESCRIPTIONS['pa-get-run-history'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
+        flowId: { type: 'string', description: 'Flow ID to get run history for.' },
         top: { type: 'number', description: 'Maximum number of runs to return.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.getRunHistory(envId, p.flowId, p.top ? Number(p.top) : undefined);
-        const runs = (r.value || []).map((run: any) => ({
-          id: run.name,
-          status: run.properties?.status,
-          startTime: run.properties?.startTime,
-          endTime: run.properties?.endTime,
-          trigger: run.properties?.trigger?.name,
+        const result = await client.getRunHistory(envId, p.flowId, p.top ? Number(p.top) : undefined);
+        const runs = (result?.value || []).map((r: any) => ({
+          runId: r.name, status: r.properties?.status,
+          startTime: r.properties?.startTime, endTime: r.properties?.endTime,
+          trigger: r.properties?.trigger?.name,
         }));
-        return ok({ count: runs.length, flowId: p.flowId, runs });
+        return ok({ flowId: p.flowId, count: runs.length, runs });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 9: Get Run Details ----
+  // ---- Get Run Details ----
   {
     name: 'pa-get-run-details',
-    description: 'Gets detailed information about a specific flow run including action-level results, inputs, outputs, and timing.',
+    description: TOOL_DESCRIPTIONS['pa-get-run-details'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
-        runId: { type: 'string', description: 'The unique identifier of the run.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        flowId: { type: 'string', description: 'Flow ID.' },
+        runId: { type: 'string', description: 'Run ID to get details for.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId', 'runId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
-        if (!p.runId) return fail('runId is required');
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.getRunDetails(envId, p.flowId, p.runId);
-        return ok({
-          id: r.name,
-          status: r.properties?.status,
-          startTime: r.properties?.startTime,
-          endTime: r.properties?.endTime,
-          trigger: r.properties?.trigger,
-          actions: r.properties?.actions,
-        });
+        const result = await client.getRunDetails(envId, p.flowId, p.runId);
+        return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 10: Cancel Run ----
+  // ---- Cancel Run ----
   {
     name: 'pa-cancel-run',
-    description: 'Cancels a currently running Power Automate flow run.',
+    description: TOOL_DESCRIPTIONS['pa-cancel-run'],
     inputSchema: {
       type: 'object',
       properties: {
-        flowId: { type: 'string', description: 'The unique identifier of the flow.' },
-        runId: { type: 'string', description: 'The unique identifier of the run to cancel.' },
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        flowId: { type: 'string', description: 'Flow ID.' },
+        runId: { type: 'string', description: 'Run ID to cancel.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
       required: ['flowId', 'runId'],
     },
     handler: async (p: any) => {
       try {
-        if (!p.flowId) return fail('flowId is required');
-        if (!p.runId) return fail('runId is required');
         const envId = resolveEnvironmentId(p.environmentId);
         await client.cancelRun(envId, p.flowId, p.runId);
         return ok({ status: 'cancelled', flowId: p.flowId, runId: p.runId });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Tool 11: List Connections ----
+  // ---- List Connections ----
   {
     name: 'pa-list-connections',
-    description: 'Lists all Power Platform connections in an environment. Returns connection ID, display name, status, connector information, and creation time.',
+    description: TOOL_DESCRIPTIONS['pa-list-connections'],
     inputSchema: {
       type: 'object',
       properties: {
-        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
       },
     },
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
-        const r = await client.listConnections(envId);
-        const connections = (r.value || []).map((c: any) => ({
-          id: c.name,
-          displayName: c.properties?.displayName,
-          status: c.properties?.statuses?.[0]?.status,
-          connectorName: c.properties?.apiId,
+        const result = await client.listConnections(envId);
+        const connections = (result?.value || []).map((c: any) => ({
+          connectionId: c.name, displayName: c.properties?.displayName,
+          apiId: c.properties?.apiId, status: c.properties?.statuses?.[0]?.status,
           createdTime: c.properties?.createdTime,
         }));
-        return ok({ count: connections.length, environmentId: envId, connections });
+        return ok({ count: connections.length, connections });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // === v3.0.0: Per-User Delegated Auth Tools ===
-  ...createV3AuthTools(userAuthManager),
+  // ---- Auth: Start Device Code Flow ----
+  {
+    name: 'pa-auth-start',
+    description: TOOL_DESCRIPTIONS['pa-auth-start'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', description: 'User email (e.g., jose@company.com).' },
+      },
+    },
+    handler: async (p: any) => {
+      try {
+        const result = await userAuthManager.startDeviceCodeFlow(p.user_id);
+        return ok({
+          status: 'device_code_issued',
+          user_code: result.user_code,
+          verification_uri: result.verification_uri,
+          message: result.message || `Visit ${result.verification_uri} and enter code: ${result.user_code}`,
+          expires_in: result.expires_in,
+          interval: result.interval || 5,
+          _note: 'After user signs in, call pa-auth-poll to complete authentication.',
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Auth: Poll ----
+  {
+    name: 'pa-auth-poll',
+    description: TOOL_DESCRIPTIONS['pa-auth-poll'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', description: 'User email to poll for.' },
+      },
+    },
+    handler: async (p: any) => {
+      try {
+        const result = await userAuthManager.pollForToken(p.user_id);
+        if (result.status === 'authenticated') {
+          return ok({
+            status: 'authenticated',
+            user_id: result.user_id || p.user_id || userAuthManager.getDefaultUserId(),
+            message: `Authenticated as ${result.user_id || p.user_id || userAuthManager.getDefaultUserId()}. Write operations available.`,
+          });
+        }
+        if (result.status === 'pending') {
+          return ok({ status: 'pending', message: 'User has not yet completed login. Call pa-auth-poll again in 5 seconds.' });
+        }
+        return ok({ status: result.status || 'error', message: result.message || 'Authentication failed. Call pa-auth-start again.' });
+      } catch (e: any) {
+        if (e.message?.includes('authorization_pending')) {
+          return ok({ status: 'pending', message: 'User has not yet completed login. Call pa-auth-poll again in 5 seconds.' });
+        }
+        return fail(e.message);
+      }
+    },
+  },
+  // ---- Auth: Status ----
+  {
+    name: 'pa-auth-status',
+    description: TOOL_DESCRIPTIONS['pa-auth-status'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', description: 'User email to check.' },
+      },
+    },
+    handler: async (p: any) => {
+      try {
+        const hasUser = userAuthManager.hasAuthenticatedUser();
+        const defaultUser = userAuthManager.getDefaultUserId();
+        const targetUser = p.user_id || defaultUser;
+        if (!hasUser) {
+          return ok({ authenticated: false, user_id: targetUser || null, message: 'No authenticated user. Call pa-auth-start.' });
+        }
+        const token = await userAuthManager.getAccessToken(p.user_id);
+        if (token) {
+          return ok({ authenticated: true, user_id: targetUser, message: `Authenticated as ${targetUser}. Write operations available.` });
+        }
+        return ok({ authenticated: false, user_id: targetUser, message: 'Token expired. Call pa-auth-start to re-authenticate.' });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
 ];
 
 // =============================================================================
-// MCP Server Setup (SSE transport)
+// Handler Map (for REST JSON-RPC transport)
 // =============================================================================
-const mcpServer = new McpServer({ name: 'power-automate-mcp', version: VERSION });
-
-// Register tools with MCP server using Zod schemas derived from JSON Schema defs
-const authToolNames = new Set(['pa-auth-start', 'pa-auth-poll', 'pa-auth-status']);
-for (const tool of toolDefs.filter(t => !authToolNames.has(t.name))) {
-  const props = (tool.inputSchema as any).properties || {};
-  const required: string[] = (tool.inputSchema as any).required || [];
-  const shape: Record<string, z.ZodTypeAny> = {};
-
-  for (const [key, val] of Object.entries(props) as [string, any][]) {
-    let zType: z.ZodTypeAny;
-    if (val.type === 'number') {
-      zType = z.number();
-    } else if (val.type === 'object') {
-      zType = z.record(z.any());
-    } else if (val.enum) {
-      zType = z.enum(val.enum as [string, ...string[]]);
-    } else {
-      zType = z.string();
-    }
-    if (val.description) zType = zType.describe(val.description);
-    if (!required.includes(key)) zType = zType.optional();
-    shape[key] = zType;
-  }
-
-  mcpServer.tool(tool.name, tool.description, shape, async (args: any) => {
-    return tool.handler(args);
-  });
-}
-
-// Build handler map for REST/JSON-RPC transport
 const toolHandlers = new Map<string, (params: any) => Promise<ToolResult>>();
-for (const tool of toolDefs) {
-  toolHandlers.set(tool.name, tool.handler);
+for (const def of toolDefs) {
+  toolHandlers.set(def.name, def.handler);
 }
 
-console.log(`[Init] MCP tools registered: ${toolDefs.length}`);
+// =============================================================================
+// MCP Server (SSE transport)
+// =============================================================================
+const mcpServer = new McpServer({
+  name: 'power-automate-mcp',
+  version: VERSION,
+});
+
+// Convert JSON Schema properties to zod for McpServer.tool() registration
+function toZodProps(inputSchema: any): Record<string, any> {
+  const props: Record<string, any> = {};
+  const required = inputSchema?.required || [];
+  for (const [key, val] of Object.entries((inputSchema?.properties || {}) as Record<string, any>)) {
+    const isReq = required.includes(key);
+    let s;
+    if (val.type === 'number') {
+      s = z.number().describe(val.description || key);
+    } else if (val.type === 'object' || val.type === 'array') {
+      s = z.any().describe(val.description || key);
+    } else {
+      s = z.string().describe(val.description || key);
+    }
+    props[key] = isReq ? s : s.optional();
+  }
+  return props;
+}
+
+// Register all tools on McpServer for SSE transport
+// Non-auth tools registered via toolDefs loop, auth via registerAuthTools
+for (const def of toolDefs) {
+  if (!def.name.startsWith('pa-auth-')) {
+    const zodProps = toZodProps(def.inputSchema);
+    mcpServer.tool(def.name, def.description, zodProps, async (params: any) => def.handler(params));
+  }
+}
+
+console.log(`[Init] MCP tools registered: ${toolDefs.filter(t => !t.name.startsWith('pa-auth-')).length}`);
+
+// Register auth tools on McpServer (uses TOOL_DESCRIPTIONS via auth-tool-handlers)
+registerAuthTools(mcpServer, userAuthManager);
 
 // =============================================================================
-// Express App + Middleware
+// Express App
 // =============================================================================
 const app = express();
 const jsonParser = express.json();
+const sseTransports = new Map<string, SSEServerTransport>();
 
-// --- Health Endpoint ---
+// Health endpoint
 app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     version: VERSION,
-    uptime: Math.floor(process.uptime()),
-    auth: {
-      azureAD: process.env.AZURE_CLIENT_ID ? 'configured' : 'missing',
-      simtheoryAuth: process.env.SIMTHEORY_AUTH_TOKEN ? 'configured' : 'missing',
-      userAuth: userAuthManager.isConfigured() ? 'configured (dual-token)' : 'not configured',
-    },
+    tools: toolDefs.length,
+    transport: ['sse', 'rest'],
+    auth: userAuthManager.isConfigured() ? 'dual-token' : 'service-principal-only',
   });
 });
-
-// --- GET Discovery ---
-app.get('/', (_req: Request, res: Response) => {
-  res.json({
-    name: 'power-automate-mcp', version: VERSION, protocol: 'MCP',
-    transport: ['sse', 'json-rpc'],
-    endpoints: { sse: '/sse', messages: '/messages', health: '/health', jsonRpc: ['/', '/mcp', '/api'] },
-  });
-});
-
-app.get('/tools', (_req: Request, res: Response) => {
-  res.json({ tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
-});
-
-app.get('/mcp', (_req: Request, res: Response) => {
-  res.json({ name: 'power-automate-mcp', version: VERSION, status: 'ready' });
-});
-
-app.get('/api', (_req: Request, res: Response) => {
-  res.json({ name: 'power-automate-mcp', version: VERSION, status: 'ready' });
-});
-
-registerAuthTools(mcpServer, userAuthManager);
 
 // --- SSE Transport ---
-const sseTransports = new Map<string, SSEServerTransport>();
-
-app.get('/sse', async (req: Request, res: Response) => {
-  console.log('[SSE] Connection initiated');
-  
-  // ── SSE Reconnect Guard ──────────────────────────────────────
-  // Simtheory.ai may reconnect (keepalive, network blip, session
-  // refresh). The MCP SDK enforces one transport per Protocol
-  // instance. Without this guard, a reconnect crashes the process
-  // with "Already connected to a transport" (protocol.js:217).
+app.get('/sse', async (_req: Request, res: Response) => {
   try {
     await mcpServer.close();
     console.log('[SSE] Previous transport closed (reconnect detected)');
   } catch (_) {
-    // No existing connection — first connect. That's fine.
+    // No existing connection - first connect.
   }
 
   const transport = new SSEServerTransport('/messages', res);
@@ -563,7 +597,6 @@ app.post('/tools', jsonParser, handleJsonRpc);
 // Start
 // =============================================================================
 
-// Diagnostic logging
 console.log('[Init] Environment variable check:');
 console.log(`[Init]   POWER_PLATFORM_ENVIRONMENT_ID = ${process.env.POWER_PLATFORM_ENVIRONMENT_ID ? '"' + process.env.POWER_PLATFORM_ENVIRONMENT_ID + '"' : '(not set)'}`);
 console.log(`[Init]   AZURE_TENANT_ID = ${process.env.AZURE_TENANT_ID ? '(set)' : '(not set)'}`);
