@@ -1,225 +1,162 @@
 /**
- * Auth Tool Handlers — v3.0.0
- * 
- * MCP tool handler implementations for per-user delegated authentication.
- * These are called by the MCP server's tools/call dispatcher in index.ts.
- * 
- * Pattern mirrors Power Interpreter's ms_auth(action) tool.
- * 
- * @version 3.0.0
+ * Power Automate MCP - Auth Tool Handlers (v3.0.3)
+ *
+ * Registers the 3 Device Code Flow authentication tools.
+ * These MUST be called before any write operation.
+ * Descriptions imported from tool-descriptions.ts.
  */
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z } from 'zod';
+import { UserAuthManager } from '../auth/user-auth-manager.js';
+import { TOOL_DESCRIPTIONS } from './tool-descriptions.js';
 
-import {
-  UserAuthManager,
-  AuthStartResult,
-  AuthPollResult,
-  AuthStatusResult,
-} from '../auth/user-auth-manager';
+// =========================================================================
+// Response Helpers
+// =========================================================================
 
-// ——— Tool: pa-auth-start ———————————————————————————————————————
-
-export async function handleAuthStart(
-  args: { user_id: string },
-  userAuthManager: UserAuthManager
-): Promise<{ content: Array<{ type: string; text: string }> }> {
-  try {
-    const result: AuthStartResult = await userAuthManager.startAuth(args.user_id);
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              status: 'device_code_issued',
-              user_id: args.user_id,
-              user_code: result.userCode,
-              verification_uri: result.verificationUri,
-              expires_in_seconds: result.expiresIn,
-              instructions: result.message,
-              next_step:
-                'After the user completes login at the URL above, call pa-auth-poll to finish authentication.',
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  } catch (error: any) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              status: 'error',
-              error: error.message,
-              suggestion: !userAuthManager.isConfigured()
-                ? 'Delegated auth is not configured. Set PA_USER_CLIENT_ID and PA_USER_TENANT_ID in environment variables.'
-                : 'Check Azure AD App Registration configuration and ensure Device Code Flow is enabled.',
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
+function jsonResponse(data: any): { content: Array<{ type: 'text'; text: string }> } {
+  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
 
-// ——— Tool: pa-auth-poll ————————————————————————————————————————
-
-export async function handleAuthPoll(
-  args: { user_id?: string },
-  userAuthManager: UserAuthManager
-): Promise<{ content: Array<{ type: string; text: string }> }> {
-  try {
-    const result: AuthPollResult = await userAuthManager.pollAuth(args.user_id);
-
-    const response: Record<string, any> = {
-      status: result.status,
-      message: result.message,
-    };
-
-    if (result.userId) {
-      response.user_id = result.userId;
-    }
-
-    // Add next-step guidance based on status
-    switch (result.status) {
-      case 'authenticated':
-        response.next_step =
-          'Authentication complete. Write operations (create/update/delete flows) are now available for this user.';
-        break;
-      case 'pending':
-        response.next_step =
-          'User has not completed login yet. Wait a few seconds and call pa-auth-poll again.';
-        break;
-      case 'expired':
-        response.next_step =
-          'Device code has expired. Call pa-auth-start to begin a new authentication.';
-        break;
-      case 'error':
-        response.next_step =
-          'An error occurred. Review the message and try pa-auth-start again if needed.';
-        break;
-    }
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response, null, 2),
-        },
-      ],
-    };
-  } catch (error: any) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              status: 'error',
-              error: error.message,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
+function errorResponse(error: any): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  const msg = error?.message || String(error);
+  console.error(`[AuthTool] Error: ${msg}`);
+  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
 }
 
-// ——— Tool: pa-auth-status ——————————————————————————————————————
+// =========================================================================
+// Auth Tool Registration
+// =========================================================================
 
-export function handleAuthStatus(
-  args: { user_id?: string },
-  userAuthManager: UserAuthManager
-): { content: Array<{ type: string; text: string }> } {
-  try {
-    const result: AuthStatusResult = userAuthManager.getStatus(args.user_id);
+export function registerAuthTools(
+  server: McpServer,
+  userAuth: UserAuthManager
+): number {
+  let count = 0;
 
-    const response: Record<string, any> = {
-      authenticated: result.authenticated,
-      message: result.message,
-    };
-
-    if (result.userId) {
-      response.user_id = result.userId;
+  // -----------------------------------------------------------------------
+  // pa-auth-start: Initiate Device Code Flow
+  // -----------------------------------------------------------------------
+  server.tool(
+    'pa-auth-start',
+    TOOL_DESCRIPTIONS['pa-auth-start'],
+    {
+      user_id: z.string().optional().describe('User email (e.g., jose@company.com). If omitted, uses last authenticated user.'),
+    },
+    async ({ user_id }) => {
+      try {
+        const result = await userAuth.startDeviceCodeFlow(user_id);
+        return jsonResponse({
+          status: 'device_code_issued',
+          user_code: result.user_code,
+          verification_uri: result.verification_uri,
+          message: result.message || `To sign in, visit ${result.verification_uri} and enter the code: ${result.user_code}`,
+          expires_in: result.expires_in,
+          interval: result.interval || 5,
+          _note: 'After the user enters the code and signs in, call pa-auth-poll to complete authentication.',
+        });
+      } catch (error: any) {
+        return errorResponse(error);
+      }
     }
+  );
+  count++;
 
-    if (result.expiresIn !== undefined) {
-      response.expires_in_seconds = result.expiresIn;
-      response.expires_in_minutes = Math.floor(result.expiresIn / 60);
+  // -----------------------------------------------------------------------
+  // pa-auth-poll: Poll for authentication completion
+  // -----------------------------------------------------------------------
+  server.tool(
+    'pa-auth-poll',
+    TOOL_DESCRIPTIONS['pa-auth-poll'],
+    {
+      user_id: z.string().optional().describe('User email to poll for. If omitted, polls for the most recent pending auth.'),
+    },
+    async ({ user_id }) => {
+      try {
+        const result = await userAuth.pollForToken(user_id);
+
+        if (result.status === 'authenticated') {
+          return jsonResponse({
+            status: 'authenticated',
+            user_id: result.user_id || user_id || userAuth.getDefaultUserId(),
+            message: `Successfully authenticated as ${result.user_id || user_id || userAuth.getDefaultUserId()}. Write operations are now available.`,
+            _note: 'You can now use pa-create-flow, pa-update-flow, and pa-trigger-flow.',
+          });
+        }
+
+        if (result.status === 'pending') {
+          return jsonResponse({
+            status: 'pending',
+            message: 'User has not yet completed login. Call pa-auth-poll again in 5 seconds.',
+            _note: 'The user needs to visit microsoft.com/devicelogin and enter the code from pa-auth-start.',
+          });
+        }
+
+        // Expired or error
+        return jsonResponse({
+          status: result.status || 'error',
+          message: result.message || 'Authentication failed or expired. Call pa-auth-start to try again.',
+          error: result.error,
+        });
+      } catch (error: any) {
+        // Handle authorization_pending as a "pending" response, not an error
+        if (error.message?.includes('authorization_pending')) {
+          return jsonResponse({
+            status: 'pending',
+            message: 'User has not yet completed login. Call pa-auth-poll again in 5 seconds.',
+          });
+        }
+        return errorResponse(error);
+      }
     }
+  );
+  count++;
 
-    // Include list of all authenticated users
-    const authenticatedUsers = userAuthManager.listAuthenticatedUsers();
-    if (authenticatedUsers.length > 0) {
-      response.authenticated_users = authenticatedUsers;
+  // -----------------------------------------------------------------------
+  // pa-auth-status: Check current authentication state
+  // -----------------------------------------------------------------------
+  server.tool(
+    'pa-auth-status',
+    TOOL_DESCRIPTIONS['pa-auth-status'],
+    {
+      user_id: z.string().optional().describe('User email to check. If omitted, checks default/last authenticated user.'),
+    },
+    async ({ user_id }) => {
+      try {
+        const hasUser = userAuth.hasAuthenticatedUser();
+        const defaultUser = userAuth.getDefaultUserId();
+        const targetUser = user_id || defaultUser;
+
+        if (!hasUser) {
+          return jsonResponse({
+            authenticated: false,
+            user_id: targetUser || null,
+            message: 'No authenticated user. Call pa-auth-start to begin Device Code Flow.',
+          });
+        }
+
+        // Try to get a token to verify it's still valid
+        const token = await userAuth.getAccessToken(user_id);
+        if (token) {
+          return jsonResponse({
+            authenticated: true,
+            user_id: targetUser,
+            message: `Authenticated as ${targetUser}. Write operations are available.`,
+          });
+        }
+
+        return jsonResponse({
+          authenticated: false,
+          user_id: targetUser,
+          message: 'Token expired or invalid. Call pa-auth-start to re-authenticate.',
+        });
+      } catch (error: any) {
+        return errorResponse(error);
+      }
     }
+  );
+  count++;
 
-    // Include delegated auth configuration status
-    response.delegated_auth_configured = userAuthManager.isConfigured();
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response, null, 2),
-        },
-      ],
-    };
-  } catch (error: any) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              status: 'error',
-              error: error.message,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
-}
-
-// ——— Tool Dispatcher ——————————————————————————————————————————
-
-/**
- * Dispatch an auth tool call to the appropriate handler.
- * This function is designed to be called from the MCP server's
- * tools/call handler in index.ts.
- * 
- * @param toolName - One of 'pa-auth-start', 'pa-auth-poll', 'pa-auth-status'
- * @param args - The tool arguments from the MCP request
- * @param userAuthManager - The UserAuthManager instance
- * @returns MCP tool response
- */
-export async function dispatchAuthTool(
-  toolName: string,
-  args: Record<string, any>,
-  userAuthManager: UserAuthManager
-): Promise<{ content: Array<{ type: string; text: string }> } | null> {
-  switch (toolName) {
-    case 'pa-auth-start':
-      return handleAuthStart(args as { user_id: string }, userAuthManager);
-
-    case 'pa-auth-poll':
-      return handleAuthPoll(args as { user_id?: string }, userAuthManager);
-
-    case 'pa-auth-status':
-      return handleAuthStatus(args as { user_id?: string }, userAuthManager);
-
-    default:
-      return null; // Not an auth tool — let the existing handler process it
-  }
+  console.log(`[AuthTools] ${count} auth tools registered with McpServer (SSE transport)`);
+  return count;
 }
