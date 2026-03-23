@@ -1,6 +1,8 @@
 /**
  * PowerPlatformClient — HTTP client for Power Platform APIs
  *
+ * v3.1.0: Added getConnectionDetails() and deleteConnection() methods
+ *
  * v3.0.3: Dual-path GET for getFlowDetails with metadata fields:
  *   _fetchedVia, _definitionStatus, _definitionNote
  *
@@ -9,7 +11,7 @@
  *   - Delegated user (UserAuthManager) for write operations + user-scoped reads
  *   - getFlowDetails: tries delegated first, falls back to admin
  *
- * @version 3.0.3
+ * @version 3.1.0
  */
 
 import axios from 'axios';
@@ -458,5 +460,26 @@ export class PowerPlatformClient {
   async listConnections(envId: string): Promise<any> {
     const path = `/scopes/admin/environments/${envId}/connections`;
     return this.adminFlowRequest(path);
+  }
+
+  /**
+   * Gets details of a specific connection.
+   * v3.1.0: New method — wired to pa-get-connection tool.
+   */
+  async getConnectionDetails(envId: string, connectionName: string): Promise<any> {
+    const path = `/scopes/admin/environments/${envId}/connections/${connectionName}`;
+    return this.adminFlowRequest(path);
+  }
+
+  /**
+   * Deletes a connection permanently.
+   * v3.1.0: New method — wired to pa-delete-connection tool.
+   *
+   * WARNING: Deleting a connection may break flows that depend on it.
+   */
+  async deleteConnection(envId: string, connectionName: string): Promise<void> {
+    const path = `/scopes/admin/environments/${envId}/connections/${connectionName}`;
+    await this.adminFlowRequest(path, 'DELETE');
+    console.log(`[deleteConnection] Connection ${connectionName} deleted`);
   }
 }

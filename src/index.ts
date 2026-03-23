@@ -15,7 +15,7 @@ import { registerAuthTools } from './tools/auth-tool-handlers.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '3.0.3';
+const VERSION = '3.1.0';
 
 // =============================================================================
 // Core Services
@@ -53,6 +53,7 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
+// v3.1.0: Added pa-get-connection and pa-delete-connection tools.
 // v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS which include
 // mandatory flow creation procedure guidance for AI agents.
 // =============================================================================
@@ -346,6 +347,61 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Get Connection Details ----
+  {
+    name: 'pa-get-connection',
+    description: TOOL_DESCRIPTIONS['pa-get-connection'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        connectionId: { type: 'string', description: 'Connection ID (name field from pa-list-connections).' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+      },
+      required: ['connectionId'],
+    },
+    handler: async (p: any) => {
+      try {
+        const envId = resolveEnvironmentId(p.environmentId);
+        const result = await client.getConnectionDetails(envId, p.connectionId);
+        const c = result;
+        return ok({
+          connectionId: c.name,
+          displayName: c.properties?.displayName,
+          apiId: c.properties?.apiId,
+          connectorDisplayName: c.properties?.apiId?.split('/').pop(),
+          status: c.properties?.statuses?.[0]?.status,
+          createdTime: c.properties?.createdTime,
+          createdBy: c.properties?.createdBy,
+          statuses: c.properties?.statuses,
+          connectionParameters: c.properties?.connectionParametersSet || null,
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Delete Connection ----
+  {
+    name: 'pa-delete-connection',
+    description: TOOL_DESCRIPTIONS['pa-delete-connection'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        connectionId: { type: 'string', description: 'Connection ID (name field) to delete.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+      },
+      required: ['connectionId'],
+    },
+    handler: async (p: any) => {
+      try {
+        const envId = resolveEnvironmentId(p.environmentId);
+        await client.deleteConnection(envId, p.connectionId);
+        return ok({
+          status: 'deleted',
+          connectionId: p.connectionId,
+          message: `Connection ${p.connectionId} has been permanently deleted.`,
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
   // =========================================================================
   // AUTH TOOLS (Device Code Flow)
   // Methods: startAuth(), pollAuth(), getAuthStatus()
@@ -476,7 +532,8 @@ for (const def of toolDefs) {
   }
 }
 
-console.log(`[Init] MCP tools registered: ${toolDefs.filter(t => !t.name.startsWith('pa-auth-')).length}`);
+const mcpToolCount = toolDefs.filter(t => !t.name.startsWith('pa-auth-')).length;
+console.log(`[Init] MCP tools registered: ${mcpToolCount}`);
 
 // Register auth tools on McpServer via dedicated handler (uses TOOL_DESCRIPTIONS)
 registerAuthTools(mcpServer, userAuthManager);
@@ -621,6 +678,6 @@ app.listen(PORT, () => {
   console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
   console.log(`[Init] Write:  Delegated user token via Device Code Flow`);
   console.log(`[Init] Auth:   ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
-  console.log(`[Init] Tools:  ${toolDefs.length} (15 MCP + 3 auth, enhanced descriptions)`);
+  console.log(`[Init] Tools:  ${toolDefs.length} (${mcpToolCount} MCP + 3 auth, enhanced descriptions)`);
   console.log('');
 });
