@@ -1,6 +1,6 @@
 /**
  * Tool Descriptions for Power Automate MCP
- * v3.0.3 - Includes flow creation procedure guidance
+ * v3.1.0 - Added pa-get-connection and pa-delete-connection
  *
  * These descriptions are embedded in the MCP tool schema and visible
  * to AI agents when they discover available tools. The procedure
@@ -8,7 +8,7 @@
  * on misread API responses.
  */
 
-export const TOOL_DESCRIPTIONS = {
+export const TOOL_DESCRIPTIONS: Record<string, string> = {
   // =========================================================================
   // AUTH TOOLS
   // =========================================================================
@@ -181,7 +181,21 @@ export const TOOL_DESCRIPTIONS = {
     'List API connections in the environment.',
     'Shows connection status, type, and authorization state.',
   ].join('\n'),
-} as const;
+
+  'pa-get-connection': [
+    'Get details for a specific API connection.',
+    'Returns connection status, connector type, authorization state, and creator info.',
+    'Requires the connectionId (name field) from pa-list-connections.',
+  ].join('\n'),
+
+  'pa-delete-connection': [
+    'Delete an API connection from the environment permanently.',
+    '',
+    'WARNING: Deleting a connection may break flows that depend on it.',
+    'Check which flows reference this connection before deleting.',
+    'This action cannot be undone.',
+  ].join('\n'),
+};
 
 /**
  * Flow Creation Procedure Summary (for embedding in system prompts)
