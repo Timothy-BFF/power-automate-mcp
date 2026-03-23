@@ -5,6 +5,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import { AzureTokenManager } from './auth/azure-token-manager.js';
 import { PowerPlatformClient } from './api/power-platform-client.js';
+import { SolutionClient } from './clients/solution-client.js';
 import { resolveEnvironmentId } from './config/environment-resolver.js';
 import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
@@ -15,7 +16,7 @@ import { registerAuthTools } from './tools/auth-tool-handlers.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 
 // =============================================================================
 // Core Services
@@ -23,8 +24,9 @@ const VERSION = '3.1.0';
 const tokenManager = new AzureTokenManager();
 const userAuthManager = new UserAuthManager();
 const client = new PowerPlatformClient(tokenManager, userAuthManager);
+const solutionClient = new SolutionClient(tokenManager);
 
-// Pre-warm tokens (BAP + Flow + PowerApps scopes)
+// Pre-warm tokens (BAP + Flow + PowerApps + Dataverse scopes)
 (async () => {
   try {
     await tokenManager.getToken('https://api.bap.microsoft.com/.default');
@@ -38,6 +40,13 @@ const client = new PowerPlatformClient(tokenManager, userAuthManager);
     await tokenManager.getToken('https://service.powerapps.com/.default');
     console.log('[Init] PowerApps token acquired (service.powerapps.com)');
   } catch (e: any) { console.warn('[Init] PowerApps token pre-warm failed:', e.message); }
+  // Dataverse scope (if configured)
+  if (solutionClient.isConfigured()) {
+    try {
+      await tokenManager.getToken(solutionClient.getScope());
+      console.log(`[Init] Dataverse token acquired (${process.env.DATAVERSE_URL})`);
+    } catch (e: any) { console.warn('[Init] Dataverse token pre-warm failed:', e.message); }
+  }
 })();
 
 // =============================================================================
@@ -53,9 +62,9 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
+// v3.2.0: Added 5 Dataverse Solutions tools.
 // v3.1.0: Added pa-get-connection and pa-delete-connection tools.
-// v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS which include
-// mandatory flow creation procedure guidance for AI agents.
+// v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS.
 // =============================================================================
 const toolDefs: ToolDefinition[] = [
   // ---- List Environments ----
@@ -114,7 +123,6 @@ const toolDefs: ToolDefinition[] = [
       try {
         const envId = resolveEnvironmentId(p.environmentId);
         const result = await client.getFlowDetails(envId, p.flowId);
-        // Strip _raw to keep response manageable for agents
         if (result && result._raw) {
           const { _raw, ...clean } = result;
           return ok(clean);
@@ -403,8 +411,127 @@ const toolDefs: ToolDefinition[] = [
     },
   },
   // =========================================================================
+  // DATAVERSE SOLUTIONS TOOLS (v3.2.0)
+  // =========================================================================
+  // ---- List Solutions ----
+  {
+    name: 'pa-list-solutions',
+    description: TOOL_DESCRIPTIONS['pa-list-solutions'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        includeManaged: { type: 'boolean', description: 'Include managed solutions (default: false, shows unmanaged only).' },
+      },
+    },
+    handler: async (p: any) => {
+      try {
+        const solutions = await solutionClient.listSolutions(p.includeManaged === true);
+        return ok({ count: solutions.length, solutions });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Get Solution Details ----
+  {
+    name: 'pa-get-solution',
+    description: TOOL_DESCRIPTIONS['pa-get-solution'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solutionId: { type: 'string', description: 'Solution GUID or unique name.' },
+      },
+      required: ['solutionId'],
+    },
+    handler: async (p: any) => {
+      try {
+        const solution = await solutionClient.getSolution(p.solutionId);
+        return ok(solution);
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- List Solution Components ----
+  {
+    name: 'pa-list-solution-components',
+    description: TOOL_DESCRIPTIONS['pa-list-solution-components'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solutionId: { type: 'string', description: 'Solution GUID (from pa-list-solutions or pa-get-solution).' },
+      },
+      required: ['solutionId'],
+    },
+    handler: async (p: any) => {
+      try {
+        const components = await solutionClient.listSolutionComponents(p.solutionId);
+        // Group by type for readability
+        const byType: Record<string, number> = {};
+        for (const c of components) {
+          byType[c.componentTypeName] = (byType[c.componentTypeName] || 0) + 1;
+        }
+        return ok({ count: components.length, componentsByType: byType, components });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Export Solution ----
+  {
+    name: 'pa-export-solution',
+    description: TOOL_DESCRIPTIONS['pa-export-solution'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solutionUniqueName: { type: 'string', description: 'Solution unique name (from pa-list-solutions).' },
+        managed: { type: 'boolean', description: 'Export as managed solution (default: false).' },
+      },
+      required: ['solutionUniqueName'],
+    },
+    handler: async (p: any) => {
+      try {
+        const result = await solutionClient.exportSolution(
+          p.solutionUniqueName,
+          p.managed === true
+        );
+        return ok({
+          status: 'exported',
+          fileName: result.fileName,
+          sizeBytes: result.sizeBytes,
+          sizeHuman: result.sizeBytes < 1024
+            ? `${result.sizeBytes} bytes`
+            : result.sizeBytes < 1048576
+              ? `${Math.round(result.sizeBytes / 1024)}KB`
+              : `${(result.sizeBytes / 1048576).toFixed(1)}MB`,
+          managed: p.managed === true,
+          base64Content: result.base64Content,
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Add Solution Component ----
+  {
+    name: 'pa-add-solution-component',
+    description: TOOL_DESCRIPTIONS['pa-add-solution-component'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solutionUniqueName: { type: 'string', description: 'Solution unique name to add the component to.' },
+        componentId: { type: 'string', description: 'GUID of the component (e.g., flow ID).' },
+        componentType: { type: 'number', description: 'Component type code (default: 29 = Cloud Flow).' },
+        addRequiredComponents: { type: 'boolean', description: 'Auto-include dependencies (default: false).' },
+      },
+      required: ['solutionUniqueName', 'componentId'],
+    },
+    handler: async (p: any) => {
+      try {
+        const result = await solutionClient.addSolutionComponent(
+          p.solutionUniqueName,
+          p.componentId,
+          p.componentType != null ? Number(p.componentType) : 29,
+          p.addRequiredComponents === true
+        );
+        return ok(result);
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // =========================================================================
   // AUTH TOOLS (Device Code Flow)
-  // Methods: startAuth(), pollAuth(), getAuthStatus()
   // =========================================================================
   // ---- Auth: Start Device Code Flow ----
   {
@@ -513,6 +640,8 @@ function toZodProps(inputSchema: any): Record<string, any> {
     let s;
     if (val.type === 'number') {
       s = z.number().describe(val.description || key);
+    } else if (val.type === 'boolean') {
+      s = z.boolean().describe(val.description || key);
     } else if (val.type === 'object' || val.type === 'array') {
       s = z.any().describe(val.description || key);
     } else {
@@ -524,7 +653,6 @@ function toZodProps(inputSchema: any): Record<string, any> {
 }
 
 // Register all tools on McpServer for SSE transport
-// Auth tools included in toolDefs so both transports get TOOL_DESCRIPTIONS
 for (const def of toolDefs) {
   if (!def.name.startsWith('pa-auth-')) {
     const zodProps = toZodProps(def.inputSchema);
@@ -553,6 +681,7 @@ app.get('/health', (_req: Request, res: Response) => {
     tools: toolDefs.length,
     transport: ['sse', 'rest'],
     auth: userAuthManager.isConfigured() ? 'dual-token' : 'service-principal-only',
+    dataverse: solutionClient.isConfigured() ? 'configured' : 'not-configured',
   });
 });
 
@@ -661,6 +790,7 @@ app.post('/tools', jsonParser, handleJsonRpc);
 console.log('[Init] Environment variable check:');
 console.log(`[Init]   POWER_PLATFORM_ENVIRONMENT_ID = ${process.env.POWER_PLATFORM_ENVIRONMENT_ID ? '"' + process.env.POWER_PLATFORM_ENVIRONMENT_ID + '"' : '(not set)'}`);
 console.log(`[Init]   AZURE_TENANT_ID = ${process.env.AZURE_TENANT_ID ? '(set)' : '(not set)'}`);
+console.log(`[Init]   DATAVERSE_URL = ${process.env.DATAVERSE_URL ? '"' + process.env.DATAVERSE_URL + '"' : '(not set)'}`);
 
 try {
   const defaultEnv = resolveEnvironmentId();
@@ -672,12 +802,13 @@ try {
 app.listen(PORT, () => {
   console.log('');
   console.log(`[Init] Power Automate MCP v${VERSION} running on port ${PORT}`);
-  console.log(`[Init] SSE:    http://localhost:${PORT}/sse`);
-  console.log(`[Init] REST:   http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
-  console.log(`[Init] Health: http://localhost:${PORT}/health`);
-  console.log(`[Init] API:    BAP admin + Flow admin + PowerApps admin (3 scopes)`);
-  console.log(`[Init] Write:  Delegated user token via Device Code Flow`);
-  console.log(`[Init] Auth:   ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
-  console.log(`[Init] Tools:  ${toolDefs.length} (${mcpToolCount} MCP + 3 auth, enhanced descriptions)`);
+  console.log(`[Init] SSE:       http://localhost:${PORT}/sse`);
+  console.log(`[Init] REST:      http://localhost:${PORT}/mcp (+ /, /api, /tools)`);
+  console.log(`[Init] Health:    http://localhost:${PORT}/health`);
+  console.log(`[Init] API:       BAP admin + Flow admin + PowerApps admin (3 scopes)`);
+  console.log(`[Init] Dataverse: ${solutionClient.isConfigured() ? process.env.DATAVERSE_URL + ' (configured)' : 'Not configured (set DATAVERSE_URL)'}`);
+  console.log(`[Init] Write:     Delegated user token via Device Code Flow`);
+  console.log(`[Init] Auth:      ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
+  console.log(`[Init] Tools:     ${toolDefs.length} (${mcpToolCount} MCP + 3 auth)`);
   console.log('');
 });
