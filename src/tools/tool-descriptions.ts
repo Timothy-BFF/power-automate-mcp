@@ -1,6 +1,6 @@
 /**
  * Tool Descriptions for Power Automate MCP
- * v3.1.0 - Added pa-get-connection and pa-delete-connection
+ * v3.2.0 - Added Dataverse Solutions tools
  *
  * These descriptions are embedded in the MCP tool schema and visible
  * to AI agents when they discover available tools. The procedure
@@ -195,13 +195,83 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
     'Check which flows reference this connection before deleting.',
     'This action cannot be undone.',
   ].join('\n'),
+
+  // =========================================================================
+  // DATAVERSE SOLUTIONS TOOLS (v3.2.0)
+  // =========================================================================
+
+  'pa-list-solutions': [
+    'List Dataverse solutions in the environment.',
+    'Returns solution unique names, versions, managed/unmanaged status.',
+    '',
+    'By default shows only unmanaged solutions.',
+    'Set includeManaged=true to include Microsoft and third-party managed solutions.',
+    '',
+    'REQUIRES: DATAVERSE_URL environment variable configured.',
+  ].join('\n'),
+
+  'pa-get-solution': [
+    'Get details for a specific Dataverse solution.',
+    'Accepts either a solution GUID or unique name (case-sensitive).',
+    '',
+    'Returns version, description, publisher, managed status, and timestamps.',
+    '',
+    'REQUIRES: DATAVERSE_URL environment variable configured.',
+  ].join('\n'),
+
+  'pa-list-solution-components': [
+    'List all components within a Dataverse solution.',
+    'Returns component types (Entity, Workflow, Canvas App, etc.) and object IDs.',
+    '',
+    'Common component types:',
+    '  29 = Cloud Flow (Workflow)',
+    '  1  = Entity (Table)',
+    '  300 = Canvas App',
+    '  372 = Environment Variable',
+    '',
+    'Use the solutionId (GUID) from pa-list-solutions or pa-get-solution.',
+    '',
+    'REQUIRES: DATAVERSE_URL environment variable configured.',
+  ].join('\n'),
+
+  'pa-export-solution': [
+    'Export a Dataverse solution as a ZIP file (base64 encoded).',
+    '',
+    'Returns the solution file as base64 plus metadata (fileName, sizeBytes).',
+    'Set managed=true to export as a managed solution.',
+    '',
+    'Use solutionUniqueName (not friendly name) from pa-list-solutions.',
+    '',
+    'NOTE: Large solutions may produce very large responses.',
+    '',
+    'REQUIRES: DATAVERSE_URL environment variable configured.',
+  ].join('\n'),
+
+  'pa-add-solution-component': [
+    'Add a component (e.g., a Cloud Flow) to a Dataverse solution.',
+    '',
+    'This is the key ALM operation: it registers an existing component',
+    '(flow, table, app, etc.) into a solution for packaging and deployment.',
+    '',
+    'Parameters:',
+    '  solutionUniqueName — Solution to add the component to',
+    '  componentId — GUID of the component (e.g., flow ID from pa-list-flows)',
+    '  componentType — Numeric type code (default: 29 = Cloud Flow)',
+    '',
+    'Common component types:',
+    '  29  = Cloud Flow (Workflow)',
+    '  1   = Entity (Table)',
+    '  300 = Canvas App',
+    '  372 = Environment Variable Definition',
+    '',
+    'Set addRequiredComponents=true to auto-include dependencies.',
+    '',
+    'REQUIRES: DATAVERSE_URL environment variable configured.',
+  ].join('\n'),
 };
 
 /**
  * Flow Creation Procedure Summary (for embedding in system prompts)
- *
- * This is a compact version of the full procedure from
- * docs/skills/flow-creation-procedure.md
  */
 export const FLOW_CREATION_PROCEDURE = [
   'FLOW CREATION SEQUENCE (mandatory):',
