@@ -75,7 +75,8 @@ function fail(msg: string): ToolResult {
 //
 // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
 //         Fixed pa-create-connection (multi-scope refresh token exchange +
-//         correct PUT endpoint with connector in path + env as filter).
+//         correct PUT endpoint with connector in path + env as filter +
+//         defensive null check on connectorId to prevent startsWith crash).
 //         Added pa-create-solution, pa-delete-solution, pa-create-connection.
 //         Unified tool registration — all 26 tools through one loop.
 //         Total: 26 tools.
@@ -352,7 +353,8 @@ const toolDefs: ToolDefinition[] = [
   // =========================================================================
   // CONNECTION TOOLS
   // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
-  //         Fixed pa-create-connection (multi-scope token + correct PUT endpoint)
+  //         Fixed pa-create-connection (multi-scope token + correct PUT endpoint
+  //         + defensive null checks on connectorId and user_id)
   // =========================================================================
   // ---- List Connections (v3.3.0 FIX: PowerApps host + PowerApps token) ----
   {
@@ -457,22 +459,17 @@ const toolDefs: ToolDefinition[] = [
     },
   },
   // =========================================================================
-  // Create Connection (v3.3.0 FIX round 3)
+  // Create Connection (v3.3.0 FIX round 3 + defensive null checks)
   //
   // Previous attempts:
   //   Round 1 (930cda56): POST /environments/{env}/connections → 403 (wrong token scope)
   //   Round 2 (7e1aef7b): POST /environments/{env}/connections + PowerApps token → 404 (wrong URL)
+  //   Round 3 (31e679ab): PUT /apis/{connector}/connections/{name} → SUCCESS for Timothy,
+  //                        but Jose hit startsWith crash when agent omitted connectorId
   //
-  // Fix: The PowerApps connection creation API uses a completely different
-  // URL pattern than listing. The connector goes IN the URL path and the
-  // environment is passed as a query filter:
-  //
-  //   PUT /providers/Microsoft.PowerApps/apis/{connectorName}/connections/{newId}
-  //       ?api-version=2016-11-01&$filter=environment eq '{envId}'
-  //
-  // For OAuth connectors (shared_office365, etc.), the API creates the
-  // connection shell but the user must authorize it in the Power Automate
-  // portal. The response may include a consentLink or an Error status.
+  // Fix: Added defensive null/type checks on connectorId and user_id before
+  // any property access. Returns clean actionable error messages that agents
+  // can self-correct on instead of raw TypeError stack traces.
   // =========================================================================
   {
     name: 'pa-create-connection',
@@ -490,7 +487,24 @@ const toolDefs: ToolDefinition[] = [
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
-        if (!p.user_id) return fail('user_id is required for creating connections. Use pa-auth-start first.');
+
+        // =================================================================
+        // Defensive null/type checks (prevents startsWith crash)
+        // Jose's agent hit TypeError when connectorId was undefined/null.
+        // =================================================================
+        if (!p.connectorId || typeof p.connectorId !== 'string') {
+          return fail(
+            'connectorId is required and must be a string. ' +
+            'Examples: "shared_office365", "shared_sharepointonline", "shared_sql", "shared_teams". ' +
+            'Use pa-list-connections to see available connectors in the environment.'
+          );
+        }
+        if (!p.user_id || typeof p.user_id !== 'string') {
+          return fail(
+            'user_id is required and must be a string (email address). ' +
+            'Example: "jose@company.com". Use pa-auth-start first to authenticate the user.'
+          );
+        }
 
         // Acquire PowerApps-scoped delegated token via refresh token exchange
         const userToken = await userAuthManager.getAccessTokenForScope(
