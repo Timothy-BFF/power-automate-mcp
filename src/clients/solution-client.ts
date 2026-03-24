@@ -1,7 +1,10 @@
 /**
  * Solution Client — Power Automate MCP (Dataverse Web API)
  * v3.2.0: Initial (list, get, components, add-component, export)
- * v3.3.0: Added createSolution, deleteSolution
+ * v3.3.0: Added createSolution, deleteSolution, fixed component type 10089
+ *
+ * Constructor takes (tokenManager) only — reads DATAVERSE_URL from env.
+ * Exposes isConfigured() and getScope() for index.ts compatibility.
  */
 import axios from 'axios';
 
@@ -62,32 +65,56 @@ export class SolutionClient {
   private tokenProvider: TokenProvider;
   private _configured: boolean;
 
-  constructor(dataverseUrl: string | undefined, tokenProvider: TokenProvider) {
+  /**
+   * Constructor — takes tokenManager only (1 argument).
+   * Reads DATAVERSE_URL from process.env internally.
+   * This matches the call in index.ts: new SolutionClient(tokenManager)
+   */
+  constructor(tokenProvider: TokenProvider) {
+    const dataverseUrl = process.env.DATAVERSE_URL;
+    this.tokenProvider = tokenProvider;
+
     if (!dataverseUrl) {
       this._configured = false;
       this.dataverseUrl = '';
       this.scope = '';
       this.apiBase = '';
-      this.tokenProvider = tokenProvider;
       console.log('[SolutionClient] Dataverse not configured (DATAVERSE_URL missing)');
       return;
     }
 
-    this.dataverseUrl = dataverseUrl.startsWith('https://')
-      ? dataverseUrl
-      : `https://${dataverseUrl}`;
+    this.dataverseUrl = dataverseUrl.startsWith('https://') ? dataverseUrl : `https://${dataverseUrl}`;
     this.scope = `${this.dataverseUrl}/.default`;
     this.apiBase = `${this.dataverseUrl}/api/data/v9.2`;
-    this.tokenProvider = tokenProvider;
     this._configured = true;
 
     console.log(`[SolutionClient] Dataverse configured: ${this.dataverseUrl}`);
     console.log(`[SolutionClient]   Scope: ${this.scope}`);
   }
 
-  get configured(): boolean {
+  // -----------------------------------------------------------------------
+  // Config accessors (called by index.ts)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Returns true if DATAVERSE_URL is set.
+   * Called by index.ts: solutionClient.isConfigured()
+   */
+  isConfigured(): boolean {
     return this._configured;
   }
+
+  /**
+   * Returns the Dataverse token scope.
+   * Called by index.ts: solutionClient.getScope()
+   */
+  getScope(): string {
+    return this.scope;
+  }
+
+  // -----------------------------------------------------------------------
+  // Internal helpers
+  // -----------------------------------------------------------------------
 
   private async getToken(): Promise<string> {
     if (!this._configured) throw new Error('Dataverse not configured. Set DATAVERSE_URL.');
@@ -106,13 +133,14 @@ export class SolutionClient {
     };
   }
 
-  /**
-   * List Dataverse solutions.
-   */
-  async listSolutions(unmanagedOnly: boolean = true): Promise<any> {
+  // -----------------------------------------------------------------------
+  // List Solutions (returns array — matches index.ts handler)
+  // -----------------------------------------------------------------------
+
+  async listSolutions(includeManaged: boolean = false): Promise<any[]> {
     const select = 'solutionid,uniquename,friendlyname,version,ismanaged,installedon,modifiedon,description,_publisherid_value';
     let filter = 'isvisible eq true';
-    if (unmanagedOnly) filter += ' and ismanaged eq false';
+    if (!includeManaged) filter += ' and ismanaged eq false';
 
     const url = `${this.apiBase}/solutions?$select=${select}&$filter=${encodeURIComponent(filter)}&$orderby=friendlyname asc`;
     console.log(`[SolutionClient] GET /solutions?$select=${select}&$filter=${filter}&$orderby=friendlyname asc`);
@@ -121,26 +149,23 @@ export class SolutionClient {
     const solutions = response.data?.value || [];
     console.log(`[SolutionClient] Found ${solutions.length} solutions`);
 
-    return {
-      count: solutions.length,
-      filter: unmanagedOnly ? 'unmanaged only' : 'all visible',
-      solutions: solutions.map((s: any) => ({
-        solutionId: s.solutionid,
-        uniqueName: s.uniquename,
-        friendlyName: s.friendlyname,
-        version: s.version,
-        isManaged: s.ismanaged,
-        description: s.description || '',
-        publisherId: s._publisherid_value,
-        installedOn: s.installedon,
-        modifiedOn: s.modifiedon,
-      })),
-    };
+    return solutions.map((s: any) => ({
+      solutionId: s.solutionid,
+      uniqueName: s.uniquename,
+      friendlyName: s.friendlyname,
+      version: s.version,
+      isManaged: s.ismanaged,
+      description: s.description || '',
+      publisherId: s._publisherid_value,
+      installedOn: s.installedon,
+      modifiedOn: s.modifiedon,
+    }));
   }
 
-  /**
-   * Get a solution by unique name or GUID.
-   */
+  // -----------------------------------------------------------------------
+  // Get Solution (returns single object)
+  // -----------------------------------------------------------------------
+
   async getSolution(uniqueNameOrId: string): Promise<any> {
     const select = 'solutionid,uniquename,friendlyname,version,description,ismanaged,installedon,modifiedon,_publisherid_value';
     const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uniqueNameOrId);
@@ -174,10 +199,11 @@ export class SolutionClient {
     };
   }
 
-  /**
-   * List components in a solution.
-   */
-  async listSolutionComponents(solutionId: string): Promise<any> {
+  // -----------------------------------------------------------------------
+  // List Solution Components (returns array with componentTypeName)
+  // -----------------------------------------------------------------------
+
+  async listSolutionComponents(solutionId: string): Promise<any[]> {
     const url = `${this.apiBase}/solutioncomponents?$filter=${encodeURIComponent(`_solutionid_value eq '${solutionId}'`)}&$select=solutioncomponentid,componenttype,objectid,ismetadata&$orderby=componenttype asc`;
     console.log(`[SolutionClient] GET /solutioncomponents?$filter=_solutionid_value eq '${solutionId}'&$select=solutioncomponentid,componenttype,objectid,ismetadata&$orderby=componenttype asc`);
 
@@ -185,31 +211,19 @@ export class SolutionClient {
     const components = response.data?.value || [];
     console.log(`[SolutionClient] Solution ${solutionId}: ${components.length} components`);
 
-    // Group by component type
-    const byType: Record<string, number> = {};
-    const mapped = components.map((c: any) => {
-      const typeName = componentTypeName(c.componenttype);
-      byType[typeName] = (byType[typeName] || 0) + 1;
-      return {
-        solutionComponentId: c.solutioncomponentid,
-        componentType: c.componenttype,
-        componentTypeName: typeName,
-        objectId: c.objectid,
-        isMetadata: c.ismetadata,
-      };
-    });
-
-    return {
-      solutionId,
-      count: mapped.length,
-      componentsByType: byType,
-      components: mapped,
-    };
+    return components.map((c: any) => ({
+      solutionComponentId: c.solutioncomponentid,
+      componentType: c.componenttype,
+      componentTypeName: componentTypeName(c.componenttype),
+      objectId: c.objectid,
+      isMetadata: c.ismetadata,
+    }));
   }
 
-  /**
-   * Add a component to a solution.
-   */
+  // -----------------------------------------------------------------------
+  // Add Solution Component
+  // -----------------------------------------------------------------------
+
   async addSolutionComponent(
     solutionUniqueName: string,
     componentId: string,
@@ -246,10 +260,11 @@ export class SolutionClient {
     }
   }
 
-  /**
-   * Export a solution as a ZIP (base64).
-   */
-  async exportSolution(solutionName: string, managed: boolean = false): Promise<any> {
+  // -----------------------------------------------------------------------
+  // Export Solution (returns {fileName, sizeBytes, base64Content})
+  // -----------------------------------------------------------------------
+
+  async exportSolution(solutionName: string, managed: boolean = false): Promise<{ fileName: string; sizeBytes: number; base64Content: string }> {
     const url = `${this.apiBase}/ExportSolution`;
     console.log(`[SolutionClient] POST /ExportSolution (name: ${solutionName}, managed: ${managed})`);
 
@@ -260,16 +275,13 @@ export class SolutionClient {
       };
 
       const response = await axios.post(url, body, { headers: await this.headers() });
-      const exportFile = response.data?.ExportSolutionFile;
+      const exportFile = response.data?.ExportSolutionFile || '';
 
       console.log(`[SolutionClient] Solution exported: ${solutionName} (managed: ${managed})`);
 
       return {
-        success: true,
-        solutionName,
-        managed,
         fileName: `${solutionName}${managed ? '_managed' : ''}.zip`,
-        fileSize: exportFile ? Math.round((exportFile.length * 3) / 4) : 0,
+        sizeBytes: exportFile ? Math.round((exportFile.length * 3) / 4) : 0,
         base64Content: exportFile,
       };
     } catch (error: any) {
@@ -280,10 +292,10 @@ export class SolutionClient {
     }
   }
 
-  /**
-   * Create a new Dataverse solution.
-   * v3.3.0: NEW tool
-   */
+  // -----------------------------------------------------------------------
+  // Create Solution (v3.3.0 NEW)
+  // -----------------------------------------------------------------------
+
   async createSolution(
     uniqueName: string,
     friendlyName: string,
@@ -303,15 +315,13 @@ export class SolutionClient {
         'publisherid@odata.bind': `/publishers(${publisherId})`,
       };
 
-      const response = await axios.post(url, body, {
-        headers: await this.headers(),
-      });
+      const response = await axios.post(url, body, { headers: await this.headers() });
 
       // Dataverse returns 204 with OData-EntityId header, or 201 with body
       const solutionId =
         response.data?.solutionid ||
         response.headers['odata-entityid']?.match(/\(([^)]+)\)/)?.[1] ||
-        'unknown';
+        'created';
 
       console.log(`[SolutionClient] Solution created: ${uniqueName} (${solutionId})`);
 
@@ -333,10 +343,10 @@ export class SolutionClient {
     }
   }
 
-  /**
-   * Delete a Dataverse solution by ID.
-   * v3.3.0: NEW tool
-   */
+  // -----------------------------------------------------------------------
+  // Delete Solution (v3.3.0 NEW)
+  // -----------------------------------------------------------------------
+
   async deleteSolution(solutionId: string): Promise<any> {
     const url = `${this.apiBase}/solutions(${solutionId})`;
     console.log(`[SolutionClient] DELETE /solutions(${solutionId})`);

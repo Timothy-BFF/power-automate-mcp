@@ -3,6 +3,7 @@ import express, { Request, Response } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+import axios from 'axios';
 import { AzureTokenManager } from './auth/azure-token-manager.js';
 import { PowerPlatformClient } from './api/power-platform-client.js';
 import { SolutionClient } from './clients/solution-client.js';
@@ -16,7 +17,7 @@ import { registerAuthTools } from './tools/auth-tool-handlers.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '3.2.0';
+const VERSION = '3.3.0';
 
 // =============================================================================
 // Core Services
@@ -62,6 +63,8 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
+// v3.3.0: Fixed pa-list-connections, added pa-create-solution,
+//         pa-delete-solution, pa-create-connection. Total: 26 tools.
 // v3.2.0: Added 5 Dataverse Solutions tools.
 // v3.1.0: Added pa-get-connection and pa-delete-connection tools.
 // v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS.
@@ -332,7 +335,11 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- List Connections ----
+  // =========================================================================
+  // CONNECTION TOOLS
+  // v3.3.0: Fixed pa-list-connections path, added pa-create-connection
+  // =========================================================================
+  // ---- List Connections (v3.3.0 FIX: delegated path) ----
   {
     name: 'pa-list-connections',
     description: TOOL_DESCRIPTIONS['pa-list-connections'],
@@ -345,8 +352,16 @@ const toolDefs: ToolDefinition[] = [
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
-        const result = await client.listConnections(envId);
-        const connections = (result?.value || []).map((c: any) => ({
+        // v3.3.0 FIX: Use delegated path instead of admin-scoped path
+        // Old (broken): /scopes/admin/environments/{envId}/connections
+        // New (fixed):  /environments/{envId}/connections
+        const token = await tokenManager.getToken('https://service.flow.microsoft.com/.default');
+        const url = `https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/${envId}/connections?api-version=2016-11-01`;
+        console.log(`[ListConnections] GET ${url} (v3.3.0 delegated path)`);
+        const response = await axios.get(url, {
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        });
+        const connections = (response.data?.value || []).map((c: any) => ({
           connectionId: c.name, displayName: c.properties?.displayName,
           apiId: c.properties?.apiId, status: c.properties?.statuses?.[0]?.status,
           createdTime: c.properties?.createdTime,
@@ -410,8 +425,57 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Create Connection (v3.3.0 NEW) ----
+  {
+    name: 'pa-create-connection',
+    description: TOOL_DESCRIPTIONS['pa-create-connection'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        connectorId: { type: 'string', description: 'Connector API name (e.g., shared_office365) or full API ID path.' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+        user_id: { type: 'string', description: 'Email of the authenticated user who will own this connection.' },
+        connectionParameters: { type: 'object', description: 'Optional connection parameters (varies by connector).' },
+      },
+      required: ['connectorId', 'user_id'],
+    },
+    handler: async (p: any) => {
+      try {
+        const envId = resolveEnvironmentId(p.environmentId);
+        if (!p.user_id) return fail('user_id is required for creating connections. Use pa-auth-start first.');
+        const userToken = await userAuthManager.getAccessToken(p.user_id);
+        if (!userToken) return fail(`Not authenticated. Use pa-auth-start to begin device login for ${p.user_id}.`);
+
+        const apiId = p.connectorId.startsWith('/providers/')
+          ? p.connectorId
+          : `/providers/Microsoft.PowerApps/apis/${p.connectorId}`;
+
+        const url = `https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/${envId}/connections?api-version=2016-11-01`;
+        console.log(`[CreateConnection] POST ${url} (connector: ${p.connectorId}, user: ${p.user_id})`);
+
+        const response = await axios.post(url, {
+          properties: {
+            apiId,
+            connectionParameters: p.connectionParameters || {},
+          },
+        }, {
+          headers: { Authorization: `Bearer ${userToken}`, 'Content-Type': 'application/json' },
+        });
+
+        const conn = response.data;
+        return ok({
+          status: 'created',
+          connectionId: conn.name,
+          displayName: conn.properties?.displayName || conn.name,
+          connectorName: p.connectorId,
+          connectionStatus: conn.properties?.statuses?.[0]?.status || 'created',
+          message: `Connection created successfully. ${conn.properties?.statuses?.[0]?.status === 'Connected' ? 'Connection is active.' : 'You may need to authorize this connection in the Power Automate portal.'}`,
+        });
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
   // =========================================================================
-  // DATAVERSE SOLUTIONS TOOLS (v3.2.0)
+  // DATAVERSE SOLUTIONS TOOLS (v3.2.0 + v3.3.0 additions)
   // =========================================================================
   // ---- List Solutions ----
   {
@@ -425,6 +489,7 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
         const solutions = await solutionClient.listSolutions(p.includeManaged === true);
         return ok({ count: solutions.length, solutions });
       } catch (e: any) { return fail(e.message); }
@@ -443,6 +508,7 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
         const solution = await solutionClient.getSolution(p.solutionId);
         return ok(solution);
       } catch (e: any) { return fail(e.message); }
@@ -461,6 +527,7 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
         const components = await solutionClient.listSolutionComponents(p.solutionId);
         // Group by type for readability
         const byType: Record<string, number> = {};
@@ -485,6 +552,7 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
         const result = await solutionClient.exportSolution(
           p.solutionUniqueName,
           p.managed === true
@@ -520,12 +588,61 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
         const result = await solutionClient.addSolutionComponent(
           p.solutionUniqueName,
           p.componentId,
           p.componentType != null ? Number(p.componentType) : 29,
           p.addRequiredComponents === true
         );
+        return ok(result);
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Create Solution (v3.3.0 NEW) ----
+  {
+    name: 'pa-create-solution',
+    description: TOOL_DESCRIPTIONS['pa-create-solution'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        uniqueName: { type: 'string', description: 'Unique name for the solution (no spaces, e.g., MyNewSolution).' },
+        friendlyName: { type: 'string', description: 'Display name for the solution.' },
+        publisherId: { type: 'string', description: 'GUID of the publisher. Use publisherId from pa-get-solution on an existing solution.' },
+        version: { type: 'string', description: 'Version number (default: 1.0.0.0).' },
+        description: { type: 'string', description: 'Optional description.' },
+      },
+      required: ['uniqueName', 'friendlyName', 'publisherId'],
+    },
+    handler: async (p: any) => {
+      try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        const result = await solutionClient.createSolution(
+          p.uniqueName,
+          p.friendlyName,
+          p.publisherId,
+          p.version || '1.0.0.0',
+          p.description || ''
+        );
+        return ok(result);
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // ---- Delete Solution (v3.3.0 NEW) ----
+  {
+    name: 'pa-delete-solution',
+    description: TOOL_DESCRIPTIONS['pa-delete-solution'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solutionId: { type: 'string', description: 'Solution GUID to delete (solutionId from pa-get-solution).' },
+      },
+      required: ['solutionId'],
+    },
+    handler: async (p: any) => {
+      try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        const result = await solutionClient.deleteSolution(p.solutionId);
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
