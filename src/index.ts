@@ -11,7 +11,6 @@ import { resolveEnvironmentId } from './config/environment-resolver.js';
 import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
 import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
-import { registerAuthTools } from './tools/auth-tool-handlers.js';
 
 // =============================================================================
 // Configuration
@@ -63,8 +62,9 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
-// v3.3.0: Fixed pa-list-connections (delegated token + delegated path),
+// v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
 //         added pa-create-solution, pa-delete-solution, pa-create-connection.
+//         Unified tool registration — all 26 tools through one loop.
 //         Total: 26 tools.
 // v3.2.0: Added 5 Dataverse Solutions tools.
 // v3.1.0: Added pa-get-connection and pa-delete-connection tools.
@@ -338,10 +338,10 @@ const toolDefs: ToolDefinition[] = [
   },
   // =========================================================================
   // CONNECTION TOOLS
-  // v3.3.0: Fixed pa-list-connections (delegated path + delegated token),
+  // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
   //         added pa-create-connection
   // =========================================================================
-  // ---- List Connections (v3.3.0 FIX: delegated path + user token) ----
+  // ---- List Connections (v3.3.0 FIX: PowerApps host + PowerApps token) ----
   {
     name: 'pa-list-connections',
     description: TOOL_DESCRIPTIONS['pa-list-connections'],
@@ -349,61 +349,45 @@ const toolDefs: ToolDefinition[] = [
       type: 'object',
       properties: {
         environmentId: { type: 'string', description: 'Power Platform environment ID.' },
-        user_id: { type: 'string', description: 'Email of authenticated user. Connections are per-user and require a delegated token. Authenticate first with pa-auth-start.' },
       },
     },
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
 
-        // v3.3.0 FIX: Connections are per-user — must use delegated token.
-        // Service principal tokens return 404 on the user-scoped connections endpoint.
-        const userId = p.user_id || userAuthManager.getDefaultUserId();
-        let token: string;
-        let tokenType: string;
+        // v3.3.0 FIX: Connections API lives under PowerApps, NOT Flow.
+        // Old (broken): api.flow.microsoft.com/.../connections → 404
+        // New (fixed):  api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/{env}/connections
+        // Token scope:  service.powerapps.com/.default (already pre-warmed)
+        const token = await tokenManager.getToken('https://service.powerapps.com/.default');
+        const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/${envId}/connections?api-version=2016-11-01`;
 
-        if (userId) {
-          const userToken = await userAuthManager.getAccessToken(userId);
-          if (userToken) {
-            token = userToken;
-            tokenType = `delegated (${userId})`;
-          } else {
-            // User specified but token expired/missing
-            return fail(
-              `User ${userId} is not authenticated or token expired. ` +
-              'Connections are per-user and require a delegated token. ' +
-              'Use pa-auth-start to authenticate first, then retry.'
-            );
-          }
-        } else {
-          // No user at all — give a clear instruction
-          return fail(
-            'pa-list-connections requires user authentication. ' +
-            'Connections are per-user and cannot be listed with a service principal token. ' +
-            'Use pa-auth-start to authenticate, then pass user_id to this tool.'
-          );
-        }
-
-        const url = `https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/${envId}/connections?api-version=2016-11-01`;
-        console.log(`[ListConnections] GET ${url} (token: ${tokenType})`);
+        console.log(`[ListConnections] GET ${url} (PowerApps admin token)`);
 
         const response = await axios.get(url, {
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
         });
+
         const connections = (response.data?.value || []).map((c: any) => ({
-          connectionId: c.name, displayName: c.properties?.displayName,
-          apiId: c.properties?.apiId, status: c.properties?.statuses?.[0]?.status,
+          connectionId: c.name,
+          displayName: c.properties?.displayName,
+          apiId: c.properties?.apiId,
+          status: c.properties?.statuses?.[0]?.status,
           createdTime: c.properties?.createdTime,
         }));
-        return ok({ count: connections.length, connections, _tokenType: tokenType });
+        return ok({
+          count: connections.length,
+          connections,
+          _apiHost: 'api.powerapps.com',
+          _tokenScope: 'service.powerapps.com',
+        });
       } catch (e: any) {
-        if (e.response?.status === 404 || e.response?.status === 403) {
-          return fail(
-            `${e.message}. This may indicate the delegated token lacks permissions. ` +
-            'Ensure the user has connections in this environment.'
-          );
-        }
-        return fail(e.message);
+        const status = e.response?.status;
+        const detail = e.response?.data?.error?.message || e.message;
+        return fail(`ListConnections failed (${status || 'unknown'}): ${detail}`);
       }
     },
   },
@@ -487,7 +471,7 @@ const toolDefs: ToolDefinition[] = [
           ? p.connectorId
           : `/providers/Microsoft.PowerApps/apis/${p.connectorId}`;
 
-        const url = `https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/${envId}/connections?api-version=2016-11-01`;
+        const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/environments/${envId}/connections?api-version=2016-11-01`;
         console.log(`[CreateConnection] POST ${url} (connector: ${p.connectorId}, user: ${p.user_id})`);
 
         const response = await axios.post(url, {
@@ -566,7 +550,6 @@ const toolDefs: ToolDefinition[] = [
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
         const components = await solutionClient.listSolutionComponents(p.solutionId);
-        // Group by type for readability
         const byType: Record<string, number> = {};
         for (const c of components) {
           byType[c.componentTypeName] = (byType[c.componentTypeName] || 0) + 1;
@@ -686,6 +669,7 @@ const toolDefs: ToolDefinition[] = [
   },
   // =========================================================================
   // AUTH TOOLS (Device Code Flow)
+  // v3.3.0: Registered via unified loop (no separate registerAuthTools call)
   // =========================================================================
   // ---- Auth: Start Device Code Flow ----
   {
@@ -806,19 +790,18 @@ function toZodProps(inputSchema: any): Record<string, any> {
   return props;
 }
 
-// Register all tools on McpServer for SSE transport
+// =============================================================================
+// UNIFIED TOOL REGISTRATION (v3.3.0 fix)
+//
+// ALL 26 tools registered through ONE loop. No separate registerAuthTools().
+// This fixes the "only 4 tools visible" SSE bug caused by dual-path registration.
+// =============================================================================
 for (const def of toolDefs) {
-  if (!def.name.startsWith('pa-auth-')) {
-    const zodProps = toZodProps(def.inputSchema);
-    mcpServer.tool(def.name, def.description, zodProps, async (params: any) => def.handler(params));
-  }
+  const zodProps = toZodProps(def.inputSchema);
+  mcpServer.tool(def.name, def.description, zodProps, async (params: any) => def.handler(params));
 }
 
-const mcpToolCount = toolDefs.filter(t => !t.name.startsWith('pa-auth-')).length;
-console.log(`[Init] MCP tools registered: ${mcpToolCount}`);
-
-// Register auth tools on McpServer via dedicated handler (uses TOOL_DESCRIPTIONS)
-registerAuthTools(mcpServer, userAuthManager);
+console.log(`[Init] MCP tools registered (SSE): ${toolDefs.length}`);
 
 // =============================================================================
 // Express App
@@ -963,6 +946,6 @@ app.listen(PORT, () => {
   console.log(`[Init] Dataverse: ${solutionClient.isConfigured() ? process.env.DATAVERSE_URL + ' (configured)' : 'Not configured (set DATAVERSE_URL)'}`);
   console.log(`[Init] Write:     Delegated user token via Device Code Flow`);
   console.log(`[Init] Auth:      ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
-  console.log(`[Init] Tools:     ${toolDefs.length} (${mcpToolCount} MCP + 3 auth)`);
+  console.log(`[Init] Tools:     ${toolDefs.length} registered (unified SSE + REST)`);
   console.log('');
 });

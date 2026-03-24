@@ -1,11 +1,12 @@
 /**
  * Tool Descriptions — Power Automate MCP
- * v3.3.0: 26 total (23 MCP + 3 auth)
+ * v3.3.0: 26 total tools, unified registration
  *
  * IMPORTANT: This must be a Record<string, string> — NOT an array.
- * index.ts and auth-tool-handlers.ts access it as TOOL_DESCRIPTIONS['pa-xxx'].
+ * index.ts accesses it as TOOL_DESCRIPTIONS['pa-xxx'].
  *
  * v3.2.0 → v3.3.0 changes:
+ *   FIXED: pa-list-connections (now uses PowerApps admin host)
  *   NEW: pa-create-solution, pa-delete-solution, pa-create-connection
  */
 
@@ -25,12 +26,11 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   'pa-get-run-details': 'Get detailed information about a specific flow run, including action results and error details.',
   'pa-cancel-run': 'Cancel a running flow instance.',
 
-  // ---- Environment Management (2 tools) ----
+  // ---- Environment Management (1 tool) ----
   'pa-list-environments': 'List all Power Platform environments accessible to the service principal.',
-  'pa-get-environment': 'Get detailed information about a specific Power Platform environment.',
 
   // ---- Connection Management (4 tools — 3 existing + 1 new) ----
-  'pa-list-connections': 'List all connections in a Power Platform environment. v3.3.0: Fixed to use delegated endpoint path.',
+  'pa-list-connections': 'List all connections in a Power Platform environment. Uses PowerApps admin API (no user auth required).',
   'pa-get-connection': 'Get detailed information about a specific connection, including status, connector type, and creation details.',
   'pa-delete-connection': 'Delete a connection permanently.',
   'pa-create-connection': 'Create a new connection to a connector in Power Automate. Requires user authentication (pa-auth-start). The connection will be owned by the authenticated user.',
