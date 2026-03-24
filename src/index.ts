@@ -11,6 +11,7 @@ import { resolveEnvironmentId } from './config/environment-resolver.js';
 import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
 import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
+import { resolveParams } from './utils/param-resolver.js';
 
 // =============================================================================
 // Configuration
@@ -76,7 +77,8 @@ function fail(msg: string): ToolResult {
 // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
 //         Fixed pa-create-connection (multi-scope refresh token exchange +
 //         correct PUT endpoint with connector in path + env as filter +
-//         defensive null check on connectorId to prevent startsWith crash).
+//         defensive null check on connectorId to prevent startsWith crash +
+//         universal param resolver for cross-client compatibility).
 //         Added pa-create-solution, pa-delete-solution, pa-create-connection.
 //         Unified tool registration — all 26 tools through one loop.
 //         Total: 26 tools.
@@ -354,7 +356,7 @@ const toolDefs: ToolDefinition[] = [
   // CONNECTION TOOLS
   // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
   //         Fixed pa-create-connection (multi-scope token + correct PUT endpoint
-  //         + defensive null checks on connectorId and user_id)
+  //         + defensive null checks + param resolver for cross-client compat)
   // =========================================================================
   // ---- List Connections (v3.3.0 FIX: PowerApps host + PowerApps token) ----
   {
@@ -459,17 +461,19 @@ const toolDefs: ToolDefinition[] = [
     },
   },
   // =========================================================================
-  // Create Connection (v3.3.0 FIX round 3 + defensive null checks)
+  // Create Connection (v3.3.0 + param resolver for cross-client compatibility)
   //
-  // Previous attempts:
-  //   Round 1 (930cda56): POST /environments/{env}/connections → 403 (wrong token scope)
-  //   Round 2 (7e1aef7b): POST /environments/{env}/connections + PowerApps token → 404 (wrong URL)
-  //   Round 3 (31e679ab): PUT /apis/{connector}/connections/{name} → SUCCESS for Timothy,
-  //                        but Jose hit startsWith crash when agent omitted connectorId
+  // Problem: Jose's Claude 4.6 AI sends connectorId and user_id in the payload,
+  // but the handler receives them as undefined. The params may arrive nested
+  // under 'arguments', 'params', 'input', or 'data' depending on the client
+  // bridge. The resolveParams utility unwraps all nesting patterns.
   //
-  // Fix: Added defensive null/type checks on connectorId and user_id before
-  // any property access. Returns clean actionable error messages that agents
-  // can self-correct on instead of raw TypeError stack traces.
+  // Previous fixes:
+  //   Round 1 (930cda56): POST /environments/{env}/connections → 403
+  //   Round 2 (7e1aef7b): POST + PowerApps token → 404
+  //   Round 3 (31e679ab): PUT /apis/{connector}/connections/{name} → SUCCESS Timothy
+  //   Round 4 (e3c66510): Defensive null checks → catches but Jose still gets error
+  //   Round 5 (this): resolveParams + diagnostic logging → universal fix
   // =========================================================================
   {
     name: 'pa-create-connection',
@@ -484,13 +488,30 @@ const toolDefs: ToolDefinition[] = [
       },
       required: ['connectorId', 'user_id'],
     },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
+        // =================================================================
+        // DIAGNOSTIC: Log raw params to Railway so we can see EXACTLY
+        // what the client/SDK sends. This is the key to solving Jose's issue.
+        // =================================================================
+        const rawStr = JSON.stringify(rawP);
+        console.log(`[CreateConnection] RAW params (${rawStr.length} chars): ${rawStr.substring(0, 500)}`);
+        console.log(`[CreateConnection] RAW keys: [${rawP ? Object.keys(rawP).join(', ') : 'null/undefined'}]`);
+        console.log(`[CreateConnection] Direct access: connectorId=${rawP?.connectorId}, user_id=${rawP?.user_id}, connector_id=${rawP?.connector_id}`);
+
+        // =================================================================
+        // Universal param resolution: unwraps nested arguments from any
+        // client/bridge wrapping pattern (arguments, params, input, data)
+        // and handles snake_case/camelCase variations.
+        // =================================================================
+        const p = resolveParams(rawP, ['connectorId', 'user_id', 'environmentId', 'connectionParameters']);
+
+        console.log(`[CreateConnection] RESOLVED: connectorId="${p.connectorId}", user_id="${p.user_id}", environmentId="${p.environmentId}"`);
+
         const envId = resolveEnvironmentId(p.environmentId);
 
         // =================================================================
-        // Defensive null/type checks (prevents startsWith crash)
-        // Jose's agent hit TypeError when connectorId was undefined/null.
+        // Defensive null/type checks (after resolution)
         // =================================================================
         if (!p.connectorId || typeof p.connectorId !== 'string') {
           return fail(
@@ -529,7 +550,6 @@ const toolDefs: ToolDefinition[] = [
 
         // Correct PowerApps connection creation endpoint:
         //   PUT /apis/{connector}/connections/{name}?$filter=environment eq '{env}'
-        // NOT: POST /environments/{env}/connections (that's only for listing)
         const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/apis/${connectorName}/connections/${connectionName}`;
 
         console.log(`[CreateConnection] PUT ${url} (user: ${p.user_id}, env: ${envId}, token: powerapps-delegated)`);
@@ -573,7 +593,7 @@ const toolDefs: ToolDefinition[] = [
           _urlPattern: 'apis/{connector}/connections/{name}?$filter=environment',
           message: needsConsent
             ? `Connection shell created for ${connectorName}. This OAuth connector requires interactive authorization. ` +
-              `Go to make.powerautomate.com → Data → Connections → find "${connectionName}" → Authorize. ` +
+              `Go to make.powerautomate.com \u2192 Data \u2192 Connections \u2192 find "${connectionName}" \u2192 Authorize. ` +
               (consentLink ? `Or visit: ${consentLink}` : '')
             : `Connection created successfully. Status: ${connStatus}.`,
         });
@@ -584,9 +604,9 @@ const toolDefs: ToolDefinition[] = [
 
         if (status === 404) {
           return fail(
-            `CreateConnection 404: Connector '${p.connectorId}' not found at the PowerApps API. ` +
+            `CreateConnection 404: Connector '${rawP?.connectorId || '(unknown)'}' not found at the PowerApps API. ` +
             `This connector may not support API-based creation, or requires interactive consent. ` +
-            `For OAuth connectors (Office 365, Outlook, SharePoint), create manually at make.powerautomate.com → Data → Connections. ` +
+            `For OAuth connectors (Office 365, Outlook, SharePoint), create manually at make.powerautomate.com \u2192 Data \u2192 Connections. ` +
             `Detail: ${detail}`
           );
         }
@@ -602,7 +622,7 @@ const toolDefs: ToolDefinition[] = [
             `Detail: ${detail}`
           );
         }
-        return fail(`CreateConnection failed (${status || 'unknown'}): ${errCode} — ${detail}`);
+        return fail(`CreateConnection failed (${status || 'unknown'}): ${errCode} \u2014 ${detail}`);
       }
     },
   },
@@ -902,11 +922,20 @@ function toZodProps(inputSchema: any): Record<string, any> {
 }
 
 // =============================================================================
-// UNIFIED TOOL REGISTRATION (v3.3.0 fix)
+// UNIFIED TOOL REGISTRATION (v3.3.0 + diagnostic logging)
+//
+// Every SSE tool call now logs the raw param keys so we can diagnose
+// cross-client argument wrapping issues in Railway logs.
 // =============================================================================
 for (const def of toolDefs) {
   const zodProps = toZodProps(def.inputSchema);
-  mcpServer.tool(def.name, def.description, zodProps, async (params: any) => def.handler(params));
+  mcpServer.tool(def.name, def.description, zodProps, async (params: any) => {
+    // Universal diagnostic: log raw param structure for EVERY tool call
+    const paramKeys = params ? Object.keys(params) : [];
+    const paramSnippet = JSON.stringify(params).substring(0, 300);
+    console.log(`[ToolCall] ${def.name} | keys: [${paramKeys.join(', ')}] | raw: ${paramSnippet}`);
+    return def.handler(params);
+  });
 }
 
 console.log(`[Init] MCP tools registered (SSE): ${toolDefs.length}`);
@@ -990,6 +1019,8 @@ async function processJsonRpcRequest(request: any): Promise<any> {
       case 'tools/call': {
         const toolName = params?.name;
         const toolArgs = params?.arguments || {};
+        // Diagnostic: log what arrives via REST tools/call
+        console.log(`[REST tools/call] tool=${toolName} | argKeys=[${Object.keys(toolArgs).join(', ')}] | raw=${JSON.stringify(toolArgs).substring(0, 300)}`);
         const handler = toolHandlers.get(toolName);
         if (!handler) {
           return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify({ error: `Unknown tool: ${toolName}` }) }], isError: true } };
