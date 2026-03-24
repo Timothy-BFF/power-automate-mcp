@@ -1,375 +1,289 @@
 /**
- * Power Automate MCP - Tool Handlers (v3.0.3)
+ * Tool Handlers — Power Automate MCP
+ * v3.3.0: 23 MCP tool handlers
  *
- * Registers all non-auth MCP tools with the McpServer.
- * Descriptions are imported from tool-descriptions.ts to provide
- * procedure guidance that prevents destructive agent behavior.
+ * v3.2.0 → v3.3.0 changes:
+ *   FIX: pa-list-connections now routes through fixed ConnectionClient
+ *   NEW: pa-create-solution, pa-delete-solution, pa-create-connection
  */
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { z } from 'zod';
-import { PowerPlatformClient } from '../api/power-platform-client.js';
-import { TOOL_DESCRIPTIONS } from './tool-descriptions.js';
 
-// =========================================================================
-// Response Helpers
-// =========================================================================
+export interface ToolClients {
+  flowClient: any;
+  connectionClient: any;
+  environmentClient: any;
+  solutionClient: any;
+}
 
-function jsonResponse(data: any): { content: Array<{ type: 'text'; text: string }> } {
-  // Strip _raw from getFlowDetails to keep response manageable
-  if (data && data._raw) {
-    const { _raw, ...clean } = data;
-    return { content: [{ type: 'text' as const, text: JSON.stringify(clean, null, 2) }] };
+function resolveEnv(explicit?: string): string {
+  if (explicit) {
+    console.log(`[EnvResolver] Using explicit parameter: ${explicit}`);
+    return explicit;
   }
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  const envId = process.env.POWER_PLATFORM_ENVIRONMENT_ID || '';
+  console.log(`[EnvResolver] Using POWER_PLATFORM_ENVIRONMENT_ID: ${envId}`);
+  return envId;
 }
 
-function errorResponse(error: any): { content: Array<{ type: 'text'; text: string }>; isError: true } {
-  const msg = error?.message || String(error);
-  console.error(`[Tool] Error: ${msg}`);
-  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
-}
-
-// =========================================================================
-// Environment Resolver
-// =========================================================================
-
-function createEnvResolver(defaultEnvId: string) {
-  return function resolveEnv(envId?: string): string {
-    if (envId) {
-      console.log(`[EnvResolver] Using explicit parameter: ${envId}`);
-      return envId;
-    }
-    console.log(`[EnvResolver] Using POWER_PLATFORM_ENVIRONMENT_ID: ${defaultEnvId}`);
-    return defaultEnvId;
+function success(data: any): { content: Array<{ type: string; text: string }> } {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
   };
 }
 
-// =========================================================================
-// Tool Registration
-// =========================================================================
+function error(message: string): { content: Array<{ type: string; text: string }>; isError: boolean } {
+  return {
+    content: [{ type: 'text', text: JSON.stringify({ error: message }, null, 2) }],
+    isError: true,
+  };
+}
 
-export function registerTools(
-  server: McpServer,
-  client: PowerPlatformClient,
-  defaultEnvId: string
-): number {
-  const resolveEnv = createEnvResolver(defaultEnvId);
-  let count = 0;
+export async function handleToolCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  clients: ToolClients
+): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+  try {
+    const envId = resolveEnv(args.environment_id as string | undefined);
 
-  // -----------------------------------------------------------------------
-  // ENVIRONMENT TOOLS
-  // -----------------------------------------------------------------------
-
-  server.tool(
-    'pa-list-environments',
-    TOOL_DESCRIPTIONS['pa-list-environments'],
-    {},
-    async () => {
-      try {
-        const result = await client.listEnvironments();
-        const envs = result?.value || [];
-        const summary = envs.map((e: any) => ({
-          id: e.name,
-          displayName: e.properties?.displayName,
-          type: e.properties?.environmentType,
-          state: e.properties?.states?.management?.id,
-          region: e.location,
-          createdTime: e.properties?.createdTime,
-        }));
-        return jsonResponse({ environments: summary, count: summary.length });
-      } catch (error: any) {
-        return errorResponse(error);
+    switch (toolName) {
+      // ═══════════════════════════════════════════
+      // FLOW MANAGEMENT
+      // ═══════════════════════════════════════════
+      case 'pa-list-flows': {
+        const result = await clients.flowClient.listFlows(envId, args.filter as string | undefined);
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  // -----------------------------------------------------------------------
-  // FLOW READ TOOLS
-  // -----------------------------------------------------------------------
-
-  server.tool(
-    'pa-list-flows',
-    TOOL_DESCRIPTIONS['pa-list-flows'],
-    {
-      environmentId: z.string().optional().describe('Power Platform environment ID (defaults to configured env)'),
-      filter: z.string().optional().describe('OData filter expression'),
-      top: z.number().optional().describe('Max number of flows to return'),
-    },
-    async ({ environmentId, filter, top }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.listFlows(envId, filter, top);
-        const flows = (result?.value || []).map((f: any) => ({
-          flowId: f.name,
-          displayName: f.properties?.displayName,
-          state: f.properties?.state,
-          createdTime: f.properties?.createdTime,
-          lastModifiedTime: f.properties?.lastModifiedTime,
-          creator: f.properties?.creator?.userId || f.properties?.creator?.objectId,
-        }));
-        return jsonResponse({ flows, count: flows.length });
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-get-flow-details': {
+        const result = await clients.flowClient.getFlowDetails(
+          envId,
+          args.flow_id as string,
+          args.user_id as string | undefined
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-get-flow-details',
-    TOOL_DESCRIPTIONS['pa-get-flow-details'],
-    {
-      flowId: z.string().describe('Flow ID to retrieve details for'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.getFlowDetails(envId, flowId);
-        return jsonResponse(result);
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-create-flow': {
+        const result = await clients.flowClient.createFlow(
+          envId,
+          args.display_name as string,
+          args.definition,
+          args.user_id as string
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  // -----------------------------------------------------------------------
-  // FLOW WRITE TOOLS
-  // -----------------------------------------------------------------------
-
-  server.tool(
-    'pa-create-flow',
-    TOOL_DESCRIPTIONS['pa-create-flow'],
-    {
-      displayName: z.string().describe('Flow display name'),
-      definition: z.any().describe('Complete workflow definition JSON with triggers and actions'),
-      state: z.string().optional().describe('Initial state: "Started" or "Stopped" (default: Stopped)'),
-      connectionReferences: z.any().optional().describe('Connection references for connectors'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ displayName, definition, state, connectionReferences, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.createFlow(envId, displayName, definition, state, connectionReferences);
-        return jsonResponse(result);
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-update-flow': {
+        const result = await clients.flowClient.updateFlow(
+          envId,
+          args.flow_id as string,
+          {
+            displayName: args.display_name as string | undefined,
+            definition: args.definition,
+          },
+          args.user_id as string | undefined
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-update-flow',
-    TOOL_DESCRIPTIONS['pa-update-flow'],
-    {
-      flowId: z.string().describe('Flow ID to update'),
-      displayName: z.string().optional().describe('New display name'),
-      definition: z.any().optional().describe('Updated workflow definition JSON'),
-      state: z.string().optional().describe('New state: "Started" or "Stopped"'),
-      connectionReferences: z.any().optional().describe('Updated connection references'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, displayName, definition, state, connectionReferences, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const updates: any = {};
-        if (displayName) updates.displayName = displayName;
-        if (definition) updates.definition = definition;
-        if (state) updates.state = state;
-        if (connectionReferences) updates.connectionReferences = connectionReferences;
-        const result = await client.updateFlow(envId, flowId, updates);
-        return jsonResponse(result);
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-delete-flow': {
+        const result = await clients.flowClient.deleteFlow(
+          envId,
+          args.flow_id as string,
+          args.user_id as string | undefined
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  // -----------------------------------------------------------------------
-  // FLOW LIFECYCLE TOOLS
-  // -----------------------------------------------------------------------
-
-  server.tool(
-    'pa-enable-flow',
-    TOOL_DESCRIPTIONS['pa-enable-flow'],
-    {
-      flowId: z.string().describe('Flow ID to enable'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        await client.enableDisableFlow(envId, flowId, 'start');
-        return jsonResponse({ status: 'enabled', flowId, message: `Flow ${flowId} has been enabled (started).` });
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-enable-flow': {
+        const result = await clients.flowClient.enableFlow(
+          envId,
+          args.flow_id as string
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-disable-flow',
-    TOOL_DESCRIPTIONS['pa-disable-flow'],
-    {
-      flowId: z.string().describe('Flow ID to disable'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        await client.enableDisableFlow(envId, flowId, 'stop');
-        return jsonResponse({ status: 'disabled', flowId, message: `Flow ${flowId} has been disabled (stopped).` });
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-disable-flow': {
+        const result = await clients.flowClient.disableFlow(
+          envId,
+          args.flow_id as string
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-delete-flow',
-    TOOL_DESCRIPTIONS['pa-delete-flow'],
-    {
-      flowId: z.string().describe('Flow ID to delete'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        await client.deleteFlow(envId, flowId);
-        return jsonResponse({ status: 'deleted', flowId, message: `Flow ${flowId} has been permanently deleted.` });
-      } catch (error: any) {
-        return errorResponse(error);
+      // ═══════════════════════════════════════════
+      // FLOW RUN MANAGEMENT
+      // ═══════════════════════════════════════════
+      case 'pa-get-flow-runs': {
+        const result = await clients.flowClient.getFlowRuns(
+          envId,
+          args.flow_id as string,
+          { top: args.top as number | undefined }
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-trigger-flow',
-    TOOL_DESCRIPTIONS['pa-trigger-flow'],
-    {
-      flowId: z.string().describe('Flow ID to trigger'),
-      body: z.any().optional().describe('Request body for the trigger (for Request-triggered flows)'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, body, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.triggerFlow(envId, flowId, body);
-        return jsonResponse({ status: 'triggered', flowId, result });
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-get-flow-run-details': {
+        const result = await clients.flowClient.getFlowRunDetails(
+          envId,
+          args.flow_id as string,
+          args.run_id as string
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  // -----------------------------------------------------------------------
-  // FLOW RUN TOOLS
-  // -----------------------------------------------------------------------
-
-  server.tool(
-    'pa-get-run-history',
-    TOOL_DESCRIPTIONS['pa-get-run-history'],
-    {
-      flowId: z.string().describe('Flow ID to get run history for'),
-      top: z.number().optional().describe('Max number of runs to return'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, top, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.getRunHistory(envId, flowId, top);
-        const runs = (result?.value || []).map((r: any) => ({
-          runId: r.name,
-          status: r.properties?.status,
-          startTime: r.properties?.startTime,
-          endTime: r.properties?.endTime,
-          trigger: r.properties?.trigger?.name,
-        }));
-        return jsonResponse({ runs, count: runs.length, flowId });
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-resubmit-flow-run': {
+        const result = await clients.flowClient.resubmitFlowRun(
+          envId,
+          args.flow_id as string,
+          args.run_id as string,
+          args.user_id as string | undefined
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-get-run-details',
-    TOOL_DESCRIPTIONS['pa-get-run-details'],
-    {
-      flowId: z.string().describe('Flow ID'),
-      runId: z.string().describe('Run ID to get details for'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, runId, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.getRunDetails(envId, flowId, runId);
-        return jsonResponse(result);
-      } catch (error: any) {
-        return errorResponse(error);
+      // ═══════════════════════════════════════════
+      // ENVIRONMENT MANAGEMENT
+      // ═══════════════════════════════════════════
+      case 'pa-list-environments': {
+        const result = await clients.environmentClient.listEnvironments();
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  server.tool(
-    'pa-cancel-run',
-    TOOL_DESCRIPTIONS['pa-cancel-run'],
-    {
-      flowId: z.string().describe('Flow ID'),
-      runId: z.string().describe('Run ID to cancel'),
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ flowId, runId, environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        await client.cancelRun(envId, flowId, runId);
-        return jsonResponse({ status: 'cancelled', flowId, runId, message: `Run ${runId} has been cancelled.` });
-      } catch (error: any) {
-        return errorResponse(error);
+      case 'pa-get-environment': {
+        const result = await clients.environmentClient.getEnvironment(
+          args.environment_id as string
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  // -----------------------------------------------------------------------
-  // CONNECTION TOOLS
-  // -----------------------------------------------------------------------
-
-  server.tool(
-    'pa-list-connections',
-    TOOL_DESCRIPTIONS['pa-list-connections'],
-    {
-      environmentId: z.string().optional().describe('Power Platform environment ID'),
-    },
-    async ({ environmentId }) => {
-      try {
-        const envId = resolveEnv(environmentId);
-        const result = await client.listConnections(envId);
-        const connections = (result?.value || []).map((c: any) => ({
-          connectionId: c.name,
-          displayName: c.properties?.displayName,
-          apiId: c.properties?.apiId,
-          status: c.properties?.statuses?.[0]?.status,
-          createdTime: c.properties?.createdTime,
-        }));
-        return jsonResponse({ connections, count: connections.length });
-      } catch (error: any) {
-        return errorResponse(error);
+      // ═══════════════════════════════════════════
+      // CONNECTION MANAGEMENT
+      // ═══════════════════════════════════════════
+      case 'pa-list-connections': {
+        // v3.3.0: Now routes through fixed ConnectionClient (delegated path)
+        const result = await clients.connectionClient.listConnections(
+          envId,
+          args.user_id as string | undefined
+        );
+        return success(result);
       }
-    }
-  );
-  count++;
 
-  console.log(`[Init] MCP tools registered: ${count}`);
-  return count;
+      case 'pa-get-connection': {
+        const result = await clients.connectionClient.getConnection(
+          envId,
+          args.connection_id as string,
+          args.user_id as string | undefined
+        );
+        return success(result);
+      }
+
+      case 'pa-list-connectors': {
+        const result = await clients.connectionClient.listConnectors(envId);
+        return success(result);
+      }
+
+      case 'pa-create-connection': {
+        // v3.3.0: NEW — requires user delegated token
+        const result = await clients.connectionClient.createConnection(
+          envId,
+          args.connector_id as string,
+          args.user_id as string,
+          args.connection_parameters as Record<string, any> | undefined
+        );
+        return success(result);
+      }
+
+      // ═══════════════════════════════════════════
+      // SOLUTION MANAGEMENT (Dataverse)
+      // ═══════════════════════════════════════════
+      case 'pa-list-solutions': {
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const unmanagedOnly = args.unmanaged_only !== false; // default true
+        const result = await clients.solutionClient.listSolutions(unmanagedOnly);
+        return success(result);
+      }
+
+      case 'pa-get-solution': {
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const result = await clients.solutionClient.getSolution(
+          args.unique_name as string
+        );
+        return success(result);
+      }
+
+      case 'pa-list-solution-components': {
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const result = await clients.solutionClient.listSolutionComponents(
+          args.solution_id as string
+        );
+        return success(result);
+      }
+
+      case 'pa-add-solution-component': {
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const result = await clients.solutionClient.addSolutionComponent(
+          args.solution_unique_name as string,
+          args.component_id as string,
+          args.component_type as number,
+          args.add_required_components as boolean | undefined
+        );
+        return success(result);
+      }
+
+      case 'pa-export-solution': {
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const result = await clients.solutionClient.exportSolution(
+          args.solution_name as string,
+          args.managed as boolean | undefined
+        );
+        return success(result);
+      }
+
+      case 'pa-create-solution': {
+        // v3.3.0: NEW
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const result = await clients.solutionClient.createSolution(
+          args.unique_name as string,
+          args.friendly_name as string,
+          args.publisher_id as string,
+          (args.version as string) || '1.0.0.0',
+          (args.description as string) || ''
+        );
+        return success(result);
+      }
+
+      case 'pa-delete-solution': {
+        // v3.3.0: NEW
+        if (!clients.solutionClient?.configured) {
+          return error('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        }
+        const result = await clients.solutionClient.deleteSolution(
+          args.solution_id as string
+        );
+        return success(result);
+      }
+
+      // ═══════════════════════════════════════════
+      // UNKNOWN TOOL
+      // ═══════════════════════════════════════════
+      default:
+        return error(`Unknown tool: ${toolName}. Available tools: 23 MCP + 3 auth.`);
+    }
+  } catch (err: any) {
+    console.error(`[ToolHandler] ${toolName} failed:`, err.message);
+    return error(`${toolName} failed: ${err.message}`);
+  }
 }

@@ -1,287 +1,497 @@
 /**
- * Tool Descriptions for Power Automate MCP
- * v3.2.0 - Added Dataverse Solutions tools
+ * Tool Descriptions — Power Automate MCP
+ * v3.3.0: 23 MCP tools (+ 3 auth tools registered separately)
  *
- * These descriptions are embedded in the MCP tool schema and visible
- * to AI agents when they discover available tools. The procedure
- * guidance prevents agents from making destructive decisions based
- * on misread API responses.
+ * v3.2.0 → v3.3.0 changes:
+ *   FIX: pa-list-connections (endpoint path corrected)
+ *   NEW: pa-create-solution, pa-delete-solution, pa-create-connection
  */
 
-export const TOOL_DESCRIPTIONS: Record<string, string> = {
-  // =========================================================================
-  // AUTH TOOLS
-  // =========================================================================
+export interface ToolDescription {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: 'object';
+    properties: Record<string, any>;
+    required?: string[];
+  };
+}
 
-  'pa-auth-start': [
-    'Start Device Code Flow authentication for Power Automate write operations.',
-    'MUST be called before any write operation (create, update, trigger flow).',
-    'Returns a user_code and verification_uri. The user must visit the URL',
-    'and enter the code to complete authentication.',
-    '',
-    'After calling this, poll with pa-auth-poll until status = "authenticated".',
-    'DO NOT attempt write operations until authentication is confirmed.',
-  ].join('\n'),
+export const TOOL_DESCRIPTIONS: ToolDescription[] = [
+  // ═══════════════════════════════════════════
+  // FLOW MANAGEMENT (7 tools)
+  // ═══════════════════════════════════════════
+  {
+    name: 'pa-list-flows',
+    description: 'List all flows in a Power Platform environment. Returns flow names, IDs, states, and trigger information.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty to use the default environment.',
+        },
+        filter: {
+          type: 'string',
+          description: 'Optional filter: "team" for shared/team flows, "personal" for personal flows.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'pa-get-flow-details',
+    description: 'Get detailed information about a specific flow, including its full definition, triggers, actions, and connections.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID) to retrieve details for.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of authenticated user (optional — enables delegated token for full definition).',
+        },
+      },
+      required: ['flow_id'],
+    },
+  },
+  {
+    name: 'pa-create-flow',
+    description: 'Create a new Power Automate flow. Requires user authentication (pa-auth-start). Provide the FULL flow definition in one call.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        display_name: {
+          type: 'string',
+          description: 'Display name for the new flow.',
+        },
+        definition: {
+          type: 'object',
+          description: 'Full flow definition JSON including triggers and actions.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user who will own this flow.',
+        },
+      },
+      required: ['display_name', 'definition', 'user_id'],
+    },
+  },
+  {
+    name: 'pa-update-flow',
+    description: 'Update an existing Power Automate flow. Can update display name, definition, or both.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID) to update.',
+        },
+        display_name: {
+          type: 'string',
+          description: 'New display name (optional).',
+        },
+        definition: {
+          type: 'object',
+          description: 'Updated flow definition JSON (optional).',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user.',
+        },
+      },
+      required: ['flow_id', 'user_id'],
+    },
+  },
+  {
+    name: 'pa-delete-flow',
+    description: 'Delete a Power Automate flow permanently.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID) to delete.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user.',
+        },
+      },
+      required: ['flow_id'],
+    },
+  },
+  {
+    name: 'pa-enable-flow',
+    description: 'Enable (turn on) a Power Automate flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID) to enable.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+      },
+      required: ['flow_id'],
+    },
+  },
+  {
+    name: 'pa-disable-flow',
+    description: 'Disable (turn off) a Power Automate flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID) to disable.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+      },
+      required: ['flow_id'],
+    },
+  },
 
-  'pa-auth-poll': [
-    'Poll for Device Code Flow authentication completion.',
-    'Call this after pa-auth-start to check if the user has completed login.',
-    '',
-    'Returns:',
-    '  status: "authenticated" - user has logged in, write operations are now available',
-    '  status: "pending" - user has not yet completed login, call again in 5 seconds',
-    '  status: "error" - authentication failed, call pa-auth-start again',
-  ].join('\n'),
+  // ═══════════════════════════════════════════
+  // FLOW RUN MANAGEMENT (3 tools)
+  // ═══════════════════════════════════════════
+  {
+    name: 'pa-get-flow-runs',
+    description: 'Get the run history for a specific flow. Returns recent runs with status, start/end times, and trigger info.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID) to get runs for.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        top: {
+          type: 'number',
+          description: 'Number of runs to return (default: 25, max: 50).',
+        },
+      },
+      required: ['flow_id'],
+    },
+  },
+  {
+    name: 'pa-get-flow-run-details',
+    description: 'Get detailed information about a specific flow run, including action results and error details.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID).',
+        },
+        run_id: {
+          type: 'string',
+          description: 'The run ID (GUID) to get details for.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+      },
+      required: ['flow_id', 'run_id'],
+    },
+  },
+  {
+    name: 'pa-resubmit-flow-run',
+    description: 'Resubmit (retry) a failed or cancelled flow run using the original trigger data.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flow_id: {
+          type: 'string',
+          description: 'The flow ID (GUID).',
+        },
+        run_id: {
+          type: 'string',
+          description: 'The run ID (GUID) to resubmit.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user.',
+        },
+      },
+      required: ['flow_id', 'run_id'],
+    },
+  },
 
-  'pa-auth-status': [
-    'Check current authentication status for a user.',
-    'Returns whether a valid delegated token exists for write operations.',
-  ].join('\n'),
+  // ═══════════════════════════════════════════
+  // ENVIRONMENT MANAGEMENT (2 tools)
+  // ═══════════════════════════════════════════
+  {
+    name: 'pa-list-environments',
+    description: 'List all Power Platform environments accessible to the service principal.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'pa-get-environment',
+    description: 'Get detailed information about a specific Power Platform environment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        environment_id: {
+          type: 'string',
+          description: 'The environment ID to get details for.',
+        },
+      },
+      required: ['environment_id'],
+    },
+  },
 
-  // =========================================================================
-  // FLOW READ TOOLS
-  // =========================================================================
+  // ═══════════════════════════════════════════
+  // CONNECTION MANAGEMENT (4 tools — 3 existing + 1 new)
+  // ═══════════════════════════════════════════
+  {
+    name: 'pa-list-connections',
+    description: 'List all connections in a Power Platform environment. v3.3.0: Fixed to use delegated endpoint path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user (optional — uses delegated token for better results).',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'pa-get-connection',
+    description: 'Get detailed information about a specific connection.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        connection_id: {
+          type: 'string',
+          description: 'The connection ID (name) to retrieve.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user (optional).',
+        },
+      },
+      required: ['connection_id'],
+    },
+  },
+  {
+    name: 'pa-list-connectors',
+    description: 'List available connectors (APIs) in a Power Platform environment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'pa-create-connection',
+    description: 'Create a new connection to a connector in Power Automate. Requires user authentication (pa-auth-start). The connection will be owned by the authenticated user.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        connector_id: {
+          type: 'string',
+          description: 'The connector API name (e.g., "shared_office365", "shared_sharepointonline") or full API ID path.',
+        },
+        environment_id: {
+          type: 'string',
+          description: 'Power Platform environment ID. Leave empty for default.',
+        },
+        user_id: {
+          type: 'string',
+          description: 'Email of the authenticated user who will own this connection.',
+        },
+        connection_parameters: {
+          type: 'object',
+          description: 'Optional connection parameters (varies by connector). Most OAuth connectors need no extra params.',
+        },
+      },
+      required: ['connector_id', 'user_id'],
+    },
+  },
 
-  'pa-list-flows': [
-    'List Power Automate flows in the environment.',
-    'Uses service principal (admin) token. Returns flow names, states, and IDs.',
-  ].join('\n'),
-
-  'pa-get-flow-details': [
-    'Get detailed information about a specific Power Automate flow.',
-    '',
-    'IMPORTANT - Read Behavior:',
-    'This tool uses DUAL-PATH GET (v3.0.3):',
-    '  1. If a delegated user token is available: uses the user endpoint',
-    '     (returns FULL definition including triggers and actions)',
-    '  2. If no user token: falls back to admin endpoint',
-    '     (may return EMPTY definition due to scope limitation)',
-    '',
-    'CRITICAL: Check these response fields before making decisions:',
-    '  - _fetchedVia: shows which path was used ("delegated" or "admin")',
-    '  - _definitionStatus: "POPULATED" or "EMPTY_OR_NOT_RETURNED"',
-    '  - _definitionNote: explains what to do if definition appears empty',
-    '',
-    'If _fetchedVia = "admin" and definition is empty:',
-    '  This is a known scope limitation, NOT a missing definition.',
-    '  The definition IS saved if the create/update returned 200.',
-    '  DO NOT delete and recreate the flow.',
-    '  Either re-authenticate (pa-auth-start) and call again,',
-    '  or ask the user to verify in the Power Automate portal.',
-  ].join('\n'),
-
-  // =========================================================================
-  // FLOW WRITE TOOLS
-  // =========================================================================
-
-  'pa-create-flow': [
-    'Create a new Power Automate flow with a complete definition.',
-    '',
-    '*** REQUIRED PROCEDURE (follow this exact sequence): ***',
-    '',
-    'STEP 1 - AUTHENTICATE FIRST:',
-    '  Call pa-auth-start, then pa-auth-poll until status = "authenticated".',
-    '  DO NOT call pa-create-flow without authentication.',
-    '',
-    'STEP 2 - CREATE WITH FULL DEFINITION:',
-    '  Pass the COMPLETE definition including triggers AND actions.',
-    '  The tool sends shell + definition in ONE API call.',
-    '  Do NOT create a shell first and update separately.',
-    '',
-    'STEP 3 - TRUST THE RESPONSE:',
-    '  If the response includes status: "created" and _authType: "delegated",',
-    '  the definition IS saved. Do not second-guess a 200/201 response.',
-    '',
-    'STEP 4 - WAIT BEFORE VERIFYING:',
-    '  Wait at least 10 seconds before calling pa-get-flow-details.',
-    '  NEVER call pa-get-flow-details in parallel with pa-create-flow.',
-    '  Power Automate has a propagation delay between write and read.',
-    '',
-    'STEP 5 - VERIFY CORRECTLY:',
-    '  When checking with pa-get-flow-details, always check _fetchedVia.',
-    '  If _fetchedVia = "admin" and definition empty, this is a scope limitation.',
-    '  The definition IS there. DO NOT delete and recreate.',
-    '',
-    '*** NEVER delete a flow because get-flow-details shows empty definition. ***',
-  ].join('\n'),
-
-  'pa-update-flow': [
-    'Update an existing Power Automate flow (definition, name, state, connections).',
-    '',
-    'REQUIRES: Delegated user authentication (call pa-auth-start first).',
-    '',
-    'Can update: displayName, definition, state, connectionReferences.',
-    'Send only the fields you want to change.',
-    '',
-    'If response returns 200, the update IS saved.',
-    'Same verification rules as pa-create-flow apply:',
-    '  - Wait 10+ seconds before verifying',
-    '  - Check _fetchedVia on the get-flow-details response',
-    '  - Admin path may show empty definition (scope limitation)',
-  ].join('\n'),
-
-  // =========================================================================
-  // FLOW LIFECYCLE TOOLS
-  // =========================================================================
-
-  'pa-enable-flow': [
-    'Enable (start) a Power Automate flow.',
-    'Note: Flow connections must be authorized in the Power Automate portal',
-    'before enabling. If connections are not authorized, the flow will fail.',
-  ].join('\n'),
-
-  'pa-disable-flow': [
-    'Disable (stop) a Power Automate flow.',
-  ].join('\n'),
-
-  'pa-delete-flow': [
-    'Delete a Power Automate flow permanently.',
-    '',
-    'WARNING: Only delete a flow if you are certain it should be removed.',
-    'Do NOT delete a flow because pa-get-flow-details shows an empty definition.',
-    'An empty definition from the admin GET path is a known scope limitation.',
-    'Check _fetchedVia and _definitionNote before deciding to delete.',
-  ].join('\n'),
-
-  'pa-trigger-flow': [
-    'Manually trigger a Power Automate flow.',
-    '',
-    'REQUIRES: Delegated user authentication and a flow with a manual/Request trigger.',
-    'Recurrence-triggered flows cannot be triggered via this endpoint.',
-    'They run on their configured schedule.',
-  ].join('\n'),
-
-  // =========================================================================
-  // FLOW RUN TOOLS
-  // =========================================================================
-
-  'pa-get-run-history': [
-    'Get the run history for a Power Automate flow.',
-    'Returns recent runs with status, start/end times, and trigger info.',
-  ].join('\n'),
-
-  'pa-get-run-details': [
-    'Get details for a specific flow run.',
-    'Returns the run status, duration, trigger, and action results.',
-  ].join('\n'),
-
-  'pa-cancel-run': [
-    'Cancel a running flow execution.',
-  ].join('\n'),
-
-  // =========================================================================
-  // ENVIRONMENT & CONNECTION TOOLS
-  // =========================================================================
-
-  'pa-list-environments': [
-    'List all Power Platform environments accessible to the service principal.',
-  ].join('\n'),
-
-  'pa-list-connections': [
-    'List API connections in the environment.',
-    'Shows connection status, type, and authorization state.',
-  ].join('\n'),
-
-  'pa-get-connection': [
-    'Get details for a specific API connection.',
-    'Returns connection status, connector type, authorization state, and creator info.',
-    'Requires the connectionId (name field) from pa-list-connections.',
-  ].join('\n'),
-
-  'pa-delete-connection': [
-    'Delete an API connection from the environment permanently.',
-    '',
-    'WARNING: Deleting a connection may break flows that depend on it.',
-    'Check which flows reference this connection before deleting.',
-    'This action cannot be undone.',
-  ].join('\n'),
-
-  // =========================================================================
-  // DATAVERSE SOLUTIONS TOOLS (v3.2.0)
-  // =========================================================================
-
-  'pa-list-solutions': [
-    'List Dataverse solutions in the environment.',
-    'Returns solution unique names, versions, managed/unmanaged status.',
-    '',
-    'By default shows only unmanaged solutions.',
-    'Set includeManaged=true to include Microsoft and third-party managed solutions.',
-    '',
-    'REQUIRES: DATAVERSE_URL environment variable configured.',
-  ].join('\n'),
-
-  'pa-get-solution': [
-    'Get details for a specific Dataverse solution.',
-    'Accepts either a solution GUID or unique name (case-sensitive).',
-    '',
-    'Returns version, description, publisher, managed status, and timestamps.',
-    '',
-    'REQUIRES: DATAVERSE_URL environment variable configured.',
-  ].join('\n'),
-
-  'pa-list-solution-components': [
-    'List all components within a Dataverse solution.',
-    'Returns component types (Entity, Workflow, Canvas App, etc.) and object IDs.',
-    '',
-    'Common component types:',
-    '  29 = Cloud Flow (Workflow)',
-    '  1  = Entity (Table)',
-    '  300 = Canvas App',
-    '  372 = Environment Variable',
-    '',
-    'Use the solutionId (GUID) from pa-list-solutions or pa-get-solution.',
-    '',
-    'REQUIRES: DATAVERSE_URL environment variable configured.',
-  ].join('\n'),
-
-  'pa-export-solution': [
-    'Export a Dataverse solution as a ZIP file (base64 encoded).',
-    '',
-    'Returns the solution file as base64 plus metadata (fileName, sizeBytes).',
-    'Set managed=true to export as a managed solution.',
-    '',
-    'Use solutionUniqueName (not friendly name) from pa-list-solutions.',
-    '',
-    'NOTE: Large solutions may produce very large responses.',
-    '',
-    'REQUIRES: DATAVERSE_URL environment variable configured.',
-  ].join('\n'),
-
-  'pa-add-solution-component': [
-    'Add a component (e.g., a Cloud Flow) to a Dataverse solution.',
-    '',
-    'This is the key ALM operation: it registers an existing component',
-    '(flow, table, app, etc.) into a solution for packaging and deployment.',
-    '',
-    'Parameters:',
-    '  solutionUniqueName — Solution to add the component to',
-    '  componentId — GUID of the component (e.g., flow ID from pa-list-flows)',
-    '  componentType — Numeric type code (default: 29 = Cloud Flow)',
-    '',
-    'Common component types:',
-    '  29  = Cloud Flow (Workflow)',
-    '  1   = Entity (Table)',
-    '  300 = Canvas App',
-    '  372 = Environment Variable Definition',
-    '',
-    'Set addRequiredComponents=true to auto-include dependencies.',
-    '',
-    'REQUIRES: DATAVERSE_URL environment variable configured.',
-  ].join('\n'),
-};
-
-/**
- * Flow Creation Procedure Summary (for embedding in system prompts)
- */
-export const FLOW_CREATION_PROCEDURE = [
-  'FLOW CREATION SEQUENCE (mandatory):',
-  '1. pa-auth-start -> pa-auth-poll (wait for "authenticated")',
-  '2. pa-create-flow with FULL definition (triggers + actions in one call)',
-  '3. Wait 10+ seconds (propagation delay)',
-  '4. pa-get-flow-details -> check _fetchedVia and _definitionStatus',
-  '5. If _fetchedVia="admin" and empty: scope limitation, NOT missing definition',
-  '',
-  'NEVER delete a flow because get-flow-details shows empty definition.',
-  'NEVER call get-flow-details in parallel with create-flow.',
-  'If create returned 200 with _authType="delegated", the definition IS saved.',
-].join('\n');
+  // ═══════════════════════════════════════════
+  // SOLUTION MANAGEMENT (7 tools — 5 existing + 2 new)
+  // ═══════════════════════════════════════════
+  {
+    name: 'pa-list-solutions',
+    description: 'List Dataverse solutions. By default shows only unmanaged solutions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        unmanaged_only: {
+          type: 'boolean',
+          description: 'If true (default), only return unmanaged solutions. Set false to include managed.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'pa-get-solution',
+    description: 'Get detailed information about a specific Dataverse solution by unique name or GUID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        unique_name: {
+          type: 'string',
+          description: 'Solution unique name (e.g., "MySolution") or solution GUID.',
+        },
+      },
+      required: ['unique_name'],
+    },
+  },
+  {
+    name: 'pa-list-solution-components',
+    description: 'List all components (flows, entities, web resources, etc.) within a Dataverse solution.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solution_id: {
+          type: 'string',
+          description: 'The solution GUID (solutionId from pa-get-solution).',
+        },
+      },
+      required: ['solution_id'],
+    },
+  },
+  {
+    name: 'pa-add-solution-component',
+    description: 'Add an existing component (flow, entity, etc.) to a Dataverse solution.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solution_unique_name: {
+          type: 'string',
+          description: 'The unique name of the target solution.',
+        },
+        component_id: {
+          type: 'string',
+          description: 'GUID of the component to add.',
+        },
+        component_type: {
+          type: 'number',
+          description: 'Component type code (e.g., 29 = Workflow, 1 = Entity, 300 = Canvas App, 62 = WebResource).',
+        },
+        add_required_components: {
+          type: 'boolean',
+          description: 'If true, also add required dependent components. Default: false.',
+        },
+      },
+      required: ['solution_unique_name', 'component_id', 'component_type'],
+    },
+  },
+  {
+    name: 'pa-export-solution',
+    description: 'Export a Dataverse solution as a ZIP file (base64 encoded).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solution_name: {
+          type: 'string',
+          description: 'The unique name of the solution to export.',
+        },
+        managed: {
+          type: 'boolean',
+          description: 'Export as managed (true) or unmanaged (false, default).',
+        },
+      },
+      required: ['solution_name'],
+    },
+  },
+  {
+    name: 'pa-create-solution',
+    description: 'Create a new Dataverse solution. Requires a publisher ID (use pa-list-solutions to find existing publishers).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        unique_name: {
+          type: 'string',
+          description: 'Unique name for the solution (no spaces, e.g., "MyNewSolution").',
+        },
+        friendly_name: {
+          type: 'string',
+          description: 'Display name for the solution (e.g., "My New Solution").',
+        },
+        publisher_id: {
+          type: 'string',
+          description: 'GUID of the publisher. Use publisherId from pa-get-solution on an existing solution to find valid publishers.',
+        },
+        version: {
+          type: 'string',
+          description: 'Version number (default: "1.0.0.0").',
+        },
+        description: {
+          type: 'string',
+          description: 'Optional description of the solution.',
+        },
+      },
+      required: ['unique_name', 'friendly_name', 'publisher_id'],
+    },
+  },
+  {
+    name: 'pa-delete-solution',
+    description: 'Delete a Dataverse solution. WARNING: This permanently removes the solution container. Components inside may remain in the environment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        solution_id: {
+          type: 'string',
+          description: 'The solution GUID to delete (solutionId from pa-get-solution).',
+        },
+      },
+      required: ['solution_id'],
+    },
+  },
+];
