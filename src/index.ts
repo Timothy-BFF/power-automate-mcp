@@ -63,8 +63,9 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
-// v3.3.0: Fixed pa-list-connections, added pa-create-solution,
-//         pa-delete-solution, pa-create-connection. Total: 26 tools.
+// v3.3.0: Fixed pa-list-connections (delegated token + delegated path),
+//         added pa-create-solution, pa-delete-solution, pa-create-connection.
+//         Total: 26 tools.
 // v3.2.0: Added 5 Dataverse Solutions tools.
 // v3.1.0: Added pa-get-connection and pa-delete-connection tools.
 // v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS.
@@ -337,9 +338,10 @@ const toolDefs: ToolDefinition[] = [
   },
   // =========================================================================
   // CONNECTION TOOLS
-  // v3.3.0: Fixed pa-list-connections path, added pa-create-connection
+  // v3.3.0: Fixed pa-list-connections (delegated path + delegated token),
+  //         added pa-create-connection
   // =========================================================================
-  // ---- List Connections (v3.3.0 FIX: delegated path) ----
+  // ---- List Connections (v3.3.0 FIX: delegated path + user token) ----
   {
     name: 'pa-list-connections',
     description: TOOL_DESCRIPTIONS['pa-list-connections'],
@@ -347,17 +349,44 @@ const toolDefs: ToolDefinition[] = [
       type: 'object',
       properties: {
         environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+        user_id: { type: 'string', description: 'Email of authenticated user. Connections are per-user and require a delegated token. Authenticate first with pa-auth-start.' },
       },
     },
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
-        // v3.3.0 FIX: Use delegated path instead of admin-scoped path
-        // Old (broken): /scopes/admin/environments/{envId}/connections
-        // New (fixed):  /environments/{envId}/connections
-        const token = await tokenManager.getToken('https://service.flow.microsoft.com/.default');
+
+        // v3.3.0 FIX: Connections are per-user — must use delegated token.
+        // Service principal tokens return 404 on the user-scoped connections endpoint.
+        const userId = p.user_id || userAuthManager.getDefaultUserId();
+        let token: string;
+        let tokenType: string;
+
+        if (userId) {
+          const userToken = await userAuthManager.getAccessToken(userId);
+          if (userToken) {
+            token = userToken;
+            tokenType = `delegated (${userId})`;
+          } else {
+            // User specified but token expired/missing
+            return fail(
+              `User ${userId} is not authenticated or token expired. ` +
+              'Connections are per-user and require a delegated token. ' +
+              'Use pa-auth-start to authenticate first, then retry.'
+            );
+          }
+        } else {
+          // No user at all — give a clear instruction
+          return fail(
+            'pa-list-connections requires user authentication. ' +
+            'Connections are per-user and cannot be listed with a service principal token. ' +
+            'Use pa-auth-start to authenticate, then pass user_id to this tool.'
+          );
+        }
+
         const url = `https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/${envId}/connections?api-version=2016-11-01`;
-        console.log(`[ListConnections] GET ${url} (v3.3.0 delegated path)`);
+        console.log(`[ListConnections] GET ${url} (token: ${tokenType})`);
+
         const response = await axios.get(url, {
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
@@ -366,8 +395,16 @@ const toolDefs: ToolDefinition[] = [
           apiId: c.properties?.apiId, status: c.properties?.statuses?.[0]?.status,
           createdTime: c.properties?.createdTime,
         }));
-        return ok({ count: connections.length, connections });
-      } catch (e: any) { return fail(e.message); }
+        return ok({ count: connections.length, connections, _tokenType: tokenType });
+      } catch (e: any) {
+        if (e.response?.status === 404 || e.response?.status === 403) {
+          return fail(
+            `${e.message}. This may indicate the delegated token lacks permissions. ` +
+            'Ensure the user has connections in this environment.'
+          );
+        }
+        return fail(e.message);
+      }
     },
   },
   // ---- Get Connection Details ----
@@ -696,7 +733,7 @@ const toolDefs: ToolDefinition[] = [
             status: 'authenticated',
             user_id: result.userId || targetUser,
             message: result.message,
-            _note: 'You can now use pa-create-flow, pa-update-flow, and pa-trigger-flow.',
+            _note: 'You can now use pa-create-flow, pa-update-flow, pa-list-connections, and pa-create-connection.',
           });
         }
         if (result.status === 'pending') {
