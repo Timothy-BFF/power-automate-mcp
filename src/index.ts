@@ -63,6 +63,7 @@ function fail(msg: string): ToolResult {
 // Tool Definitions (shared between SSE + REST transports)
 //
 // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
+//         Fixed pa-create-connection (multi-scope refresh token exchange),
 //         added pa-create-solution, pa-delete-solution, pa-create-connection.
 //         Unified tool registration — all 26 tools through one loop.
 //         Total: 26 tools.
@@ -339,7 +340,7 @@ const toolDefs: ToolDefinition[] = [
   // =========================================================================
   // CONNECTION TOOLS
   // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
-  //         added pa-create-connection
+  //         Fixed pa-create-connection (multi-scope refresh token exchange)
   // =========================================================================
   // ---- List Connections (v3.3.0 FIX: PowerApps host + PowerApps token) ----
   {
@@ -356,9 +357,6 @@ const toolDefs: ToolDefinition[] = [
         const envId = resolveEnvironmentId(p.environmentId);
 
         // v3.3.0 FIX: Connections API lives under PowerApps, NOT Flow.
-        // Old (broken): api.flow.microsoft.com/.../connections → 404
-        // New (fixed):  api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/{env}/connections
-        // Token scope:  service.powerapps.com/.default (already pre-warmed)
         const token = await tokenManager.getToken('https://service.powerapps.com/.default');
         const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/${envId}/connections?api-version=2016-11-01`;
 
@@ -446,7 +444,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Create Connection (v3.3.0 NEW) ----
+  // ---- Create Connection (v3.3.0 FIX: multi-scope refresh token exchange) ----
   {
     name: 'pa-create-connection',
     description: TOOL_DESCRIPTIONS['pa-create-connection'],
@@ -464,15 +462,28 @@ const toolDefs: ToolDefinition[] = [
       try {
         const envId = resolveEnvironmentId(p.environmentId);
         if (!p.user_id) return fail('user_id is required for creating connections. Use pa-auth-start first.');
-        const userToken = await userAuthManager.getAccessToken(p.user_id);
-        if (!userToken) return fail(`Not authenticated. Use pa-auth-start to begin device login for ${p.user_id}.`);
+
+        // v3.3.0 FIX: Use PowerApps-scoped delegated token (not Flow-scoped).
+        // The refresh token from Device Code auth is silently exchanged for a
+        // service.powerapps.com token via UserAuthManager.getAccessTokenForScope().
+        const userToken = await userAuthManager.getAccessTokenForScope(
+          p.user_id,
+          'https://service.powerapps.com/.default'
+        );
+        if (!userToken) {
+          return fail(
+            `Could not acquire PowerApps delegated token for ${p.user_id}. ` +
+            'Ensure the user is authenticated (pa-auth-start) and the refresh token is valid. ' +
+            'If this persists, admin consent for PowerApps Service may be required in Azure AD.'
+          );
+        }
 
         const apiId = p.connectorId.startsWith('/providers/')
           ? p.connectorId
           : `/providers/Microsoft.PowerApps/apis/${p.connectorId}`;
 
         const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/environments/${envId}/connections?api-version=2016-11-01`;
-        console.log(`[CreateConnection] POST ${url} (connector: ${p.connectorId}, user: ${p.user_id})`);
+        console.log(`[CreateConnection] POST ${url} (connector: ${p.connectorId}, user: ${p.user_id}, token: powerapps-delegated)`);
 
         const response = await axios.post(url, {
           properties: {
@@ -490,9 +501,21 @@ const toolDefs: ToolDefinition[] = [
           displayName: conn.properties?.displayName || conn.name,
           connectorName: p.connectorId,
           connectionStatus: conn.properties?.statuses?.[0]?.status || 'created',
+          _tokenScope: 'service.powerapps.com (delegated)',
           message: `Connection created successfully. ${conn.properties?.statuses?.[0]?.status === 'Connected' ? 'Connection is active.' : 'You may need to authorize this connection in the Power Automate portal.'}`,
         });
-      } catch (e: any) { return fail(e.message); }
+      } catch (e: any) {
+        const status = e.response?.status;
+        const detail = e.response?.data?.error?.message || e.message;
+        if (status === 403) {
+          return fail(
+            `CreateConnection 403 Forbidden: ${detail}. ` +
+            'This may require admin consent for PowerApps Service in Azure AD, ' +
+            'or the connector may need interactive authorization (e.g., OAuth connectors like shared_office365).'
+          );
+        }
+        return fail(`CreateConnection failed (${status || 'unknown'}): ${detail}`);
+      }
     },
   },
   // =========================================================================
@@ -944,7 +967,7 @@ app.listen(PORT, () => {
   console.log(`[Init] Health:    http://localhost:${PORT}/health`);
   console.log(`[Init] API:       BAP admin + Flow admin + PowerApps admin (3 scopes)`);
   console.log(`[Init] Dataverse: ${solutionClient.isConfigured() ? process.env.DATAVERSE_URL + ' (configured)' : 'Not configured (set DATAVERSE_URL)'}`);
-  console.log(`[Init] Write:     Delegated user token via Device Code Flow`);
+  console.log(`[Init] Write:     Delegated user token via Device Code Flow (multi-scope)`);
   console.log(`[Init] Auth:      ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
   console.log(`[Init] Tools:     ${toolDefs.length} registered (unified SSE + REST)`);
   console.log('');

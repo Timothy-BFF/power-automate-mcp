@@ -9,13 +9,16 @@
  *   - Tokens stored in-memory per userId (email)
  *   - Auto-refresh when < 5 minutes remaining
  *   - Refresh tokens valid for ~90 days
+ *   - Multi-scope support: one Device Code auth, refresh token mints tokens
+ *     for Flow, PowerApps, Dataverse, or any Microsoft resource scope
  *
  * Integration with PowerPlatformClient:
- *   - getAccessToken(userId?) returns a valid bearer token
+ *   - getAccessToken(userId?) returns a valid Flow-scoped bearer token
+ *   - getAccessTokenForScope(userId?, scope) returns a token for any resource
  *   - Auto-resolves to most recently authenticated user if no userId specified
- *   - Used by createFlow() and updateFlow() for delegated write operations
+ *   - Used by createFlow() for delegated write, createConnection() for PowerApps
  *
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 import axios from 'axios';
@@ -82,7 +85,15 @@ export class UserAuthManager {
   private tenantId: string;
   private clientId: string;
   private scope: string;
+
+  // Primary tokens: userId -> Flow-scoped token (from Device Code auth)
   private tokens: Map<string, UserToken> = new Map();
+
+  // Additional scoped tokens: userId -> (scope -> token)
+  // Acquired silently via refresh token exchange
+  private scopedTokens: Map<string, Map<string, UserToken>> = new Map();
+
+  // Pending device code auths
   private pendingAuths: Map<string, PendingDeviceAuth> = new Map();
 
   /**
@@ -356,11 +367,11 @@ export class UserAuthManager {
   }
 
   // -----------------------------------------------------------------------
-  // Access Token (for PowerPlatformClient integration)
+  // Access Token — Primary (Flow scope)
   // -----------------------------------------------------------------------
 
   /**
-   * Gets a valid access token for the specified user.
+   * Gets a valid access token for the specified user (Flow scope).
    * Auto-refreshes if the token is within 5 minutes of expiry.
    * Returns null if no token is available (user must authenticate).
    *
@@ -402,7 +413,63 @@ export class UserAuthManager {
   }
 
   // -----------------------------------------------------------------------
-  // Token Refresh (internal)
+  // Access Token — Multi-Scope (v2.1.0)
+  //
+  // Uses the stored refresh token to silently acquire access tokens for
+  // ANY Microsoft resource scope. The user authenticates ONCE via Device
+  // Code Flow; the refresh token mints tokens for additional resources.
+  //
+  // Example:
+  //   getAccessTokenForScope(userId, 'https://service.powerapps.com/.default')
+  //   getAccessTokenForScope(userId, 'https://graph.microsoft.com/.default')
+  // -----------------------------------------------------------------------
+
+  /**
+   * Gets an access token for a specific resource scope.
+   * If scope is the default Flow scope (or omitted), delegates to getAccessToken().
+   * Otherwise, checks the scoped token cache and acquires via refresh token exchange.
+   *
+   * @param userId - User email (optional, defaults to most recent authenticated user)
+   * @param scope  - Target resource scope (e.g., 'https://service.powerapps.com/.default')
+   * @returns Access token string or null if unavailable
+   */
+  async getAccessTokenForScope(userId?: string, scope?: string): Promise<string | null> {
+    // No scope or default Flow scope → use primary token path
+    if (!scope || scope === DEFAULT_SCOPE || scope.startsWith('https://service.flow.microsoft.com/')) {
+      return this.getAccessToken(userId);
+    }
+
+    const targetUser = userId || this.getDefaultUserId();
+    if (!targetUser) {
+      console.log('[UserAuth] No authenticated user available for scoped token request');
+      return null;
+    }
+
+    // Check scoped token cache
+    const userScoped = this.scopedTokens.get(targetUser);
+    if (userScoped) {
+      const cached = userScoped.get(scope);
+      if (cached) {
+        // Auto-refresh scoped token if < 5 min remaining
+        if (cached.expiresAt - Date.now() >= REFRESH_BUFFER_MS) {
+          return cached.accessToken;
+        }
+        console.log(`[UserAuth] Scoped token (${this.shortScope(scope)}) for ${targetUser} expiring soon, re-acquiring...`);
+      }
+    }
+
+    // Acquire new scoped token via refresh token exchange
+    const primaryToken = this.tokens.get(targetUser);
+    if (!primaryToken?.refreshToken) {
+      console.log(`[UserAuth] No refresh token for ${targetUser} — cannot acquire ${this.shortScope(scope)} token`);
+      return null;
+    }
+
+    return this.acquireScopedToken(targetUser, scope, primaryToken.refreshToken);
+  }
+
+  // -----------------------------------------------------------------------
+  // Token Refresh — Primary (internal)
   // -----------------------------------------------------------------------
 
   private async refreshTokenForUser(userId: string, refreshToken: string): Promise<boolean> {
@@ -437,6 +504,94 @@ export class UserAuthManager {
       console.error(`[UserAuth] Refresh failed for ${userId}: ${errMsg}`);
       return false;
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Token Acquisition — Scoped (v2.1.0, internal)
+  //
+  // Exchanges the stored refresh token for an access token targeting a
+  // different Microsoft resource. Azure AD v2.0 allows a single refresh
+  // token to be used across any resource the app has permissions for.
+  // -----------------------------------------------------------------------
+
+  private async acquireScopedToken(
+    userId: string,
+    scope: string,
+    refreshToken: string
+  ): Promise<string | null> {
+    try {
+      // Ensure offline_access is included so we get a fresh refresh token back
+      const requestScope = scope.includes('offline_access')
+        ? scope
+        : `${scope} offline_access`;
+
+      console.log(`[UserAuth] Acquiring ${this.shortScope(scope)} token for ${userId} via refresh token exchange...`);
+
+      const params = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: this.clientId,
+        refresh_token: refreshToken,
+        scope: requestScope,
+      });
+
+      const response = await axios.post(this.tokenEndpoint, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+
+      const data = response.data;
+
+      // Store scoped token
+      if (!this.scopedTokens.has(userId)) {
+        this.scopedTokens.set(userId, new Map());
+      }
+      this.scopedTokens.get(userId)!.set(scope, {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token || refreshToken,
+        expiresAt: Date.now() + (data.expires_in * 1000),
+        userId,
+        acquiredAt: Date.now(),
+      });
+
+      // Sync refresh token back to primary if Azure AD rotated it
+      if (data.refresh_token) {
+        const primary = this.tokens.get(userId);
+        if (primary && data.refresh_token !== primary.refreshToken) {
+          primary.refreshToken = data.refresh_token;
+          console.log(`[UserAuth] Refresh token rotated for ${userId} (synced to primary)`);
+        }
+      }
+
+      console.log(`[UserAuth] ✅ ${this.shortScope(scope)} token acquired for ${userId} (TTL: ${data.expires_in}s)`);
+      return data.access_token;
+
+    } catch (error: any) {
+      const errCode = error.response?.data?.error || '';
+      const errMsg = error.response?.data?.error_description || error.message;
+
+      // If the error is interaction_required, the user may need to re-consent
+      if (errCode === 'interaction_required' || errCode === 'invalid_grant') {
+        console.error(
+          `[UserAuth] Cannot silently acquire ${this.shortScope(scope)} token for ${userId}: ${errCode}. ` +
+          'The user may need to re-authenticate or admin consent may be required for this scope.'
+        );
+      } else {
+        console.error(`[UserAuth] Scoped token acquisition failed for ${userId} (${this.shortScope(scope)}): ${errMsg}`);
+      }
+
+      return null;
+    }
+  }
+
+  /**
+   * Returns a short human-readable label for a scope URL.
+   * e.g., 'https://service.powerapps.com/.default' → 'powerapps'
+   */
+  private shortScope(scope: string): string {
+    if (scope.includes('powerapps')) return 'powerapps';
+    if (scope.includes('flow')) return 'flow';
+    if (scope.includes('graph')) return 'graph';
+    if (scope.includes('dynamics') || scope.includes('crm')) return 'dataverse';
+    return scope.split('/')[2] || scope;
   }
 
   // -----------------------------------------------------------------------
@@ -484,9 +639,11 @@ export class UserAuthManager {
 
   /**
    * Invalidates a specific user's token (e.g., on 401 retry failure).
+   * Also clears all scoped tokens for the user.
    */
   invalidateUser(userId: string): void {
     this.tokens.delete(userId);
-    console.log(`[UserAuth] Token invalidated for ${userId}`);
+    this.scopedTokens.delete(userId);
+    console.log(`[UserAuth] Token invalidated for ${userId} (primary + all scoped tokens)`);
   }
 }
