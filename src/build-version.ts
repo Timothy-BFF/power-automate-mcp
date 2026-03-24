@@ -1,6 +1,7 @@
-// Cache-bust marker — forces Docker to recompile src/ layer
-export const BUILD_VERSION = '1.0.6';
-export const BUILD_TIMESTAMP = '2026-03-05T21:35:00Z';
-// Fix: add cancelFlowRun() alias (cancel-run.ts handler)
-// Fix: add setFlowState() alias (enable-disable-flow.ts handler)
-// All 4 handler method name mismatches now resolved
+/**
+ * Power Automate MCP — Build Version
+ * v3.3.0: Fix pa-list-connections, add create/delete solution & create connection
+ */
+export const BUILD_VERSION = '3.3.0';
+export const BUILD_DATE = '2026-03-24';
+export const BUILD_NAME = 'power-automate-mcp';
