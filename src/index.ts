@@ -19,6 +19,17 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const VERSION = '3.3.0';
 
 // =============================================================================
+// Utility
+// =============================================================================
+function generateUUID(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+// =============================================================================
 // Core Services
 // =============================================================================
 const tokenManager = new AzureTokenManager();
@@ -63,8 +74,9 @@ function fail(msg: string): ToolResult {
 // Tool Definitions (shared between SSE + REST transports)
 //
 // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
-//         Fixed pa-create-connection (multi-scope refresh token exchange),
-//         added pa-create-solution, pa-delete-solution, pa-create-connection.
+//         Fixed pa-create-connection (multi-scope refresh token exchange +
+//         correct PUT endpoint with connector in path + env as filter).
+//         Added pa-create-solution, pa-delete-solution, pa-create-connection.
 //         Unified tool registration — all 26 tools through one loop.
 //         Total: 26 tools.
 // v3.2.0: Added 5 Dataverse Solutions tools.
@@ -340,7 +352,7 @@ const toolDefs: ToolDefinition[] = [
   // =========================================================================
   // CONNECTION TOOLS
   // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
-  //         Fixed pa-create-connection (multi-scope refresh token exchange)
+  //         Fixed pa-create-connection (multi-scope token + correct PUT endpoint)
   // =========================================================================
   // ---- List Connections (v3.3.0 FIX: PowerApps host + PowerApps token) ----
   {
@@ -444,17 +456,34 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Create Connection (v3.3.0 FIX: multi-scope refresh token exchange) ----
+  // =========================================================================
+  // Create Connection (v3.3.0 FIX round 3)
+  //
+  // Previous attempts:
+  //   Round 1 (930cda56): POST /environments/{env}/connections → 403 (wrong token scope)
+  //   Round 2 (7e1aef7b): POST /environments/{env}/connections + PowerApps token → 404 (wrong URL)
+  //
+  // Fix: The PowerApps connection creation API uses a completely different
+  // URL pattern than listing. The connector goes IN the URL path and the
+  // environment is passed as a query filter:
+  //
+  //   PUT /providers/Microsoft.PowerApps/apis/{connectorName}/connections/{newId}
+  //       ?api-version=2016-11-01&$filter=environment eq '{envId}'
+  //
+  // For OAuth connectors (shared_office365, etc.), the API creates the
+  // connection shell but the user must authorize it in the Power Automate
+  // portal. The response may include a consentLink or an Error status.
+  // =========================================================================
   {
     name: 'pa-create-connection',
     description: TOOL_DESCRIPTIONS['pa-create-connection'],
     inputSchema: {
       type: 'object',
       properties: {
-        connectorId: { type: 'string', description: 'Connector API name (e.g., shared_office365) or full API ID path.' },
+        connectorId: { type: 'string', description: 'Connector API name (e.g., shared_office365, shared_sql, shared_sharepointonline) or full API ID path.' },
         environmentId: { type: 'string', description: 'Power Platform environment ID.' },
         user_id: { type: 'string', description: 'Email of the authenticated user who will own this connection.' },
-        connectionParameters: { type: 'object', description: 'Optional connection parameters (varies by connector).' },
+        connectionParameters: { type: 'object', description: 'Optional connection parameters (varies by connector, e.g., server/database for SQL).' },
       },
       required: ['connectorId', 'user_id'],
     },
@@ -463,9 +492,7 @@ const toolDefs: ToolDefinition[] = [
         const envId = resolveEnvironmentId(p.environmentId);
         if (!p.user_id) return fail('user_id is required for creating connections. Use pa-auth-start first.');
 
-        // v3.3.0 FIX: Use PowerApps-scoped delegated token (not Flow-scoped).
-        // The refresh token from Device Code auth is silently exchanged for a
-        // service.powerapps.com token via UserAuthManager.getAccessTokenForScope().
+        // Acquire PowerApps-scoped delegated token via refresh token exchange
         const userToken = await userAuthManager.getAccessTokenForScope(
           p.user_id,
           'https://service.powerapps.com/.default'
@@ -478,43 +505,90 @@ const toolDefs: ToolDefinition[] = [
           );
         }
 
-        const apiId = p.connectorId.startsWith('/providers/')
-          ? p.connectorId
-          : `/providers/Microsoft.PowerApps/apis/${p.connectorId}`;
+        // Extract short connector name (e.g., shared_office365)
+        const connectorName = p.connectorId.startsWith('/providers/')
+          ? p.connectorId.split('/').pop()!
+          : p.connectorId;
 
-        const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/environments/${envId}/connections?api-version=2016-11-01`;
-        console.log(`[CreateConnection] POST ${url} (connector: ${p.connectorId}, user: ${p.user_id}, token: powerapps-delegated)`);
+        // Generate unique connection name: shared-office365-{uuid}
+        const connectionName = `${connectorName.replace(/_/g, '-')}-${generateUUID()}`;
 
-        const response = await axios.post(url, {
+        // Correct PowerApps connection creation endpoint:
+        //   PUT /apis/{connector}/connections/{name}?$filter=environment eq '{env}'
+        // NOT: POST /environments/{env}/connections (that's only for listing)
+        const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/apis/${connectorName}/connections/${connectionName}`;
+
+        console.log(`[CreateConnection] PUT ${url} (user: ${p.user_id}, env: ${envId}, token: powerapps-delegated)`);
+
+        const response = await axios.put(url, {
           properties: {
-            apiId,
+            environment: {
+              id: `/providers/Microsoft.PowerApps/environments/${envId}`,
+              name: envId,
+            },
             connectionParameters: p.connectionParameters || {},
           },
         }, {
-          headers: { Authorization: `Bearer ${userToken}`, 'Content-Type': 'application/json' },
+          headers: {
+            Authorization: `Bearer ${userToken}`,
+            'Content-Type': 'application/json',
+          },
+          params: {
+            'api-version': '2016-11-01',
+            '$filter': `environment eq '${envId}'`,
+          },
         });
 
         const conn = response.data;
+        const connStatus = conn?.properties?.statuses?.[0]?.status || 'Unknown';
+
+        // Check if the connector requires interactive consent (OAuth connectors)
+        const needsConsent = connStatus === 'Error' || connStatus === 'Unauthenticated';
+        const consentLink = conn?.properties?.connectionParameters?.token?.oAuthSettings?.redirectUrl || null;
+
         return ok({
           status: 'created',
-          connectionId: conn.name,
-          displayName: conn.properties?.displayName || conn.name,
-          connectorName: p.connectorId,
-          connectionStatus: conn.properties?.statuses?.[0]?.status || 'created',
+          connectionId: conn?.name || connectionName,
+          displayName: conn?.properties?.displayName || connectionName,
+          connectorName,
+          connectionStatus: connStatus,
+          needsConsent,
+          consentLink,
           _tokenScope: 'service.powerapps.com (delegated)',
-          message: `Connection created successfully. ${conn.properties?.statuses?.[0]?.status === 'Connected' ? 'Connection is active.' : 'You may need to authorize this connection in the Power Automate portal.'}`,
+          _method: 'PUT',
+          _urlPattern: 'apis/{connector}/connections/{name}?$filter=environment',
+          message: needsConsent
+            ? `Connection shell created for ${connectorName}. This OAuth connector requires interactive authorization. ` +
+              `Go to make.powerautomate.com → Data → Connections → find "${connectionName}" → Authorize. ` +
+              (consentLink ? `Or visit: ${consentLink}` : '')
+            : `Connection created successfully. Status: ${connStatus}.`,
         });
       } catch (e: any) {
         const status = e.response?.status;
+        const errCode = e.response?.data?.error?.code || '';
         const detail = e.response?.data?.error?.message || e.message;
+
+        if (status === 404) {
+          return fail(
+            `CreateConnection 404: Connector '${p.connectorId}' not found at the PowerApps API. ` +
+            `This connector may not support API-based creation, or requires interactive consent. ` +
+            `For OAuth connectors (Office 365, Outlook, SharePoint), create manually at make.powerautomate.com → Data → Connections. ` +
+            `Detail: ${detail}`
+          );
+        }
         if (status === 403) {
           return fail(
             `CreateConnection 403 Forbidden: ${detail}. ` +
-            'This may require admin consent for PowerApps Service in Azure AD, ' +
-            'or the connector may need interactive authorization (e.g., OAuth connectors like shared_office365).'
+            'Admin consent for PowerApps Service may be required in Azure AD.'
           );
         }
-        return fail(`CreateConnection failed (${status || 'unknown'}): ${detail}`);
+        if (status === 409) {
+          return fail(
+            `CreateConnection 409 Conflict: A connection with this name already exists. ` +
+            `Detail: ${detail}`
+          );
+        }
+        return fail(`CreateConnection failed (${status || 'unknown'}): ${errCode} — ${detail}`);
       }
     },
   },
@@ -815,9 +889,6 @@ function toZodProps(inputSchema: any): Record<string, any> {
 
 // =============================================================================
 // UNIFIED TOOL REGISTRATION (v3.3.0 fix)
-//
-// ALL 26 tools registered through ONE loop. No separate registerAuthTools().
-// This fixes the "only 4 tools visible" SSE bug caused by dual-path registration.
 // =============================================================================
 for (const def of toolDefs) {
   const zodProps = toZodProps(def.inputSchema);

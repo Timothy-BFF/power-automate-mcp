@@ -5,8 +5,9 @@
  * IMPORTANT: This must be a Record<string, string> — NOT an array.
  * index.ts accesses it as TOOL_DESCRIPTIONS['pa-xxx'].
  *
- * v3.2.0 → v3.3.0 changes:
+ * v3.3.0 changes:
  *   FIXED: pa-list-connections (now uses PowerApps admin host)
+ *   FIXED: pa-create-connection (PUT endpoint, connector in path, env as filter, multi-scope token)
  *   NEW: pa-create-solution, pa-delete-solution, pa-create-connection
  */
 
@@ -29,13 +30,13 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
   // ---- Environment Management (1 tool) ----
   'pa-list-environments': 'List all Power Platform environments accessible to the service principal.',
 
-  // ---- Connection Management (4 tools — 3 existing + 1 new) ----
+  // ---- Connection Management (4 tools) ----
   'pa-list-connections': 'List all connections in a Power Platform environment. Uses PowerApps admin API (no user auth required).',
   'pa-get-connection': 'Get detailed information about a specific connection, including status, connector type, and creation details.',
   'pa-delete-connection': 'Delete a connection permanently.',
-  'pa-create-connection': 'Create a new connection to a connector in Power Automate. Requires user authentication (pa-auth-start). The connection will be owned by the authenticated user.',
+  'pa-create-connection': 'Create a new connection to a connector in Power Automate. Requires user authentication (pa-auth-start). Uses PUT to /apis/{connector}/connections/{name}. For OAuth connectors (Office 365, Outlook, SharePoint), the connection shell is created but the user may need to authorize it in the Power Automate portal.',
 
-  // ---- Solution Management (7 tools — 5 existing + 2 new) ----
+  // ---- Solution Management (7 tools) ----
   'pa-list-solutions': 'List Dataverse solutions. By default shows only unmanaged solutions.',
   'pa-get-solution': 'Get detailed information about a specific Dataverse solution by unique name or GUID.',
   'pa-list-solution-components': 'List all components (flows, entities, web resources, etc.) within a Dataverse solution.',
