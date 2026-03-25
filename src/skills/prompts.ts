@@ -8,7 +8,7 @@
  *
  * Registered prompts:
  *   - workflow-auth: Device Code Flow authentication sequence
- *   - workflow-create-flow: Mandatory flow creation procedure
+ *   - workflow-create-flow: Mandatory flow creation procedure + definition format
  *   - workflow-create-connection: Connection creation with OAuth consent guide
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -18,8 +18,6 @@ export function registerPrompts(server: McpServer): void {
 
   // =========================================================================
   // Prompt 1: workflow-auth
-  // Guides agents through the Device Code Flow authentication sequence.
-  // Prevents: agents calling write tools without auth, confusing pending status.
   // =========================================================================
   server.prompt(
     'workflow-auth',
@@ -58,6 +56,12 @@ export function registerPrompts(server: McpServer): void {
             '- Users MUST open a FRESH SSE connection',
             '- Users MUST re-authenticate (refresh tokens are stored in-memory only)',
             '',
+            '## IMPORTANT — Environment Discovery:',
+            '- `pa-list-environments` may return empty — this is a known limitation (BAP admin role)',
+            '- You do NOT need to discover the environment ID — it is configured server-side',
+            '- All tools default to the production environment automatically when environmentId is omitted',
+            '- Just call pa-list-flows, pa-create-flow, etc. directly without passing environmentId',
+            '',
             '## Multi-Scope Token Exchange:',
             'The server automatically exchanges the Flow-scoped token for PowerApps-scoped tokens',
             'when needed (e.g., for pa-create-connection). Users only authenticate once.',
@@ -71,13 +75,11 @@ export function registerPrompts(server: McpServer): void {
   );
 
   // =========================================================================
-  // Prompt 2: workflow-create-flow
-  // Encodes the mandatory flow creation procedure.
-  // Prevents: empty definitions, premature deletion, missing verification.
+  // Prompt 2: workflow-create-flow (with definition JSON format guide)
   // =========================================================================
   server.prompt(
     'workflow-create-flow',
-    'MANDATORY procedure for creating a Power Automate flow. Agents MUST follow this exact sequence to avoid data loss.',
+    'MANDATORY procedure for creating a Power Automate flow. Includes definition JSON format requirements. Agents MUST follow this exact sequence.',
     {
       displayName: z.string().optional().describe('Name of the flow to create'),
       user_id: z.string().optional().describe('Authenticated user email'),
@@ -105,11 +107,45 @@ export function registerPrompts(server: McpServer): void {
             '- Call `pa-create-flow` with the COMPLETE definition in ONE call',
             '- Required parameters:',
             '  - `displayName`: Human-readable flow name',
-            '  - `definition`: Complete workflow JSON with triggers AND actions',
+            '  - `definition`: Complete workflow definition JSON (see format below)',
             '- Optional parameters:',
             '  - `connectionReferences`: Map of connection references for connectors used',
             '  - `state`: "Started" or "Stopped" (defaults to "Stopped" — safe for testing)',
             '  - `environmentId`: Uses production environment if omitted',
+            '',
+            '### ⚠️ Flow Definition JSON Format (CRITICAL):',
+            '',
+            'The definition MUST include these required top-level properties:',
+            '  {',
+            '    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",',
+            '    "contentVersion": "1.0.0.0",',
+            '    "triggers": { ... },',
+            '    "actions": { ... }',
+            '  }',
+            '',
+            'Properties inside actions MUST use camelCase — NOT snake_case:',
+            '  ✅ runAfter          ❌ run_after',
+            '  ✅ triggerConditions  ❌ trigger_conditions',
+            '  ✅ operationId       ❌ operation_id',
+            '  ✅ contentType       ❌ content_type',
+            '  ✅ retryPolicy       ❌ retry_policy',
+            '  ✅ operationOptions  ❌ operation_options',
+            '  ✅ splitOn           ❌ split_on',
+            '  ✅ trackedProperties ❌ tracked_properties',
+            '',
+            'Example CORRECT action definition:',
+            '  "HTTP_GetData": {',
+            '    "type": "Http",',
+            '    "runAfter": { "Initialize_Variable": ["Succeeded"] },',
+            '    "inputs": {',
+            '      "method": "GET",',
+            '      "uri": "https://api.example.com/data",',
+            '      "headers": { "Content-Type": "application/json" }',
+            '    }',
+            '  }',
+            '',
+            'The server auto-normalizes run_after → runAfter and injects missing',
+            '$schema/contentVersion as a safety net, but correct definitions avoid errors.',
             '',
             '### Step 3: Wait for Propagation',
             '- Wait **at least 10 seconds** before verifying',
@@ -145,8 +181,6 @@ export function registerPrompts(server: McpServer): void {
 
   // =========================================================================
   // Prompt 3: workflow-create-connection
-  // Guides connection creation including OAuth consent expectations.
-  // Prevents: agents panicking at "Error" status, wrong parameter format.
   // =========================================================================
   server.prompt(
     'workflow-create-connection',
@@ -196,18 +230,18 @@ export function registerPrompts(server: McpServer): void {
             '## Common Connector IDs:',
             '| Connector | connectorId | Needs Manual Auth? |',
             '|-----------|------------|-------------------|',
-            '| Office 365 Outlook | shared_office365 | ✅ Yes |',
-            '| SharePoint | shared_sharepointonline | ✅ Yes |',
-            '| Teams | shared_teams | ✅ Yes |',
-            '| OneDrive for Business | shared_onedrive | ✅ Yes |',
-            '| Excel Online (Business) | shared_excelonlinebusiness | ✅ Yes |',
-            '| Dataverse | shared_commondataserviceforapps | ✅ Yes |',
-            '| Approvals | shared_approvals | ❌ No |',
-            '| HTTP | shared_webcontents | ❌ No |',
+            '| Office 365 Outlook | shared_office365 | Yes |',
+            '| SharePoint | shared_sharepointonline | Yes |',
+            '| Teams | shared_teams | Yes |',
+            '| OneDrive for Business | shared_onedrive | Yes |',
+            '| Excel Online (Business) | shared_excelonlinebusiness | Yes |',
+            '| Dataverse | shared_commondataserviceforapps | Yes |',
+            '| Approvals | shared_approvals | No |',
+            '| HTTP | shared_webcontents | No |',
             '',
             '## PARAMETER FORMAT:',
-            '✅ Always use camelCase: connectorId, environmentId, connectionParameters',
-            '❌ NOT snake_case: connector_id, environment_id, connection_parameters',
+            'Always use camelCase: connectorId, environmentId, connectionParameters',
+            'NOT snake_case: connector_id, environment_id, connection_parameters',
             '',
             'The server includes a param-resolver that maps snake_case → camelCase automatically,',
             'but agents SHOULD always send camelCase to avoid unnecessary resolution.',
