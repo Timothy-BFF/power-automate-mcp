@@ -13,6 +13,7 @@ import { UserAuthManager } from './auth/user-auth-manager.js';
 import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
 import { resolveParams } from './utils/param-resolver.js';
 import { normalizeDefinition } from './utils/normalize-definition.js';
+import { registerFlowInDataverse } from './utils/flow-adopter.js';
 import { registerSkills } from './skills/register.js';
 import { processSkillRequest } from './skills/rest-skills.js';
 
@@ -20,7 +21,7 @@ import { processSkillRequest } from './skills/rest-skills.js';
 // Configuration
 // =============================================================================
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const VERSION = '3.3.0';
+const VERSION = '3.4.0';
 
 // =============================================================================
 // Utility
@@ -76,9 +77,11 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
-// v3.3.0: 26 tools + 3 prompts + 3 resources + definition normalizer.
-//         All solution tools now use resolveParams for snake_case compat.
-//         Normalizer handles default_value → defaultValue in $connections.
+// v3.4.0: 27 tools + 3 prompts + 3 resources.
+//         Added pa-adopt-flow (Dataverse workflow record creation + solution add).
+//         Enhanced pa-create-flow with optional solutionUniqueName for auto-adoption.
+//         Definition normalizer handles run_after, default_value, $schema.
+//         All solution tools use resolveParams for snake_case compat.
 // =============================================================================
 const toolDefs: ToolDefinition[] = [
   // ---- List Environments ----
@@ -145,7 +148,9 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Create Flow (with definition normalizer) ----
+  // =========================================================================
+  // Create Flow (with definition normalizer + optional auto-adoption)
+  // =========================================================================
   {
     name: 'pa-create-flow',
     description: TOOL_DESCRIPTIONS['pa-create-flow'],
@@ -157,17 +162,57 @@ const toolDefs: ToolDefinition[] = [
         state: { type: 'string', description: 'Initial state: Started or Stopped (default: Stopped).' },
         connectionReferences: { type: 'object', description: 'Connection references for connectors.' },
         environmentId: { type: 'string', description: 'Power Platform environment ID.' },
+        solutionUniqueName: { type: 'string', description: 'If provided, auto-adopts the flow into this Dataverse solution after creation. Creates the required Dataverse workflow record and calls AddSolutionComponent automatically.' },
       },
       required: ['displayName', 'definition'],
     },
     handler: async (rawP: any) => {
       try {
-        // Resolve snake_case tool params (display_name, environment_id, connection_references)
-        const p = resolveParams(rawP, ['displayName', 'definition', 'state', 'connectionReferences', 'environmentId']);
+        const p = resolveParams(rawP, ['displayName', 'definition', 'state', 'connectionReferences', 'environmentId', 'solutionUniqueName']);
         const envId = resolveEnvironmentId(p.environmentId);
-        // Normalize the definition: inject $schema, contentVersion, fix run_after, default_value, etc.
         const normalizedDef = normalizeDefinition(p.definition);
         const result = await client.createFlow(envId, p.displayName, normalizedDef, p.state, p.connectionReferences);
+
+        // ── Auto-adopt into solution if solutionUniqueName provided ──────
+        if (p.solutionUniqueName && solutionClient.isConfigured()) {
+          const flowId = result?.name || result?.id;
+          if (flowId) {
+            try {
+              console.log(`[CreateFlow] Auto-adopting flow ${flowId} into solution: ${p.solutionUniqueName}`);
+              const dataverseToken = await tokenManager.getToken(solutionClient.getScope());
+              const registerResult = await registerFlowInDataverse({
+                flowId,
+                displayName: p.displayName,
+                dataverseUrl: process.env.DATAVERSE_URL!,
+                dataverseToken,
+                flowDefinition: normalizedDef,
+                connectionReferences: p.connectionReferences,
+              });
+
+              const addResult = await solutionClient.addSolutionComponent(
+                p.solutionUniqueName, flowId, 29, false
+              );
+
+              result._solutionAdoption = {
+                status: 'adopted',
+                solutionUniqueName: p.solutionUniqueName,
+                dataverseRecordCreated: !registerResult.alreadyExisted,
+                solutionComponentAdded: true,
+                message: `Flow auto-adopted into "${p.solutionUniqueName}" successfully.`,
+              };
+              console.log(`[CreateFlow] Auto-adopted into ${p.solutionUniqueName} successfully`);
+            } catch (adoptErr: any) {
+              result._solutionAdoption = {
+                status: 'failed',
+                solutionUniqueName: p.solutionUniqueName,
+                error: adoptErr.message,
+                message: `Flow created successfully but auto-adoption failed. Use pa-adopt-flow to retry.`,
+              };
+              console.warn(`[CreateFlow] Auto-adoption failed: ${adoptErr.message}`);
+            }
+          }
+        }
+
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
@@ -597,7 +642,6 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Create Solution (with resolveParams — fixes Jose's snake_case issue) ----
   {
     name: 'pa-create-solution',
     description: TOOL_DESCRIPTIONS['pa-create-solution'],
@@ -615,7 +659,6 @@ const toolDefs: ToolDefinition[] = [
     handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
-        // resolveParams maps: unique_name → uniqueName, friendly_name → friendlyName, publisher_id → publisherId
         const p = resolveParams(rawP, ['uniqueName', 'friendlyName', 'publisherId', 'version', 'description']);
         console.log(`[CreateSolution] RESOLVED: uniqueName="${p.uniqueName}", friendlyName="${p.friendlyName}", publisherId="${p.publisherId}"`);
         if (!p.uniqueName || !p.friendlyName || !p.publisherId) {
@@ -626,7 +669,6 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Delete Solution (with resolveParams) ----
   {
     name: 'pa-delete-solution',
     description: TOOL_DESCRIPTIONS['pa-delete-solution'],
@@ -637,6 +679,85 @@ const toolDefs: ToolDefinition[] = [
         const p = resolveParams(rawP, ['solutionId']);
         const result = await solutionClient.deleteSolution(p.solutionId);
         return ok(result);
+      } catch (e: any) { return fail(e.message); }
+    },
+  },
+  // =========================================================================
+  // ADOPT FLOW (Dataverse workflow record creation + solution placement)
+  //
+  // Solves the 404 "does not exist" error when adding non-solution-aware
+  // flows to a solution. Creates the missing Dataverse `workflows` entity
+  // record, then calls AddSolutionComponent.
+  // =========================================================================
+  {
+    name: 'pa-adopt-flow',
+    description: 'Adopt an existing non-solution-aware flow into a Dataverse solution. Creates the required Dataverse workflow record and adds the flow as a solution component (type 29). Use this for flows created outside of solutions (via portal UI or pa-create-flow without solutionUniqueName). Resolves the 404 "does not exist" error from pa-add-solution-component.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        flowId: { type: 'string', description: 'Flow ID (GUID) to adopt into a solution.' },
+        solutionUniqueName: { type: 'string', description: 'Target solution unique name (e.g., "BeakSolution").' },
+        environmentId: { type: 'string', description: 'Power Platform environment ID. Uses default if omitted.' },
+      },
+      required: ['flowId', 'solutionUniqueName'],
+    },
+    handler: async (rawP: any) => {
+      try {
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['flowId', 'solutionUniqueName', 'environmentId']);
+
+        if (!p.flowId) return fail('flowId is required (the GUID of the flow to adopt).');
+        if (!p.solutionUniqueName) return fail('solutionUniqueName is required (target solution unique name).');
+
+        const envId = resolveEnvironmentId(p.environmentId);
+
+        // ── Step 1: Get flow details from Flow API ──────────────────────
+        console.log(`[AdoptFlow] Fetching flow details: ${p.flowId}`);
+        let flowDetails: any;
+        try {
+          flowDetails = await client.getFlowDetails(envId, p.flowId);
+        } catch (fetchErr: any) {
+          return fail(`Could not fetch flow ${p.flowId}: ${fetchErr.message}. Verify the flow exists in environment ${envId}.`);
+        }
+
+        const displayName = flowDetails?.displayName || flowDetails?.id || p.flowId;
+        const definition = flowDetails?.definition || flowDetails?._raw?.properties?.definition;
+        const connRefs = flowDetails?.connectionReferences || flowDetails?._raw?.properties?.connectionReferences;
+
+        console.log(`[AdoptFlow] Flow found: "${displayName}" — definition: ${definition ? 'present' : 'not available (admin endpoint)'}`);
+
+        // ── Step 2: Register in Dataverse workflows entity ──────────────
+        console.log(`[AdoptFlow] Registering in Dataverse: "${displayName}" (${p.flowId})`);
+        const dataverseToken = await tokenManager.getToken(solutionClient.getScope());
+        const registerResult = await registerFlowInDataverse({
+          flowId: p.flowId,
+          displayName,
+          dataverseUrl: process.env.DATAVERSE_URL!,
+          dataverseToken,
+          flowDefinition: definition,
+          connectionReferences: connRefs,
+        });
+
+        // ── Step 3: Add to solution ─────────────────────────────────────
+        console.log(`[AdoptFlow] Adding to solution: ${p.solutionUniqueName}`);
+        const addResult = await solutionClient.addSolutionComponent(
+          p.solutionUniqueName, p.flowId, 29, false
+        );
+
+        console.log(`[AdoptFlow] Successfully adopted ${p.flowId} into ${p.solutionUniqueName}`);
+        return ok({
+          status: 'adopted',
+          flowId: p.flowId,
+          displayName,
+          solutionUniqueName: p.solutionUniqueName,
+          dataverseRecord: {
+            created: !registerResult.alreadyExisted,
+            alreadyExisted: registerResult.alreadyExisted,
+            message: registerResult.message,
+          },
+          solutionComponent: addResult,
+          message: `Flow "${displayName}" adopted into solution "${p.solutionUniqueName}" successfully.`,
+        });
       } catch (e: any) { return fail(e.message); }
     },
   },
@@ -849,5 +970,6 @@ app.listen(PORT, () => {
   console.log(`[Init] Tools:     ${toolDefs.length} registered (unified SSE + REST)`);
   console.log(`[Init] Skills:    3 prompts + 3 resources (SSE native + REST JSON-RPC)`);
   console.log(`[Init] Normalizer: Flow definition auto-fix (run_after, default_value, $schema, contentVersion)`);
+  console.log(`[Init] Adopter:   Flow adoption pipeline (Dataverse workflow record + AddSolutionComponent)`);
   console.log('');
 });
