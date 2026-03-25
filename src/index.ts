@@ -76,9 +76,9 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
-// v3.3.0: 26 tools + 3 prompts + 3 resources.
-//         Added SkillEngine v1.0.0, REST skill endpoints, definition normalizer.
-//         Fixed pa-list-connections, pa-create-connection, param-resolver.
+// v3.3.0: 26 tools + 3 prompts + 3 resources + definition normalizer.
+//         All solution tools now use resolveParams for snake_case compat.
+//         Normalizer handles default_value → defaultValue in $connections.
 // =============================================================================
 const toolDefs: ToolDefinition[] = [
   // ---- List Environments ----
@@ -160,10 +160,12 @@ const toolDefs: ToolDefinition[] = [
       },
       required: ['displayName', 'definition'],
     },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
+        // Resolve snake_case tool params (display_name, environment_id, connection_references)
+        const p = resolveParams(rawP, ['displayName', 'definition', 'state', 'connectionReferences', 'environmentId']);
         const envId = resolveEnvironmentId(p.environmentId);
-        // Normalize the definition: inject $schema, contentVersion, fix run_after -> runAfter
+        // Normalize the definition: inject $schema, contentVersion, fix run_after, default_value, etc.
         const normalizedDef = normalizeDefinition(p.definition);
         const result = await client.createFlow(envId, p.displayName, normalizedDef, p.state, p.connectionReferences);
         return ok(result);
@@ -186,8 +188,9 @@ const toolDefs: ToolDefinition[] = [
       },
       required: ['flowId'],
     },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
+        const p = resolveParams(rawP, ['flowId', 'displayName', 'definition', 'state', 'connectionReferences', 'environmentId']);
         const envId = resolveEnvironmentId(p.environmentId);
         const updates: any = {};
         if (p.displayName) updates.displayName = p.displayName;
@@ -505,15 +508,16 @@ const toolDefs: ToolDefinition[] = [
     },
   },
   // =========================================================================
-  // DATAVERSE SOLUTIONS TOOLS
+  // DATAVERSE SOLUTIONS TOOLS (all with resolveParams for snake_case compat)
   // =========================================================================
   {
     name: 'pa-list-solutions',
     description: TOOL_DESCRIPTIONS['pa-list-solutions'],
     inputSchema: { type: 'object', properties: { includeManaged: { type: 'boolean', description: 'Include managed solutions (default: false).' } } },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['includeManaged']);
         const solutions = await solutionClient.listSolutions(p.includeManaged === true);
         return ok({ count: solutions.length, solutions });
       } catch (e: any) { return fail(e.message); }
@@ -523,9 +527,10 @@ const toolDefs: ToolDefinition[] = [
     name: 'pa-get-solution',
     description: TOOL_DESCRIPTIONS['pa-get-solution'],
     inputSchema: { type: 'object', properties: { solutionId: { type: 'string', description: 'Solution GUID or unique name.' } }, required: ['solutionId'] },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['solutionId']);
         const solution = await solutionClient.getSolution(p.solutionId);
         return ok(solution);
       } catch (e: any) { return fail(e.message); }
@@ -535,9 +540,10 @@ const toolDefs: ToolDefinition[] = [
     name: 'pa-list-solution-components',
     description: TOOL_DESCRIPTIONS['pa-list-solution-components'],
     inputSchema: { type: 'object', properties: { solutionId: { type: 'string', description: 'Solution GUID.' } }, required: ['solutionId'] },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['solutionId']);
         const components = await solutionClient.listSolutionComponents(p.solutionId);
         const byType: Record<string, number> = {};
         for (const c of components) { byType[c.componentTypeName] = (byType[c.componentTypeName] || 0) + 1; }
@@ -556,9 +562,10 @@ const toolDefs: ToolDefinition[] = [
       },
       required: ['solutionUniqueName'],
     },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['solutionUniqueName', 'managed']);
         const result = await solutionClient.exportSolution(p.solutionUniqueName, p.managed === true);
         return ok({
           status: 'exported', fileName: result.fileName, sizeBytes: result.sizeBytes,
@@ -581,14 +588,16 @@ const toolDefs: ToolDefinition[] = [
       },
       required: ['solutionUniqueName', 'componentId'],
     },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['solutionUniqueName', 'componentId', 'componentType', 'addRequiredComponents']);
         const result = await solutionClient.addSolutionComponent(p.solutionUniqueName, p.componentId, p.componentType != null ? Number(p.componentType) : 29, p.addRequiredComponents === true);
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Create Solution (with resolveParams — fixes Jose's snake_case issue) ----
   {
     name: 'pa-create-solution',
     description: TOOL_DESCRIPTIONS['pa-create-solution'],
@@ -603,21 +612,29 @@ const toolDefs: ToolDefinition[] = [
       },
       required: ['uniqueName', 'friendlyName', 'publisherId'],
     },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        // resolveParams maps: unique_name → uniqueName, friendly_name → friendlyName, publisher_id → publisherId
+        const p = resolveParams(rawP, ['uniqueName', 'friendlyName', 'publisherId', 'version', 'description']);
+        console.log(`[CreateSolution] RESOLVED: uniqueName="${p.uniqueName}", friendlyName="${p.friendlyName}", publisherId="${p.publisherId}"`);
+        if (!p.uniqueName || !p.friendlyName || !p.publisherId) {
+          return fail(`Missing required params. Got: uniqueName="${p.uniqueName}", friendlyName="${p.friendlyName}", publisherId="${p.publisherId}". All three are required.`);
+        }
         const result = await solutionClient.createSolution(p.uniqueName, p.friendlyName, p.publisherId, p.version || '1.0.0.0', p.description || '');
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
+  // ---- Delete Solution (with resolveParams) ----
   {
     name: 'pa-delete-solution',
     description: TOOL_DESCRIPTIONS['pa-delete-solution'],
     inputSchema: { type: 'object', properties: { solutionId: { type: 'string', description: 'Solution GUID to delete.' } }, required: ['solutionId'] },
-    handler: async (p: any) => {
+    handler: async (rawP: any) => {
       try {
         if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const p = resolveParams(rawP, ['solutionId']);
         const result = await solutionClient.deleteSolution(p.solutionId);
         return ok(result);
       } catch (e: any) { return fail(e.message); }
@@ -831,6 +848,6 @@ app.listen(PORT, () => {
   console.log(`[Init] Auth:      ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
   console.log(`[Init] Tools:     ${toolDefs.length} registered (unified SSE + REST)`);
   console.log(`[Init] Skills:    3 prompts + 3 resources (SSE native + REST JSON-RPC)`);
-  console.log(`[Init] Normalizer: Flow definition auto-fix (run_after, $schema, contentVersion)`);
+  console.log(`[Init] Normalizer: Flow definition auto-fix (run_after, default_value, $schema, contentVersion)`);
   console.log('');
 });

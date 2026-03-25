@@ -9,14 +9,15 @@
  * This is a safety net — the workflow-create-flow prompt teaches agents
  * the correct format, but this catches errors when they don't comply.
  *
- * Directly addresses Jose's 3 failed pa-create-flow calls (2026-03-25):
- *   Error 1: "Could not find member 'run_after'" → fixed by run_after → runAfter
- *   Error 2: "Required property '$schema' not found" → fixed by $schema injection
- *   Error 3: "Could not find member 'run_after'" → same as Error 1
+ * Fixes applied based on production errors:
+ *   2026-03-25 Jose Error 1: "Could not find member 'run_after'" → run_after → runAfter
+ *   2026-03-25 Jose Error 2: "Required property '$schema' not found" → $schema injection
+ *   2026-03-25 Jose Error 3: "Could not find member 'default_value'" → default_value → defaultValue
  */
 
 // Known snake_case → camelCase mappings for Flow definition properties
 const DEFINITION_PROPERTY_MAP: Record<string, string> = {
+  // Core action properties
   'run_after': 'runAfter',
   'trigger_conditions': 'triggerConditions',
   'operation_id': 'operationId',
@@ -34,6 +35,17 @@ const DEFINITION_PROPERTY_MAP: Record<string, string> = {
   'row_id': 'rowId',
   'run_after_status': 'runAfterStatus',
   'include_nested_actions': 'includeNestedActions',
+
+  // Parameter / $connections properties (Jose's Error 3 — 2026-03-25)
+  'default_value': 'defaultValue',
+  'allowed_values': 'allowedValues',
+  'is_required': 'isRequired',
+  'display_name': 'displayName',
+  'parameter_name': 'parameterName',
+  'connection_id': 'connectionId',
+  'connection_name': 'connectionName',
+  'connection_reference_logical_name': 'connectionReferenceLogicalName',
+  'api_id': 'apiId',
 };
 
 const REQUIRED_SCHEMA = 'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#';
@@ -101,7 +113,7 @@ export function normalizeDefinition(definition: any): any {
   if (fixes.length > 0 || remappedCount > 0) {
     const allFixes = [...fixes];
     if (remappedCount > 0) {
-      allFixes.push(`remapped ${remappedCount} snake_case properties (e.g., run_after → runAfter)`);
+      allFixes.push(`remapped ${remappedCount} snake_case properties (e.g., run_after → runAfter, default_value → defaultValue)`);
     }
     console.log(`[NormalizeDef] Applied ${allFixes.length} fixes: ${allFixes.join(', ')}`);
   }
