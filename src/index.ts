@@ -12,6 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
 import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
 import { resolveParams } from './utils/param-resolver.js';
+import { normalizeDefinition } from './utils/normalize-definition.js';
 import { registerSkills } from './skills/register.js';
 import { processSkillRequest } from './skills/rest-skills.js';
 
@@ -54,7 +55,6 @@ const solutionClient = new SolutionClient(tokenManager);
     await tokenManager.getToken('https://service.powerapps.com/.default');
     console.log('[Init] PowerApps token acquired (service.powerapps.com)');
   } catch (e: any) { console.warn('[Init] PowerApps token pre-warm failed:', e.message); }
-  // Dataverse scope (if configured)
   if (solutionClient.isConfigured()) {
     try {
       await tokenManager.getToken(solutionClient.getScope());
@@ -76,19 +76,9 @@ function fail(msg: string): ToolResult {
 // =============================================================================
 // Tool Definitions (shared between SSE + REST transports)
 //
-// v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
-//         Fixed pa-create-connection (multi-scope refresh token exchange +
-//         correct PUT endpoint with connector in path + env as filter +
-//         defensive null check on connectorId to prevent startsWith crash +
-//         universal param resolver for cross-client compatibility).
-//         Added pa-create-solution, pa-delete-solution, pa-create-connection.
-//         Unified tool registration — all 26 tools through one loop.
-//         Added SkillEngine v1.0.0 (3 prompts + 3 resources).
-//         Added REST skill endpoints (prompts/list, prompts/get, resources/list, resources/read).
-//         Total: 26 tools + 3 prompts + 3 resources.
-// v3.2.0: Added 5 Dataverse Solutions tools.
-// v3.1.0: Added pa-get-connection and pa-delete-connection tools.
-// v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS.
+// v3.3.0: 26 tools + 3 prompts + 3 resources.
+//         Added SkillEngine v1.0.0, REST skill endpoints, definition normalizer.
+//         Fixed pa-list-connections, pa-create-connection, param-resolver.
 // =============================================================================
 const toolDefs: ToolDefinition[] = [
   // ---- List Environments ----
@@ -155,7 +145,7 @@ const toolDefs: ToolDefinition[] = [
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Create Flow ----
+  // ---- Create Flow (with definition normalizer) ----
   {
     name: 'pa-create-flow',
     description: TOOL_DESCRIPTIONS['pa-create-flow'],
@@ -173,12 +163,14 @@ const toolDefs: ToolDefinition[] = [
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
-        const result = await client.createFlow(envId, p.displayName, p.definition, p.state, p.connectionReferences);
+        // Normalize the definition: inject $schema, contentVersion, fix run_after -> runAfter
+        const normalizedDef = normalizeDefinition(p.definition);
+        const result = await client.createFlow(envId, p.displayName, normalizedDef, p.state, p.connectionReferences);
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Update Flow ----
+  // ---- Update Flow (with definition normalizer) ----
   {
     name: 'pa-update-flow',
     description: TOOL_DESCRIPTIONS['pa-update-flow'],
@@ -199,7 +191,7 @@ const toolDefs: ToolDefinition[] = [
         const envId = resolveEnvironmentId(p.environmentId);
         const updates: any = {};
         if (p.displayName) updates.displayName = p.displayName;
-        if (p.definition) updates.definition = p.definition;
+        if (p.definition) updates.definition = normalizeDefinition(p.definition);
         if (p.state) updates.state = p.state;
         if (p.connectionReferences) updates.connectionReferences = p.connectionReferences;
         const result = await client.updateFlow(envId, p.flowId, updates);
@@ -358,11 +350,7 @@ const toolDefs: ToolDefinition[] = [
   },
   // =========================================================================
   // CONNECTION TOOLS
-  // v3.3.0: Fixed pa-list-connections (PowerApps host + admin token),
-  //         Fixed pa-create-connection (multi-scope token + correct PUT endpoint
-  //         + defensive null checks + param resolver for cross-client compat)
   // =========================================================================
-  // ---- List Connections (v3.3.0 FIX: PowerApps host + PowerApps token) ----
   {
     name: 'pa-list-connections',
     description: TOOL_DESCRIPTIONS['pa-list-connections'],
@@ -375,33 +363,18 @@ const toolDefs: ToolDefinition[] = [
     handler: async (p: any) => {
       try {
         const envId = resolveEnvironmentId(p.environmentId);
-
-        // v3.3.0 FIX: Connections API lives under PowerApps, NOT Flow.
         const token = await tokenManager.getToken('https://service.powerapps.com/.default');
         const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/${envId}/connections?api-version=2016-11-01`;
-
         console.log(`[ListConnections] GET ${url} (PowerApps admin token)`);
-
         const response = await axios.get(url, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         });
-
         const connections = (response.data?.value || []).map((c: any) => ({
-          connectionId: c.name,
-          displayName: c.properties?.displayName,
-          apiId: c.properties?.apiId,
-          status: c.properties?.statuses?.[0]?.status,
+          connectionId: c.name, displayName: c.properties?.displayName,
+          apiId: c.properties?.apiId, status: c.properties?.statuses?.[0]?.status,
           createdTime: c.properties?.createdTime,
         }));
-        return ok({
-          count: connections.length,
-          connections,
-          _apiHost: 'api.powerapps.com',
-          _tokenScope: 'service.powerapps.com',
-        });
+        return ok({ count: connections.length, connections, _apiHost: 'api.powerapps.com', _tokenScope: 'service.powerapps.com' });
       } catch (e: any) {
         const status = e.response?.status;
         const detail = e.response?.data?.error?.message || e.message;
@@ -409,7 +382,6 @@ const toolDefs: ToolDefinition[] = [
       }
     },
   },
-  // ---- Get Connection Details ----
   {
     name: 'pa-get-connection',
     description: TOOL_DESCRIPTIONS['pa-get-connection'],
@@ -427,20 +399,15 @@ const toolDefs: ToolDefinition[] = [
         const result = await client.getConnectionDetails(envId, p.connectionId);
         const c = result;
         return ok({
-          connectionId: c.name,
-          displayName: c.properties?.displayName,
-          apiId: c.properties?.apiId,
-          connectorDisplayName: c.properties?.apiId?.split('/').pop(),
-          status: c.properties?.statuses?.[0]?.status,
-          createdTime: c.properties?.createdTime,
-          createdBy: c.properties?.createdBy,
-          statuses: c.properties?.statuses,
+          connectionId: c.name, displayName: c.properties?.displayName,
+          apiId: c.properties?.apiId, connectorDisplayName: c.properties?.apiId?.split('/').pop(),
+          status: c.properties?.statuses?.[0]?.status, createdTime: c.properties?.createdTime,
+          createdBy: c.properties?.createdBy, statuses: c.properties?.statuses,
           connectionParameters: c.properties?.connectionParametersSet || null,
         });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Delete Connection ----
   {
     name: 'pa-delete-connection',
     description: TOOL_DESCRIPTIONS['pa-delete-connection'],
@@ -456,16 +423,12 @@ const toolDefs: ToolDefinition[] = [
       try {
         const envId = resolveEnvironmentId(p.environmentId);
         await client.deleteConnection(envId, p.connectionId);
-        return ok({
-          status: 'deleted',
-          connectionId: p.connectionId,
-          message: `Connection ${p.connectionId} has been permanently deleted.`,
-        });
+        return ok({ status: 'deleted', connectionId: p.connectionId, message: `Connection ${p.connectionId} has been permanently deleted.` });
       } catch (e: any) { return fail(e.message); }
     },
   },
   // =========================================================================
-  // Create Connection (v3.3.0 + param resolver for cross-client compatibility)
+  // Create Connection (with param resolver)
   // =========================================================================
   {
     name: 'pa-create-connection',
@@ -473,10 +436,10 @@ const toolDefs: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        connectorId: { type: 'string', description: 'Connector API name (e.g., shared_office365, shared_sql, shared_sharepointonline) or full API ID path.' },
+        connectorId: { type: 'string', description: 'Connector API name (e.g., shared_office365) or full API ID path.' },
         environmentId: { type: 'string', description: 'Power Platform environment ID.' },
         user_id: { type: 'string', description: 'Email of the authenticated user who will own this connection.' },
-        connectionParameters: { type: 'object', description: 'Optional connection parameters (varies by connector, e.g., server/database for SQL).' },
+        connectionParameters: { type: 'object', description: 'Optional connection parameters.' },
       },
       required: ['connectorId', 'user_id'],
     },
@@ -485,226 +448,134 @@ const toolDefs: ToolDefinition[] = [
         const rawStr = JSON.stringify(rawP);
         console.log(`[CreateConnection] RAW params (${rawStr.length} chars): ${rawStr.substring(0, 500)}`);
         console.log(`[CreateConnection] RAW keys: [${rawP ? Object.keys(rawP).join(', ') : 'null/undefined'}]`);
-        console.log(`[CreateConnection] Direct access: connectorId=${rawP?.connectorId}, user_id=${rawP?.user_id}, connector_id=${rawP?.connector_id}`);
 
         const p = resolveParams(rawP, ['connectorId', 'user_id', 'environmentId', 'connectionParameters']);
-
         console.log(`[CreateConnection] RESOLVED: connectorId="${p.connectorId}", user_id="${p.user_id}", environmentId="${p.environmentId}"`);
 
         const envId = resolveEnvironmentId(p.environmentId);
 
         if (!p.connectorId || typeof p.connectorId !== 'string') {
-          return fail(
-            'connectorId is required and must be a string. ' +
-            'Examples: "shared_office365", "shared_sharepointonline", "shared_sql", "shared_teams". ' +
-            'Use pa-list-connections to see available connectors in the environment.'
-          );
+          return fail('connectorId is required and must be a string. Examples: "shared_office365", "shared_sharepointonline".');
         }
         if (!p.user_id || typeof p.user_id !== 'string') {
-          return fail(
-            'user_id is required and must be a string (email address). ' +
-            'Example: "jose@company.com". Use pa-auth-start first to authenticate the user.'
-          );
+          return fail('user_id is required (email address). Use pa-auth-start first to authenticate.');
         }
 
-        const userToken = await userAuthManager.getAccessTokenForScope(
-          p.user_id,
-          'https://service.powerapps.com/.default'
-        );
+        const userToken = await userAuthManager.getAccessTokenForScope(p.user_id, 'https://service.powerapps.com/.default');
         if (!userToken) {
-          return fail(
-            `Could not acquire PowerApps delegated token for ${p.user_id}. ` +
-            'Ensure the user is authenticated (pa-auth-start) and the refresh token is valid. ' +
-            'If this persists, admin consent for PowerApps Service may be required in Azure AD.'
-          );
+          return fail(`Could not acquire PowerApps delegated token for ${p.user_id}. Ensure authenticated via pa-auth-start.`);
         }
 
-        const connectorName = p.connectorId.startsWith('/providers/')
-          ? p.connectorId.split('/').pop()!
-          : p.connectorId;
-
+        const connectorName = p.connectorId.startsWith('/providers/') ? p.connectorId.split('/').pop()! : p.connectorId;
         const connectionName = `${connectorName.replace(/_/g, '-')}-${generateUUID()}`;
-
         const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/apis/${connectorName}/connections/${connectionName}`;
 
-        console.log(`[CreateConnection] PUT ${url} (user: ${p.user_id}, env: ${envId}, token: powerapps-delegated)`);
+        console.log(`[CreateConnection] PUT ${url} (user: ${p.user_id}, env: ${envId})`);
 
         const response = await axios.put(url, {
           properties: {
-            environment: {
-              id: `/providers/Microsoft.PowerApps/environments/${envId}`,
-              name: envId,
-            },
+            environment: { id: `/providers/Microsoft.PowerApps/environments/${envId}`, name: envId },
             connectionParameters: p.connectionParameters || {},
           },
         }, {
-          headers: {
-            Authorization: `Bearer ${userToken}`,
-            'Content-Type': 'application/json',
-          },
-          params: {
-            'api-version': '2016-11-01',
-            '$filter': `environment eq '${envId}'`,
-          },
+          headers: { Authorization: `Bearer ${userToken}`, 'Content-Type': 'application/json' },
+          params: { 'api-version': '2016-11-01', '$filter': `environment eq '${envId}'` },
         });
 
         const conn = response.data;
         const connStatus = conn?.properties?.statuses?.[0]?.status || 'Unknown';
         const needsConsent = connStatus === 'Error' || connStatus === 'Unauthenticated';
-        const consentLink = conn?.properties?.connectionParameters?.token?.oAuthSettings?.redirectUrl || null;
 
         return ok({
-          status: 'created',
-          connectionId: conn?.name || connectionName,
+          status: 'created', connectionId: conn?.name || connectionName,
           displayName: conn?.properties?.displayName || connectionName,
-          connectorName,
-          connectionStatus: connStatus,
-          needsConsent,
-          consentLink,
-          _tokenScope: 'service.powerapps.com (delegated)',
-          _method: 'PUT',
-          _urlPattern: 'apis/{connector}/connections/{name}?$filter=environment',
+          connectorName, connectionStatus: connStatus, needsConsent,
           message: needsConsent
-            ? `Connection shell created for ${connectorName}. This OAuth connector requires interactive authorization. ` +
-              `Go to make.powerautomate.com \u2192 Data \u2192 Connections \u2192 find "${connectionName}" \u2192 Authorize. ` +
-              (consentLink ? `Or visit: ${consentLink}` : '')
+            ? `Connection shell created for ${connectorName}. OAuth connector requires authorization at make.powerautomate.com > Data > Connections.`
             : `Connection created successfully. Status: ${connStatus}.`,
         });
       } catch (e: any) {
         const status = e.response?.status;
-        const errCode = e.response?.data?.error?.code || '';
         const detail = e.response?.data?.error?.message || e.message;
-
-        if (status === 404) {
-          return fail(
-            `CreateConnection 404: Connector '${rawP?.connectorId || '(unknown)'}' not found at the PowerApps API. ` +
-            `This connector may not support API-based creation, or requires interactive consent. ` +
-            `For OAuth connectors (Office 365, Outlook, SharePoint), create manually at make.powerautomate.com \u2192 Data \u2192 Connections. ` +
-            `Detail: ${detail}`
-          );
-        }
-        if (status === 403) {
-          return fail(
-            `CreateConnection 403 Forbidden: ${detail}. ` +
-            'Admin consent for PowerApps Service may be required in Azure AD.'
-          );
-        }
-        if (status === 409) {
-          return fail(
-            `CreateConnection 409 Conflict: A connection with this name already exists. ` +
-            `Detail: ${detail}`
-          );
-        }
-        return fail(`CreateConnection failed (${status || 'unknown'}): ${errCode} \u2014 ${detail}`);
+        if (status === 404) return fail(`CreateConnection 404: Connector '${rawP?.connectorId || '(unknown)'}' not found. Detail: ${detail}`);
+        if (status === 403) return fail(`CreateConnection 403 Forbidden: ${detail}. Admin consent for PowerApps Service may be required.`);
+        if (status === 409) return fail(`CreateConnection 409 Conflict: Connection name already exists. Detail: ${detail}`);
+        return fail(`CreateConnection failed (${status || 'unknown'}): ${detail}`);
       }
     },
   },
   // =========================================================================
-  // DATAVERSE SOLUTIONS TOOLS (v3.2.0 + v3.3.0 additions)
+  // DATAVERSE SOLUTIONS TOOLS
   // =========================================================================
-  // ---- List Solutions ----
   {
     name: 'pa-list-solutions',
     description: TOOL_DESCRIPTIONS['pa-list-solutions'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        includeManaged: { type: 'boolean', description: 'Include managed solutions (default: false, shows unmanaged only).' },
-      },
-    },
+    inputSchema: { type: 'object', properties: { includeManaged: { type: 'boolean', description: 'Include managed solutions (default: false).' } } },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
         const solutions = await solutionClient.listSolutions(p.includeManaged === true);
         return ok({ count: solutions.length, solutions });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Get Solution Details ----
   {
     name: 'pa-get-solution',
     description: TOOL_DESCRIPTIONS['pa-get-solution'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        solutionId: { type: 'string', description: 'Solution GUID or unique name.' },
-      },
-      required: ['solutionId'],
-    },
+    inputSchema: { type: 'object', properties: { solutionId: { type: 'string', description: 'Solution GUID or unique name.' } }, required: ['solutionId'] },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
         const solution = await solutionClient.getSolution(p.solutionId);
         return ok(solution);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- List Solution Components ----
   {
     name: 'pa-list-solution-components',
     description: TOOL_DESCRIPTIONS['pa-list-solution-components'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        solutionId: { type: 'string', description: 'Solution GUID (from pa-list-solutions or pa-get-solution).' },
-      },
-      required: ['solutionId'],
-    },
+    inputSchema: { type: 'object', properties: { solutionId: { type: 'string', description: 'Solution GUID.' } }, required: ['solutionId'] },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
         const components = await solutionClient.listSolutionComponents(p.solutionId);
         const byType: Record<string, number> = {};
-        for (const c of components) {
-          byType[c.componentTypeName] = (byType[c.componentTypeName] || 0) + 1;
-        }
+        for (const c of components) { byType[c.componentTypeName] = (byType[c.componentTypeName] || 0) + 1; }
         return ok({ count: components.length, componentsByType: byType, components });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Export Solution ----
   {
     name: 'pa-export-solution',
     description: TOOL_DESCRIPTIONS['pa-export-solution'],
     inputSchema: {
       type: 'object',
       properties: {
-        solutionUniqueName: { type: 'string', description: 'Solution unique name (from pa-list-solutions).' },
-        managed: { type: 'boolean', description: 'Export as managed solution (default: false).' },
+        solutionUniqueName: { type: 'string', description: 'Solution unique name.' },
+        managed: { type: 'boolean', description: 'Export as managed (default: false).' },
       },
       required: ['solutionUniqueName'],
     },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
-        const result = await solutionClient.exportSolution(
-          p.solutionUniqueName,
-          p.managed === true
-        );
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const result = await solutionClient.exportSolution(p.solutionUniqueName, p.managed === true);
         return ok({
-          status: 'exported',
-          fileName: result.fileName,
-          sizeBytes: result.sizeBytes,
-          sizeHuman: result.sizeBytes < 1024
-            ? `${result.sizeBytes} bytes`
-            : result.sizeBytes < 1048576
-              ? `${Math.round(result.sizeBytes / 1024)}KB`
-              : `${(result.sizeBytes / 1048576).toFixed(1)}MB`,
-          managed: p.managed === true,
-          base64Content: result.base64Content,
+          status: 'exported', fileName: result.fileName, sizeBytes: result.sizeBytes,
+          sizeHuman: result.sizeBytes < 1048576 ? `${Math.round(result.sizeBytes / 1024)}KB` : `${(result.sizeBytes / 1048576).toFixed(1)}MB`,
+          managed: p.managed === true, base64Content: result.base64Content,
         });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Add Solution Component ----
   {
     name: 'pa-add-solution-component',
     description: TOOL_DESCRIPTIONS['pa-add-solution-component'],
     inputSchema: {
       type: 'object',
       properties: {
-        solutionUniqueName: { type: 'string', description: 'Solution unique name to add the component to.' },
-        componentId: { type: 'string', description: 'GUID of the component (e.g., flow ID).' },
+        solutionUniqueName: { type: 'string', description: 'Solution unique name.' },
+        componentId: { type: 'string', description: 'GUID of the component.' },
         componentType: { type: 'number', description: 'Component type code (default: 29 = Cloud Flow).' },
         addRequiredComponents: { type: 'boolean', description: 'Auto-include dependencies (default: false).' },
       },
@@ -712,145 +583,84 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
-        const result = await solutionClient.addSolutionComponent(
-          p.solutionUniqueName,
-          p.componentId,
-          p.componentType != null ? Number(p.componentType) : 29,
-          p.addRequiredComponents === true
-        );
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const result = await solutionClient.addSolutionComponent(p.solutionUniqueName, p.componentId, p.componentType != null ? Number(p.componentType) : 29, p.addRequiredComponents === true);
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Create Solution (v3.3.0 NEW) ----
   {
     name: 'pa-create-solution',
     description: TOOL_DESCRIPTIONS['pa-create-solution'],
     inputSchema: {
       type: 'object',
       properties: {
-        uniqueName: { type: 'string', description: 'Unique name for the solution (no spaces, e.g., MyNewSolution).' },
-        friendlyName: { type: 'string', description: 'Display name for the solution.' },
-        publisherId: { type: 'string', description: 'GUID of the publisher. Use publisherId from pa-get-solution on an existing solution.' },
-        version: { type: 'string', description: 'Version number (default: 1.0.0.0).' },
+        uniqueName: { type: 'string', description: 'Unique name (no spaces).' },
+        friendlyName: { type: 'string', description: 'Display name.' },
+        publisherId: { type: 'string', description: 'Publisher GUID.' },
+        version: { type: 'string', description: 'Version (default: 1.0.0.0).' },
         description: { type: 'string', description: 'Optional description.' },
       },
       required: ['uniqueName', 'friendlyName', 'publisherId'],
     },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
-        const result = await solutionClient.createSolution(
-          p.uniqueName,
-          p.friendlyName,
-          p.publisherId,
-          p.version || '1.0.0.0',
-          p.description || ''
-        );
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
+        const result = await solutionClient.createSolution(p.uniqueName, p.friendlyName, p.publisherId, p.version || '1.0.0.0', p.description || '');
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Delete Solution (v3.3.0 NEW) ----
   {
     name: 'pa-delete-solution',
     description: TOOL_DESCRIPTIONS['pa-delete-solution'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        solutionId: { type: 'string', description: 'Solution GUID to delete (solutionId from pa-get-solution).' },
-      },
-      required: ['solutionId'],
-    },
+    inputSchema: { type: 'object', properties: { solutionId: { type: 'string', description: 'Solution GUID to delete.' } }, required: ['solutionId'] },
     handler: async (p: any) => {
       try {
-        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL environment variable.');
+        if (!solutionClient.isConfigured()) return fail('Dataverse not configured. Set DATAVERSE_URL.');
         const result = await solutionClient.deleteSolution(p.solutionId);
         return ok(result);
       } catch (e: any) { return fail(e.message); }
     },
   },
   // =========================================================================
-  // AUTH TOOLS (Device Code Flow)
+  // AUTH TOOLS
   // =========================================================================
-  // ---- Auth: Start Device Code Flow ----
   {
     name: 'pa-auth-start',
     description: TOOL_DESCRIPTIONS['pa-auth-start'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        user_id: { type: 'string', description: 'User email (e.g., jose@company.com).' },
-      },
-      required: ['user_id'],
-    },
+    inputSchema: { type: 'object', properties: { user_id: { type: 'string', description: 'User email.' } }, required: ['user_id'] },
     handler: async (p: any) => {
       try {
-        if (!p.user_id) return fail('user_id is required. Provide the user email address.');
+        if (!p.user_id) return fail('user_id is required.');
         const result = await userAuthManager.startAuth(p.user_id);
-        return ok({
-          status: 'device_code_issued',
-          user_code: result.userCode,
-          verification_uri: result.verificationUri,
-          message: result.message,
-          expires_in: result.expiresIn,
-          _note: 'After user signs in, call pa-auth-poll to complete authentication.',
-        });
+        return ok({ status: 'device_code_issued', user_code: result.userCode, verification_uri: result.verificationUri, message: result.message, expires_in: result.expiresIn, _note: 'After user signs in, call pa-auth-poll.' });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Auth: Poll ----
   {
     name: 'pa-auth-poll',
     description: TOOL_DESCRIPTIONS['pa-auth-poll'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        user_id: { type: 'string', description: 'User email to poll for.' },
-      },
-    },
+    inputSchema: { type: 'object', properties: { user_id: { type: 'string', description: 'User email to poll for.' } } },
     handler: async (p: any) => {
       try {
         const targetUser = p.user_id || userAuthManager.getDefaultUserId();
         if (!targetUser) return fail('No user_id provided and no pending auth found. Call pa-auth-start first.');
         const result = await userAuthManager.pollAuth(targetUser);
-        if (result.status === 'authenticated') {
-          return ok({
-            status: 'authenticated',
-            user_id: result.userId || targetUser,
-            message: result.message,
-            _note: 'You can now use pa-create-flow, pa-update-flow, pa-list-connections, and pa-create-connection.',
-          });
-        }
-        if (result.status === 'pending') {
-          return ok({ status: 'pending', message: result.message });
-        }
+        if (result.status === 'authenticated') return ok({ status: 'authenticated', user_id: result.userId || targetUser, message: result.message, _note: 'You can now use write tools.' });
+        if (result.status === 'pending') return ok({ status: 'pending', message: result.message });
         return ok({ status: result.status, message: result.message });
       } catch (e: any) { return fail(e.message); }
     },
   },
-  // ---- Auth: Status ----
   {
     name: 'pa-auth-status',
     description: TOOL_DESCRIPTIONS['pa-auth-status'],
-    inputSchema: {
-      type: 'object',
-      properties: {
-        user_id: { type: 'string', description: 'User email to check.' },
-      },
-    },
+    inputSchema: { type: 'object', properties: { user_id: { type: 'string', description: 'User email to check.' } } },
     handler: async (p: any) => {
       try {
         const status = userAuthManager.getAuthStatus(p.user_id);
-        return ok({
-          authenticated: status.authenticated,
-          user_id: status.userId,
-          message: status.message,
-          pending: status.pending,
-          authenticatedUsers: status.authenticatedUsers,
-          expiresIn: status.expiresIn,
-        });
+        return ok({ authenticated: status.authenticated, user_id: status.userId, message: status.message, pending: status.pending, authenticatedUsers: status.authenticatedUsers, expiresIn: status.expiresIn });
       } catch (e: any) { return fail(e.message); }
     },
   },
@@ -860,42 +670,29 @@ const toolDefs: ToolDefinition[] = [
 // Handler Map (for REST JSON-RPC transport)
 // =============================================================================
 const toolHandlers = new Map<string, (params: any) => Promise<ToolResult>>();
-for (const def of toolDefs) {
-  toolHandlers.set(def.name, def.handler);
-}
+for (const def of toolDefs) { toolHandlers.set(def.name, def.handler); }
 
 // =============================================================================
 // MCP Server (SSE transport)
 // =============================================================================
-const mcpServer = new McpServer({
-  name: 'power-automate-mcp',
-  version: VERSION,
-});
+const mcpServer = new McpServer({ name: 'power-automate-mcp', version: VERSION });
 
-// Convert JSON Schema properties to zod for McpServer.tool() registration
 function toZodProps(inputSchema: any): Record<string, any> {
   const props: Record<string, any> = {};
   const required = inputSchema?.required || [];
   for (const [key, val] of Object.entries((inputSchema?.properties || {}) as Record<string, any>)) {
     const isReq = required.includes(key);
     let s;
-    if (val.type === 'number') {
-      s = z.number().describe(val.description || key);
-    } else if (val.type === 'boolean') {
-      s = z.boolean().describe(val.description || key);
-    } else if (val.type === 'object' || val.type === 'array') {
-      s = z.any().describe(val.description || key);
-    } else {
-      s = z.string().describe(val.description || key);
-    }
+    if (val.type === 'number') s = z.number().describe(val.description || key);
+    else if (val.type === 'boolean') s = z.boolean().describe(val.description || key);
+    else if (val.type === 'object' || val.type === 'array') s = z.any().describe(val.description || key);
+    else s = z.string().describe(val.description || key);
     props[key] = isReq ? s : s.optional();
   }
   return props;
 }
 
-// =============================================================================
-// UNIFIED TOOL REGISTRATION (v3.3.0 + diagnostic logging)
-// =============================================================================
+// Unified tool registration with diagnostic logging
 for (const def of toolDefs) {
   const zodProps = toZodProps(def.inputSchema);
   mcpServer.tool(def.name, def.description, zodProps, async (params: any) => {
@@ -908,9 +705,7 @@ for (const def of toolDefs) {
 
 console.log(`[Init] MCP tools registered (SSE): ${toolDefs.length}`);
 
-// =============================================================================
-// SkillEngine: Register workflow prompts + knowledge resources (v1.0.0)
-// =============================================================================
+// SkillEngine: Register workflow prompts + knowledge resources
 registerSkills(mcpServer);
 
 // =============================================================================
@@ -920,12 +715,9 @@ const app = express();
 const jsonParser = express.json();
 const sseTransports = new Map<string, SSEServerTransport>();
 
-// Health endpoint
 app.get('/health', (_req: Request, res: Response) => {
   res.json({
-    status: 'ok',
-    version: VERSION,
-    tools: toolDefs.length,
+    status: 'ok', version: VERSION, tools: toolDefs.length,
     skills: { prompts: 3, resources: 3 },
     transport: ['sse', 'rest'],
     auth: userAuthManager.isConfigured() ? 'dual-token' : 'service-principal-only',
@@ -935,19 +727,10 @@ app.get('/health', (_req: Request, res: Response) => {
 
 // --- SSE Transport ---
 app.get('/sse', async (_req: Request, res: Response) => {
-  try {
-    await mcpServer.close();
-    console.log('[SSE] Previous transport closed (reconnect detected)');
-  } catch (_) {
-    // No existing connection - first connect.
-  }
-
+  try { await mcpServer.close(); console.log('[SSE] Previous transport closed (reconnect detected)'); } catch (_) {}
   const transport = new SSEServerTransport('/messages', res);
   sseTransports.set(transport.sessionId, transport);
-  res.on('close', () => {
-    console.log(`[SSE] Connection closed: ${transport.sessionId}`);
-    sseTransports.delete(transport.sessionId);
-  });
+  res.on('close', () => { console.log(`[SSE] Connection closed: ${transport.sessionId}`); sseTransports.delete(transport.sessionId); });
   await mcpServer.connect(transport);
 });
 
@@ -972,10 +755,7 @@ async function processJsonRpcRequest(request: any): Promise<any> {
     }
   }
 
-  // =========================================================================
-  // REST Skill Endpoints (prompts/list, prompts/get, resources/list, resources/read)
-  // Delegates to processSkillRequest — returns null if not a skill method.
-  // =========================================================================
+  // REST Skill Endpoints
   const skillResult = processSkillRequest(method, params, id);
   if (skillResult) return skillResult;
 
@@ -986,11 +766,7 @@ async function processJsonRpcRequest(request: any): Promise<any> {
           jsonrpc: '2.0', id,
           result: {
             protocolVersion: '2024-11-05',
-            capabilities: {
-              tools: { listChanged: false },
-              prompts: { listChanged: false },
-              resources: { listChanged: false },
-            },
+            capabilities: { tools: { listChanged: false }, prompts: { listChanged: false }, resources: { listChanged: false } },
             serverInfo: { name: 'power-automate-mcp', version: VERSION },
           },
         };
@@ -998,18 +774,13 @@ async function processJsonRpcRequest(request: any): Promise<any> {
       case 'initialized':
         return { jsonrpc: '2.0', id, result: {} };
       case 'tools/list':
-        return {
-          jsonrpc: '2.0', id,
-          result: { tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) },
-        };
+        return { jsonrpc: '2.0', id, result: { tools: toolDefs.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) } };
       case 'tools/call': {
         const toolName = params?.name;
         const toolArgs = params?.arguments || {};
         console.log(`[REST tools/call] tool=${toolName} | argKeys=[${Object.keys(toolArgs).join(', ')}] | raw=${JSON.stringify(toolArgs).substring(0, 300)}`);
         const handler = toolHandlers.get(toolName);
-        if (!handler) {
-          return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify({ error: `Unknown tool: ${toolName}` }) }], isError: true } };
-        }
+        if (!handler) return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify({ error: `Unknown tool: ${toolName}` }) }], isError: true } };
         const result = await handler(toolArgs);
         return { jsonrpc: '2.0', id, result };
       }
@@ -1026,15 +797,8 @@ async function processJsonRpcRequest(request: any): Promise<any> {
 
 const handleJsonRpc = async (req: Request, res: Response): Promise<void> => {
   const body = req.body;
-  if (!body || (typeof body !== 'object')) {
-    res.status(400).json({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } });
-    return;
-  }
-  if (Array.isArray(body)) {
-    const results = await Promise.all(body.map(processJsonRpcRequest));
-    res.json(results);
-    return;
-  }
+  if (!body || (typeof body !== 'object')) { res.status(400).json({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } }); return; }
+  if (Array.isArray(body)) { const results = await Promise.all(body.map(processJsonRpcRequest)); res.json(results); return; }
   const result = await processJsonRpcRequest(body);
   res.json(result);
 };
@@ -1047,18 +811,13 @@ app.post('/tools', jsonParser, handleJsonRpc);
 // =============================================================================
 // Start
 // =============================================================================
-
 console.log('[Init] Environment variable check:');
 console.log(`[Init]   POWER_PLATFORM_ENVIRONMENT_ID = ${process.env.POWER_PLATFORM_ENVIRONMENT_ID ? '"' + process.env.POWER_PLATFORM_ENVIRONMENT_ID + '"' : '(not set)'}`);
 console.log(`[Init]   AZURE_TENANT_ID = ${process.env.AZURE_TENANT_ID ? '(set)' : '(not set)'}`);
 console.log(`[Init]   DATAVERSE_URL = ${process.env.DATAVERSE_URL ? '"' + process.env.DATAVERSE_URL + '"' : '(not set)'}`);
 
-try {
-  const defaultEnv = resolveEnvironmentId();
-  console.log(`[Init] Default environment: ${defaultEnv}`);
-} catch (e: any) {
-  console.warn(`[Init] No default environment configured: ${e.message}`);
-}
+try { const defaultEnv = resolveEnvironmentId(); console.log(`[Init] Default environment: ${defaultEnv}`); }
+catch (e: any) { console.warn(`[Init] No default environment configured: ${e.message}`); }
 
 app.listen(PORT, () => {
   console.log('');
@@ -1072,5 +831,6 @@ app.listen(PORT, () => {
   console.log(`[Init] Auth:      ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
   console.log(`[Init] Tools:     ${toolDefs.length} registered (unified SSE + REST)`);
   console.log(`[Init] Skills:    3 prompts + 3 resources (SSE native + REST JSON-RPC)`);
+  console.log(`[Init] Normalizer: Flow definition auto-fix (run_after, $schema, contentVersion)`);
   console.log('');
 });
