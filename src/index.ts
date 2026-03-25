@@ -12,6 +12,7 @@ import { ToolResult, ToolDefinition } from './types.js';
 import { UserAuthManager } from './auth/user-auth-manager.js';
 import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
 import { resolveParams } from './utils/param-resolver.js';
+import { registerSkills } from './skills/register.js';
 
 // =============================================================================
 // Configuration
@@ -81,7 +82,8 @@ function fail(msg: string): ToolResult {
 //         universal param resolver for cross-client compatibility).
 //         Added pa-create-solution, pa-delete-solution, pa-create-connection.
 //         Unified tool registration — all 26 tools through one loop.
-//         Total: 26 tools.
+//         Added SkillEngine v1.0.0 (3 prompts + 3 resources).
+//         Total: 26 tools + 3 prompts + 3 resources.
 // v3.2.0: Added 5 Dataverse Solutions tools.
 // v3.1.0: Added pa-get-connection and pa-delete-connection tools.
 // v3.0.3: All descriptions sourced from TOOL_DESCRIPTIONS.
@@ -941,6 +943,15 @@ for (const def of toolDefs) {
 console.log(`[Init] MCP tools registered (SSE): ${toolDefs.length}`);
 
 // =============================================================================
+// SkillEngine: Register workflow prompts + knowledge resources (v1.0.0)
+//
+// Skills provide operational knowledge that agents read BEFORE calling tools:
+// - 3 workflow prompts (auth, create-flow, create-connection)
+// - 3 knowledge resources (parameter-conventions, connection-lifecycle, env-info)
+// =============================================================================
+registerSkills(mcpServer);
+
+// =============================================================================
 // Express App
 // =============================================================================
 const app = express();
@@ -953,6 +964,7 @@ app.get('/health', (_req: Request, res: Response) => {
     status: 'ok',
     version: VERSION,
     tools: toolDefs.length,
+    skills: { prompts: 3, resources: 3 },
     transport: ['sse', 'rest'],
     auth: userAuthManager.isConfigured() ? 'dual-token' : 'service-principal-only',
     dataverse: solutionClient.isConfigured() ? 'configured' : 'not-configured',
