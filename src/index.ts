@@ -13,6 +13,7 @@ import { UserAuthManager } from './auth/user-auth-manager.js';
 import { TOOL_DESCRIPTIONS } from './tools/tool-descriptions.js';
 import { resolveParams } from './utils/param-resolver.js';
 import { registerSkills } from './skills/register.js';
+import { processSkillRequest } from './skills/rest-skills.js';
 
 // =============================================================================
 // Configuration
@@ -83,6 +84,7 @@ function fail(msg: string): ToolResult {
 //         Added pa-create-solution, pa-delete-solution, pa-create-connection.
 //         Unified tool registration — all 26 tools through one loop.
 //         Added SkillEngine v1.0.0 (3 prompts + 3 resources).
+//         Added REST skill endpoints (prompts/list, prompts/get, resources/list, resources/read).
 //         Total: 26 tools + 3 prompts + 3 resources.
 // v3.2.0: Added 5 Dataverse Solutions tools.
 // v3.1.0: Added pa-get-connection and pa-delete-connection tools.
@@ -464,18 +466,6 @@ const toolDefs: ToolDefinition[] = [
   },
   // =========================================================================
   // Create Connection (v3.3.0 + param resolver for cross-client compatibility)
-  //
-  // Problem: Jose's Claude 4.6 AI sends connectorId and user_id in the payload,
-  // but the handler receives them as undefined. The params may arrive nested
-  // under 'arguments', 'params', 'input', or 'data' depending on the client
-  // bridge. The resolveParams utility unwraps all nesting patterns.
-  //
-  // Previous fixes:
-  //   Round 1 (930cda56): POST /environments/{env}/connections → 403
-  //   Round 2 (7e1aef7b): POST + PowerApps token → 404
-  //   Round 3 (31e679ab): PUT /apis/{connector}/connections/{name} → SUCCESS Timothy
-  //   Round 4 (e3c66510): Defensive null checks → catches but Jose still gets error
-  //   Round 5 (this): resolveParams + diagnostic logging → universal fix
   // =========================================================================
   {
     name: 'pa-create-connection',
@@ -492,29 +482,17 @@ const toolDefs: ToolDefinition[] = [
     },
     handler: async (rawP: any) => {
       try {
-        // =================================================================
-        // DIAGNOSTIC: Log raw params to Railway so we can see EXACTLY
-        // what the client/SDK sends. This is the key to solving Jose's issue.
-        // =================================================================
         const rawStr = JSON.stringify(rawP);
         console.log(`[CreateConnection] RAW params (${rawStr.length} chars): ${rawStr.substring(0, 500)}`);
         console.log(`[CreateConnection] RAW keys: [${rawP ? Object.keys(rawP).join(', ') : 'null/undefined'}]`);
         console.log(`[CreateConnection] Direct access: connectorId=${rawP?.connectorId}, user_id=${rawP?.user_id}, connector_id=${rawP?.connector_id}`);
 
-        // =================================================================
-        // Universal param resolution: unwraps nested arguments from any
-        // client/bridge wrapping pattern (arguments, params, input, data)
-        // and handles snake_case/camelCase variations.
-        // =================================================================
         const p = resolveParams(rawP, ['connectorId', 'user_id', 'environmentId', 'connectionParameters']);
 
         console.log(`[CreateConnection] RESOLVED: connectorId="${p.connectorId}", user_id="${p.user_id}", environmentId="${p.environmentId}"`);
 
         const envId = resolveEnvironmentId(p.environmentId);
 
-        // =================================================================
-        // Defensive null/type checks (after resolution)
-        // =================================================================
         if (!p.connectorId || typeof p.connectorId !== 'string') {
           return fail(
             'connectorId is required and must be a string. ' +
@@ -529,7 +507,6 @@ const toolDefs: ToolDefinition[] = [
           );
         }
 
-        // Acquire PowerApps-scoped delegated token via refresh token exchange
         const userToken = await userAuthManager.getAccessTokenForScope(
           p.user_id,
           'https://service.powerapps.com/.default'
@@ -542,16 +519,12 @@ const toolDefs: ToolDefinition[] = [
           );
         }
 
-        // Extract short connector name (e.g., shared_office365)
         const connectorName = p.connectorId.startsWith('/providers/')
           ? p.connectorId.split('/').pop()!
           : p.connectorId;
 
-        // Generate unique connection name: shared-office365-{uuid}
         const connectionName = `${connectorName.replace(/_/g, '-')}-${generateUUID()}`;
 
-        // Correct PowerApps connection creation endpoint:
-        //   PUT /apis/{connector}/connections/{name}?$filter=environment eq '{env}'
         const url = `https://api.powerapps.com/providers/Microsoft.PowerApps/apis/${connectorName}/connections/${connectionName}`;
 
         console.log(`[CreateConnection] PUT ${url} (user: ${p.user_id}, env: ${envId}, token: powerapps-delegated)`);
@@ -577,8 +550,6 @@ const toolDefs: ToolDefinition[] = [
 
         const conn = response.data;
         const connStatus = conn?.properties?.statuses?.[0]?.status || 'Unknown';
-
-        // Check if the connector requires interactive consent (OAuth connectors)
         const needsConsent = connStatus === 'Error' || connStatus === 'Unauthenticated';
         const consentLink = conn?.properties?.connectionParameters?.token?.oAuthSettings?.redirectUrl || null;
 
@@ -802,7 +773,6 @@ const toolDefs: ToolDefinition[] = [
   },
   // =========================================================================
   // AUTH TOOLS (Device Code Flow)
-  // v3.3.0: Registered via unified loop (no separate registerAuthTools call)
   // =========================================================================
   // ---- Auth: Start Device Code Flow ----
   {
@@ -925,14 +895,10 @@ function toZodProps(inputSchema: any): Record<string, any> {
 
 // =============================================================================
 // UNIFIED TOOL REGISTRATION (v3.3.0 + diagnostic logging)
-//
-// Every SSE tool call now logs the raw param keys so we can diagnose
-// cross-client argument wrapping issues in Railway logs.
 // =============================================================================
 for (const def of toolDefs) {
   const zodProps = toZodProps(def.inputSchema);
   mcpServer.tool(def.name, def.description, zodProps, async (params: any) => {
-    // Universal diagnostic: log raw param structure for EVERY tool call
     const paramKeys = params ? Object.keys(params) : [];
     const paramSnippet = JSON.stringify(params).substring(0, 300);
     console.log(`[ToolCall] ${def.name} | keys: [${paramKeys.join(', ')}] | raw: ${paramSnippet}`);
@@ -944,10 +910,6 @@ console.log(`[Init] MCP tools registered (SSE): ${toolDefs.length}`);
 
 // =============================================================================
 // SkillEngine: Register workflow prompts + knowledge resources (v1.0.0)
-//
-// Skills provide operational knowledge that agents read BEFORE calling tools:
-// - 3 workflow prompts (auth, create-flow, create-connection)
-// - 3 knowledge resources (parameter-conventions, connection-lifecycle, env-info)
 // =============================================================================
 registerSkills(mcpServer);
 
@@ -1000,6 +962,7 @@ app.post('/messages', async (req: Request, res: Response) => {
 async function processJsonRpcRequest(request: any): Promise<any> {
   const { jsonrpc, id, method, params } = request || {};
 
+  // Direct tool handler shortcut
   if (method && toolHandlers.has(method)) {
     try {
       const result = await toolHandlers.get(method)!(params || {});
@@ -1009,6 +972,13 @@ async function processJsonRpcRequest(request: any): Promise<any> {
     }
   }
 
+  // =========================================================================
+  // REST Skill Endpoints (prompts/list, prompts/get, resources/list, resources/read)
+  // Delegates to processSkillRequest — returns null if not a skill method.
+  // =========================================================================
+  const skillResult = processSkillRequest(method, params, id);
+  if (skillResult) return skillResult;
+
   try {
     switch (method) {
       case 'initialize':
@@ -1016,7 +986,11 @@ async function processJsonRpcRequest(request: any): Promise<any> {
           jsonrpc: '2.0', id,
           result: {
             protocolVersion: '2024-11-05',
-            capabilities: { tools: { listChanged: false } },
+            capabilities: {
+              tools: { listChanged: false },
+              prompts: { listChanged: false },
+              resources: { listChanged: false },
+            },
             serverInfo: { name: 'power-automate-mcp', version: VERSION },
           },
         };
@@ -1031,7 +1005,6 @@ async function processJsonRpcRequest(request: any): Promise<any> {
       case 'tools/call': {
         const toolName = params?.name;
         const toolArgs = params?.arguments || {};
-        // Diagnostic: log what arrives via REST tools/call
         console.log(`[REST tools/call] tool=${toolName} | argKeys=[${Object.keys(toolArgs).join(', ')}] | raw=${JSON.stringify(toolArgs).substring(0, 300)}`);
         const handler = toolHandlers.get(toolName);
         if (!handler) {
@@ -1098,5 +1071,6 @@ app.listen(PORT, () => {
   console.log(`[Init] Write:     Delegated user token via Device Code Flow (multi-scope)`);
   console.log(`[Init] Auth:      ${userAuthManager.isConfigured() ? 'Dual-token mode (service principal + per-user delegated)' : 'Service-principal only (UserAuth not configured)'}`);
   console.log(`[Init] Tools:     ${toolDefs.length} registered (unified SSE + REST)`);
+  console.log(`[Init] Skills:    3 prompts + 3 resources (SSE native + REST JSON-RPC)`);
   console.log('');
 });
