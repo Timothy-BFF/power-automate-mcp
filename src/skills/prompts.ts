@@ -75,11 +75,11 @@ export function registerPrompts(server: McpServer): void {
   );
 
   // =========================================================================
-  // Prompt 2: workflow-create-flow (with definition JSON format guide)
+  // Prompt 2: workflow-create-flow (with definition format + solution step)
   // =========================================================================
   server.prompt(
     'workflow-create-flow',
-    'MANDATORY procedure for creating a Power Automate flow. Includes definition JSON format requirements. Agents MUST follow this exact sequence.',
+    'MANDATORY procedure for creating a Power Automate flow. Includes definition JSON format requirements and solution placement. Agents MUST follow this exact sequence.',
     {
       displayName: z.string().optional().describe('Name of the flow to create'),
       user_id: z.string().optional().describe('Authenticated user email'),
@@ -90,7 +90,7 @@ export function registerPrompts(server: McpServer): void {
         content: {
           type: 'text' as const,
           text: [
-            '# Flow Creation — Mandatory Procedure',
+            '# Flow Creation — Mandatory 5-Step Procedure',
             '',
             `**Flow**: ${args.displayName || '<provide-display-name>'}`,
             `**User**: ${args.user_id || '<must-be-authenticated>'}`,
@@ -132,6 +132,22 @@ export function registerPrompts(server: McpServer): void {
             '  ✅ operationOptions  ❌ operation_options',
             '  ✅ splitOn           ❌ split_on',
             '  ✅ trackedProperties ❌ tracked_properties',
+            '  ✅ defaultValue      ❌ default_value',
+            '',
+            '### ⚠️ $connections Parameter Format (CRITICAL):',
+            '',
+            'If the flow uses connectors, the definition MUST include a `parameters` block',
+            'with `$connections` using `defaultValue` (NOT `default_value`):',
+            '',
+            '  "parameters": {',
+            '    "$connections": {',
+            '      "defaultValue": {},',
+            '      "type": "Object"',
+            '    }',
+            '  }',
+            '',
+            'The server auto-normalizes default_value → defaultValue as a safety net,',
+            'but providing correct camelCase avoids API round-trip errors.',
             '',
             'Example CORRECT action definition:',
             '  "HTTP_GetData": {',
@@ -144,9 +160,6 @@ export function registerPrompts(server: McpServer): void {
             '    }',
             '  }',
             '',
-            'The server auto-normalizes run_after → runAfter and injects missing',
-            '$schema/contentVersion as a safety net, but correct definitions avoid errors.',
-            '',
             '### Step 3: Wait for Propagation',
             '- Wait **at least 10 seconds** before verifying',
             '- The Flow service needs time to persist the definition across replicas',
@@ -157,6 +170,27 @@ export function registerPrompts(server: McpServer): void {
             '  - `_fetchedVia`: Shows which endpoint retrieved the definition',
             '  - `_definitionStatus`: Should indicate definition is present',
             '  - `_authType`: Shows what token type was used during creation',
+            '',
+            '### Step 5: Add to Solution (if applicable)',
+            '',
+            'If the flow should live inside a solution:',
+            '- Call `pa-add-solution-component` IMMEDIATELY after Step 4 verification:',
+            '  - `solutionUniqueName`: The target solution\'s unique name (e.g., "BeakSolution")',
+            '  - `componentId`: The flow ID returned from pa-create-flow in Step 2',
+            '  - `componentType`: 29 (Cloud Flow)',
+            '',
+            '⚠️ IMPORTANT — You MUST use the flow ID from pa-create-flow (Step 2).',
+            'Do NOT try to "find" the flow via pa-list-flows first — flows created via',
+            'the API are immediately available by ID but may take 15–30 minutes to',
+            'appear in list results due to admin API indexing delays.',
+            '',
+            'If you need the solution\'s unique name, call `pa-get-solution` with the solution ID.',
+            '',
+            '⚠️ CRITICAL: Flows created via the Power Automate portal UI (not via pa-create-flow)',
+            'may not appear in pa-list-flows for 15–30 minutes. If you must add a UI-created flow',
+            'to a solution, get the flow GUID from the browser URL bar:',
+            '  .../environments/{envId}/flows/{FLOW-GUID}/details',
+            'Then call pa-add-solution-component with that GUID as componentId.',
             '',
             '## ⚠️ CRITICAL RULES:',
             '',
@@ -171,7 +205,8 @@ export function registerPrompts(server: McpServer): void {
             'This causes orphaned flows with no triggers or actions.',
             '',
             '### Parameter Format',
-            'ALL parameters use camelCase: flowId, displayName, environmentId, connectionReferences.',
+            'ALL tool parameters use camelCase: flowId, displayName, environmentId, connectionReferences.',
+            'ALL definition body properties use camelCase: runAfter, defaultValue, operationId.',
             '(See resource: parameter-conventions for the complete list)',
           ].join('\n')
         }
