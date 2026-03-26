@@ -1,6 +1,6 @@
-# Power Automate MCP v3.3.0
+# Power Automate MCP v3.4.0
 
-A production-grade **Model Context Protocol (MCP) server** that gives AI agents full control over Microsoft Power Automate — flows, connections, solutions, and environments — through 26 tools and 6 embedded skills.
+A production-grade **Model Context Protocol (MCP) server** that gives AI agents full control over Microsoft Power Automate — flows, connections, solutions, and environments — through 27 tools and 6 embedded skills.
 
 Deployed on **Railway**. Built with **TypeScript**. Authenticated via **Azure AD** dual-token architecture.
 
@@ -9,36 +9,44 @@ Deployed on **Railway**. Built with **TypeScript**. Authenticated via **Azure AD
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                  Power Automate MCP v3.3.0                   │
-│                                                             │
-│  ┌──────────────────────┐   ┌────────────────────────────┐  │
-│  │  AzureTokenManager   │   │  UserAuthManager            │  │
-│  │  (Service Principal)  │   │  (Device Code Flow)        │  │
-│  │  • Auto-refresh      │   │  • Per-user tokens         │  │
-│  │  • 4 scopes          │   │  • Refresh token rotation  │  │
-│  └──────────┬───────────┘   └──────────────┬─────────────┘  │
-│             │                               │               │
-│       READ OPERATIONS                 WRITE OPERATIONS      │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  SkillEngine v1.0.0                                  │   │
-│  │  3 Workflow Prompts + 3 Knowledge Resources          │   │
-│  │  Available via SSE native + REST JSON-RPC             │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  Definition Normalizer                                │   │
-│  │  Auto-fixes: run_after→runAfter, injects $schema     │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Transports: SSE (/sse) + REST JSON-RPC (/mcp)             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                  Power Automate MCP v3.4.0                      │
+│                                                                 │
+│  ┌──────────────────────┐   ┌────────────────────────────────┐  │
+│  │  AzureTokenManager   │   │  UserAuthManager               │  │
+│  │  (Service Principal)  │   │  (Device Code Flow)           │  │
+│  │  • Auto-refresh      │   │  • Per-user tokens            │  │
+│  │  • 4 scopes          │   │  • Refresh token rotation     │  │
+│  └──────────┬───────────┘   └──────────────┬─────────────────┘  │
+│             │                               │                   │
+│       READ OPERATIONS                 WRITE OPERATIONS          │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  SkillEngine v1.0.0                                      │   │
+│  │  3 Workflow Prompts + 3 Knowledge Resources              │   │
+│  │  Available via SSE native + REST JSON-RPC                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Definition Normalizer                                    │   │
+│  │  Auto-fixes: run_after→runAfter, default_value→defaultValue│  │
+│  │  Injects missing $schema + contentVersion                 │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Flow Adopter Pipeline (NEW in v3.4.0)                    │   │
+│  │  Registers flows in Dataverse workflows entity            │   │
+│  │  Enables AddSolutionComponent for non-solution-aware flows│   │
+│  │  Equivalent to portal "Add existing → Outside solutions"  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Transports: SSE (/sse) + REST JSON-RPC (/mcp)                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Tools (26)
+## Tools (27)
 
 ### Environments
 | Tool | Description |
@@ -50,12 +58,13 @@ Deployed on **Railway**. Built with **TypeScript**. Authenticated via **Azure AD
 |------|-------------|
 | `pa-list-flows` | List flows in an environment |
 | `pa-get-flow-details` | Get full flow details including definition |
-| `pa-create-flow` | Create a cloud flow (auto-normalizes definition) |
+| `pa-create-flow` | Create a cloud flow (auto-normalizes definition). Optional `solutionUniqueName` param for auto-adoption into a solution. |
 | `pa-update-flow` | Update flow definition, name, or state (auto-normalizes) |
 | `pa-enable-flow` | Enable (start) a flow |
 | `pa-disable-flow` | Disable (stop) a flow |
 | `pa-delete-flow` | Permanently delete a flow |
 | `pa-trigger-flow` | Manually trigger a flow |
+| `pa-adopt-flow` | **NEW** — Adopt a non-solution-aware flow into a Dataverse solution. Creates the required Dataverse `workflows` record then calls `AddSolutionComponent`. |
 
 ### Runs
 | Tool | Description |
@@ -92,6 +101,65 @@ Deployed on **Railway**. Built with **TypeScript**. Authenticated via **Azure AD
 
 ---
 
+## Flow Adopter Pipeline (v3.4.0)
+
+Flows created via the Power Automate portal UI or the Flow Management API are **non-solution-aware** — they exist only in the Flow service, not in Dataverse. The `AddSolutionComponent` action requires a Dataverse `workflows` entity record to exist.
+
+The Flow Adopter solves this by creating the missing record programmatically.
+
+### How It Works
+
+```
+pa-adopt-flow (flowId, solutionUniqueName)
+  │
+  ├─ Step 1: GET flow details from Flow API
+  ├─ Step 2: Check Dataverse workflows entity for existing record
+  │          └─ If missing → POST /workflows (category=5, type=1)
+  └─ Step 3: POST /AddSolutionComponent (componentType=29)
+```
+
+### Two Ways to Use It
+
+**Option A — Standalone tool** (for existing flows):
+```json
+{
+  "tool": "pa-adopt-flow",
+  "params": {
+    "flowId": "b65abe28-4e71-4ff2-8c71-c448cec077a6",
+    "solutionUniqueName": "BeakSolution"
+  }
+}
+```
+
+**Option B — Auto-adoption during creation** (new in `pa-create-flow`):
+```json
+{
+  "tool": "pa-create-flow",
+  "params": {
+    "displayName": "My New Flow",
+    "definition": { ... },
+    "solutionUniqueName": "BeakSolution"
+  }
+}
+```
+When `solutionUniqueName` is provided, `pa-create-flow` automatically:
+1. Creates the flow via Flow API
+2. Registers it in Dataverse `workflows` entity
+3. Calls `AddSolutionComponent` to link it to the solution
+4. Returns `_solutionAdoption` status in the response
+
+If auto-adoption fails, the flow creation still succeeds — retry with `pa-adopt-flow`.
+
+### What It Fixes
+
+| Before v3.4.0 | After v3.4.0 |
+|--------------|-------------|
+| `pa-add-solution-component` → 404 "does not exist" | `pa-adopt-flow` → creates Dataverse record → `AddSolutionComponent` succeeds |
+| Manual portal step: Solutions → Add existing → Outside solutions | Fully automated via API |
+| Flows created via `pa-create-flow` not solution-aware | Pass `solutionUniqueName` for automatic adoption |
+
+---
+
 ## Skills — SkillEngine v1.0.0
 
 Skills are **embedded operational knowledge** that agents read BEFORE calling tools. Available via both SSE and REST transports.
@@ -101,7 +169,7 @@ Skills are **embedded operational knowledge** that agents read BEFORE calling to
 | Prompt | Purpose | Prevents |
 |--------|---------|----------|
 | `workflow-auth` | Device Code Flow sequence + environment discovery note | Auth errors, empty environment confusion |
-| `workflow-create-flow` | Mandatory 4-step procedure + **definition JSON format** | Empty definitions, `run_after` errors, missing `$schema` |
+| `workflow-create-flow` | Mandatory 5-step procedure: Auth → Create → Wait → Verify → Add to Solution | Empty definitions, `run_after` errors, missing `$schema`, 404 solution errors |
 | `workflow-create-connection` | Connection creation with OAuth consent guide | Agents panicking at expected "Error" status |
 
 ### Knowledge Resources (3)
@@ -121,6 +189,7 @@ The server automatically fixes common AI-generated definition errors:
 | Fix | Example | Applied To |
 |-----|---------|------------|
 | `run_after` → `runAfter` | Recursive in all actions | `pa-create-flow`, `pa-update-flow` |
+| `default_value` → `defaultValue` | `$connections` parameter block | `pa-create-flow`, `pa-update-flow` |
 | Missing `$schema` | Injects Logic Apps schema URL | `pa-create-flow`, `pa-update-flow` |
 | Missing `contentVersion` | Injects `1.0.0.0` | `pa-create-flow`, `pa-update-flow` |
 | `trigger_conditions` → `triggerConditions` | Recursive | `pa-create-flow`, `pa-update-flow` |
@@ -155,6 +224,8 @@ Diagnostics logged to Railway: `[NormalizeDef] Applied 3 fixes: injected $schema
 | `pa-list-environments` returns empty | Service principal may lack Power Platform Admin role | All tools default to configured environment ID — skip this call |
 | OAuth connections show `Error` status | Expected behavior for Office 365, SharePoint, etc. | User authorizes at `make.powerautomate.com` → Data → Connections |
 | Admin endpoint doesn't return definitions | `pa-get-flow-details` may show empty definition | This is an API limitation, not a creation failure |
+| `pa-list-flows` indexing delay | New flows may take 15–30 min to appear in list results | Use the flow ID from `pa-create-flow` directly — don't search |
+| Non-solution-aware flows 404 on AddSolutionComponent | Flows created outside solutions lack Dataverse records | Use `pa-adopt-flow` or pass `solutionUniqueName` to `pa-create-flow` |
 
 ---
 
@@ -166,7 +237,7 @@ Diagnostics logged to Railway: `[NormalizeDef] Applied 3 fixes: injected $schema
 | `AZURE_CLIENT_ID` | ✅ | App registration client ID |
 | `AZURE_CLIENT_SECRET` | ✅ | App registration client secret |
 | `POWER_PLATFORM_ENVIRONMENT_ID` | ✅ | Target Power Platform environment ID |
-| `DATAVERSE_URL` | ✅ | Dataverse instance URL |
+| `DATAVERSE_URL` | ✅ | Dataverse instance URL (e.g., `bolthousefreshprod.crm.dynamics.com`) |
 | `PORT` | ❌ | Server port (default: 8080) |
 
 ---
@@ -191,12 +262,12 @@ Push to `main` → Railway auto-builds → auto-deploys.
 
 ```
 src/
-├── index.ts                        # Main entry: Express + MCP + tools + skills
+├── index.ts                        # Main entry: Express + MCP + 27 tools + skills
 ├── auth/
 │   ├── azure-token-manager.ts      # Service principal token lifecycle
 │   └── user-auth-manager.ts        # Per-user Device Code Flow
 ├── api/
-│   └── power-platform-client.ts     # HTTP client for Flow + PowerApps APIs
+│   └── power-platform-client.ts    # HTTP client for Flow + PowerApps APIs
 ├── clients/
 │   └── solution-client.ts          # Dataverse Web API client
 ├── config/
@@ -205,7 +276,8 @@ src/
 │   └── tool-descriptions.ts        # Centralized tool descriptions
 ├── utils/
 │   ├── param-resolver.ts           # snake_case → camelCase param unwrapper
-│   └── normalize-definition.ts     # Flow definition auto-fixer
+│   ├── normalize-definition.ts     # Flow definition auto-fixer
+│   └── flow-adopter.ts             # Dataverse workflow record creator (v3.4.0)
 └── skills/
     ├── register.ts                 # SkillEngine entry point
     ├── prompts.ts                  # 3 workflow prompts (SSE)
@@ -240,6 +312,7 @@ src/
 
 | Version | Date | Changes |
 |---------|------|----------|
+| v3.4.0 | 2026-03-25 | Flow Adopter pipeline (`pa-adopt-flow`), `pa-create-flow` auto-adoption via `solutionUniqueName`, 27 tools, `workflow-create-flow` updated to 5-step procedure |
 | v3.3.0 | 2026-03-25 | SkillEngine v1.0.0, REST skill endpoints, definition normalizer, production env switch, param-resolver, pa-create-solution, pa-delete-solution |
 | v3.2.0 | 2026-03-22 | 5 Dataverse solution tools |
 | v3.1.0 | 2026-03-21 | pa-get-connection, pa-delete-connection |
