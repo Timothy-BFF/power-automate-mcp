@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { TokenInfo } from '../types.js';
 
-const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const REFRESH_BUFFER_MS = 10 * 60 * 1000;
 
 export class AzureTokenManager {
   private tokens: Map<string, TokenInfo> = new Map();

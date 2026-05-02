@@ -9,7 +9,7 @@ export class TokenStore {
   get(scope: string): string | null {
     const stored = this.tokens.get(scope);
     if (!stored) return null;
-    if (Date.now() >= stored.expiresAt - 5 * 60 * 1000) return null;
+    if (Date.now() >= stored.expiresAt - 10 * 60 * 1000) return null;
     return stored.accessToken;
   }
 

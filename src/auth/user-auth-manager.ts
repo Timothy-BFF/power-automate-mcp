@@ -59,6 +59,7 @@ interface UserToken {
   expiresAt: number;
   userId: string;
   acquiredAt: number;
+  refreshCount: number;
 }
 
 interface PendingDeviceAuth {
@@ -74,7 +75,7 @@ interface PendingDeviceAuth {
 // Constants
 // =========================================================================
 
-const REFRESH_BUFFER_MS = 5 * 60 * 1000;  // Refresh when < 5 min remaining
+const REFRESH_BUFFER_MS = 10 * 60 * 1000;  // Refresh when < 10 min remaining
 const DEFAULT_SCOPE = 'https://service.flow.microsoft.com/.default offline_access';
 
 // =========================================================================
@@ -249,6 +250,7 @@ export class UserAuthManager {
         expiresAt: Date.now() + (data.expires_in * 1000),
         userId,
         acquiredAt: Date.now(),
+        refreshCount: 0,
       });
 
       this.pendingAuths.delete(userId);
@@ -394,7 +396,8 @@ export class UserAuthManager {
     // Auto-refresh if < 5 min remaining
     if (token.expiresAt - Date.now() < REFRESH_BUFFER_MS) {
       if (token.refreshToken) {
-        console.log(`[UserAuth] Token for ${targetUser} expiring soon, refreshing...`);
+        const currentCount = token.refreshCount || 0;
+        console.log(`[UserAuth] Token for ${targetUser} expiring soon (refreshCount: ${currentCount}), refreshing...`);
         const refreshed = await this.refreshTokenForUser(targetUser, token.refreshToken);
         if (refreshed) {
           return this.tokens.get(targetUser)!.accessToken;
@@ -488,16 +491,16 @@ export class UserAuthManager {
       });
 
       const data = response.data;
-
+      const prevCount = this.tokens.get(userId)?.refreshCount || 0;
       this.tokens.set(userId, {
         accessToken: data.access_token,
         refreshToken: data.refresh_token || refreshToken,
         expiresAt: Date.now() + (data.expires_in * 1000),
         userId,
         acquiredAt: Date.now(),
+        refreshCount: prevCount + 1,
       });
-
-      console.log(`[UserAuth] ✅ Token refreshed for ${userId} (TTL: ${data.expires_in}s)`);
+      console.log(`[UserAuth] Token refreshed for ${userId} (TTL: ${data.expires_in}s, refreshCount: ${prevCount + 1})`);
       return true;
     } catch (error: any) {
       const errMsg = error.response?.data?.error_description || error.response?.data?.error || error.message;
@@ -550,6 +553,7 @@ export class UserAuthManager {
         expiresAt: Date.now() + (data.expires_in * 1000),
         userId,
         acquiredAt: Date.now(),
+        refreshCount: 0,
       });
 
       // Sync refresh token back to primary if Azure AD rotated it
