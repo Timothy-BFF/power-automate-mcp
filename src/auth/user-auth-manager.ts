@@ -76,7 +76,7 @@ interface PendingDeviceAuth {
 // =========================================================================
 
 const REFRESH_BUFFER_MS = 10 * 60 * 1000;  // Refresh when < 10 min remaining
-const DEFAULT_SCOPE = 'https://service.flow.microsoft.com/.default offline_access';
+const DEFAULT_SCOPE = 'https://service.flow.microsoft.com/.default https://service.powerapps.com/.default offline_access';
 
 // =========================================================================
 // UserAuthManager
